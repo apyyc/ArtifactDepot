@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+warehouse/
+logs/
+*.log
+.warehouse.json
+tokens.json
+signed_links.json
+.env
+*.tar
+audit.log
