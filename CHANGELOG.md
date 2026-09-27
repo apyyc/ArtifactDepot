@@ -1,11 +1,20 @@
 # Changelog
 
-DataWarehouse v0.5.5 — 所有对本项目的重要更改都将记录在此文件中。
+ArtifactDepot v0.6.1 — 所有对本项目的重要更改都将记录在此文件中。
 
 本日志格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本号遵循 [语义化版本规范](https://semver.org/lang/zh-CN/)。
 
 ---
+
+## [0.6.1] - 2026-09-28
+
+### Changed
+
+- **项目更名 DataWarehouse → ArtifactDepot**：Python 包 `datawarehouse` → `artifactdepot`、镜像/容器名、Dockerfile LABEL、脚本与文档全面更新；API 路径与响应结构不变（对外契约保持兼容）。
+- **配置键更名**：`warehouse_dir` → `depot_dir`（新键优先，旧键兼容读取）；环境变量前缀 `WAREHOUSE_*` → `ARTIFACT_DEPOT_*`（新前缀优先，旧前缀兼容）。
+- **数据目录自动迁移**：启动时检测旧 `warehouse/` 目录存在且新 `depot/` 不存在，自动改名迁移（不移动文件内容，同文件系统瞬间完成）。
+- `/health` 返回键 `warehouse_dir` → `depot_dir`。
 
 ## [0.5.5] - 2026-09-26
 
@@ -17,11 +26,11 @@ DataWarehouse v0.5.5 — 所有对本项目的重要更改都将记录在此文�
 
 - **Podman 构建保留 HEALTHCHECK**：`build_image.sh` 在 Podman 下自动追加 `--format docker`，避免默认 OCI 格式忽略 `HEALTHCHECK`。
 - **`deploy_container.sh` 真正兼容 Docker**：镜像检查改用 Podman/Docker 都支持的 `image inspect`；Docker 下不使用 `podman generate systemd`，自动改用 `--restart=always`。
-- **`meta_dir` 语义修复**：部署时默认不再注入 `WAREHOUSE_META_DIR`，以容器内 `config.json` 为准；新增 `--meta-dir` 供显式覆盖。
-- **默认数据目录可回退**：`~/SERVER` 不可写时自动回退到 `${XDG_DATA_HOME:-~/.local/share}/datawarehouse/...`，避免开箱即用失败。
-- **默认配置路径统一**：`deploy_container.sh` 自动探测 `~/SERVER/datawarehouse/config/config.json`，新增 `--config` 显式挂载；修正数据卷/配置路径文档。
+- **`meta_dir` 语义修复**：部署时默认不再注入 `ARTIFACT_DEPOT_META_DIR`，以容器内 `config.json` 为准；新增 `--meta-dir` 供显式覆盖。
+- **默认数据目录可回退**：`~/SERVER` 不可写时自动回退到 `${XDG_DATA_HOME:-~/.local/share}/artifactdepot/...`，避免开箱即用失败。
+- **默认配置路径统一**：`deploy_container.sh` 自动探测 `~/SERVER/artifactdepot/config/config.json`，新增 `--config` 显式挂载；修正数据卷/配置路径文档。
 - `supervisord` 配置消除 root 与 `redirect_stderr` 警告。
-- 新增 `.dockerignore`，构建上下文排除 `*.tar`、`warehouse/`、`logs/`、`__pycache__` 等无关大文件。
+- 新增 `.dockerignore`，构建上下文排除 `*.tar`、`depot/`、`logs/`、`__pycache__` 等无关大文件。
 - 补齐 `config.production.json` 与生产诊断脚本 `check_dw_sync.sh`。
 
 ## [0.5.4] - 2026-09-26
@@ -34,13 +43,13 @@ DataWarehouse v0.5.5 — 所有对本项目的重要更改都将记录在此文�
 ### Changed
 
 - 管理接口权限语义修正：无 token / 无效 token 返回 401；已认证普通用户调用管理接口返回 403。
-- 对象 key 的隐藏路径段规则收紧：任意路径段以 `.` 开头均拒绝上传，与 `.warehouse.json` / `.keep` 隐藏约定保持一致。
+- 对象 key 的隐藏路径段规则收紧：任意路径段以 `.` 开头均拒绝上传，与 `.depot.json` / `.keep` 隐藏约定保持一致。
 - 文档与构建/部署脚本版本号统一为 0.5.4。
 
 ### Fixed
 
 - 签名链接下载先检查对象是否存在，再扣减次数，避免对象不存在时仍消费链接次数。
-- 手工放入、无 `.warehouse.json` 记录的文件列表 `mtime` 回退为文件系统 mtime。
+- 手工放入、无 `.depot.json` 记录的文件列表 `mtime` 回退为文件系统 mtime。
 - 空目录列表 `mtime` 改为目录自身 mtime，不再返回当前时间。
 - 对象操作不再接受空 key：防止 `DELETE /api/objects?key=` 误删整个空 bucket，同时拒绝空 key 的 presign/download/上传落盘。
 - 审计查询 `limit=0` 返回空列表，负数返回 422，避免负数导致返回数量异常。
@@ -80,24 +89,24 @@ DataWarehouse v0.5.5 — 所有对本项目的重要更改都将记录在此文�
 
 ### Added
 
-- **`meta_dir` 配置项**：把状态文件（`tokens.json` / `signed_links.json` / `audit.log`）从仓库根移出到独立目录（留空 = 原行为放 `warehouse_dir` 根下；相对路径按 `warehouse_dir` 解析）。新增环境变量 `WAREHOUSE_META_DIR` 覆盖
-- **`build_image.sh` 构建完自动导出 tar**：默认 `./build_image.sh` 即构建 + 导出 `datawarehouse-0.5.0.tar`；`--no-save` 跳过、`--save [路径]` 指定、`--tag` 覆盖版本标签、`--load` / `--list` 保留
-- **`config.production.json`**：生产可整份复制的配置模板（`warehouse_dir=/data/warehouse`、`meta_dir=/data/warehouse/state`、host 网络 `datahub_url=127.0.0.1:8002`）
+- **`meta_dir` 配置项**：把状态文件（`tokens.json` / `signed_links.json` / `audit.log`）从仓库根移出到独立目录（留空 = 原行为放 `depot_dir` 根下；相对路径按 `depot_dir` 解析）。新增环境变量 `ARTIFACT_DEPOT_META_DIR` 覆盖
+- **`build_image.sh` 构建完自动导出 tar**：默认 `./build_image.sh` 即构建 + 导出 `artifactdepot-0.5.0.tar`；`--no-save` 跳过、`--save [路径]` 指定、`--tag` 覆盖版本标签、`--load` / `--list` 保留
+- **`config.production.json`**：生产可整份复制的配置模板（`depot_dir=/data/depot`、`meta_dir=/data/depot/state`、host 网络 `datahub_url=127.0.0.1:8002`）
 - **`check_dw_sync.sh`**：生产连通性诊断脚本（只依赖 python3，无需 curl/wget/jq）—— 校验容器内配置 / 应用实际同步 / 容器内访问 DataHub / 宿主对照 / 端口监听 / 挂载列表，逐段定位 "All connection attempts failed"
 
 ### Changed
 
 - **`deploy_container.sh` 默认 host 网络**：`DO_HOST_NETWORK=true`，容器共享宿主网络不再映射端口（同机连 DataHub `127.0.0.1:8002` 最稳，规避 rootless pasta 网桥连不通宿主发布端口）；`--port-map` 才改用端口映射
-- **`deploy_container.sh` 不再默认注入 `datahub_url`**：只有显式 `--datahub-url` / 环境变量 `WAREHOUSE_DATAHUB_URL` 才注入，否则以容器内配置文件的 `datahub_url` 为准（修复：旧脚本默认把 127.0.0.1 注入容器，导致同步指向自身）
-- **`Dockerfile` 移除烤死的 `WAREHOUSE_DATAHUB_URL=127.0.0.1` ENV**：`config.py` 里环境变量优先级高于配置文件，镜像内预设默认值会把挂载 config.json 的 `datahub_url` 盖掉（正是生产 "All connection attempts failed" 的根因之一）。`datahub_url` 以容器内配置文件字段为准
+- **`deploy_container.sh` 不再默认注入 `datahub_url`**：只有显式 `--datahub-url` / 环境变量 `ARTIFACT_DEPOT_DATAHUB_URL` 才注入，否则以容器内配置文件的 `datahub_url` 为准（修复：旧脚本默认把 127.0.0.1 注入容器，导致同步指向自身）
+- **`Dockerfile` 移除烤死的 `ARTIFACT_DEPOT_DATAHUB_URL=127.0.0.1` ENV**：`config.py` 里环境变量优先级高于配置文件，镜像内预设默认值会把挂载 config.json 的 `datahub_url` 盖掉（正是生产 "All connection attempts failed" 的根因之一）。`datahub_url` 以容器内配置文件字段为准
 - **`deploy_container.sh` 新增 `VOLUME_MAPS`**：脚本顶部列表，每项 `宿主机:容器内` 追加挂载；典型用途把改好的 config.json 挂进容器（配置显式可改、无需重建镜像）
-- 默认数据目录随版本：`~/SERVER/datawarehouse/datawarehouse_0.5.0`
+- 默认数据目录随版本：`~/SERVER/artifactdepot/artifactdepot_0.5.0`
 
 ### Fixed
 
 - **生产 token 同步失败（"All connection attempts failed"）全链路**：
-  1. 部署脚本默认注入 `WAREHOUSE_DATAHUB_URL=127.0.0.1`（指向容器自身），改为默认不再注入
-  2. Dockerfile `ENV` 烤死 `WAREHOUSE_DATAHUB_URL` 盖掉挂载配置，移除该 ENV（需重建镜像生效）
+  1. 部署脚本默认注入 `ARTIFACT_DEPOT_DATAHUB_URL=127.0.0.1`（指向容器自身），改为默认不再注入
+  2. Dockerfile `ENV` 烤死 `ARTIFACT_DEPOT_DATAHUB_URL` 盖掉挂载配置，移除该 ENV（需重建镜像生效）
   3. collab 容器 DataHub 只绑 `127.0.0.1:8002`，宿主访问被拒，supervisord.conf 改绑 `0.0.0.0`
   4. rootless pasta 桥接下容器连宿主发布端口不通，DW 容器改默认 host 网络
   （第 1、3、4 项为配置/脚本/容器改动，第 2 项为镜像构建改动）
@@ -141,11 +150,11 @@ DataWarehouse v0.5.5 — 所有对本项目的重要更改都将记录在此文�
 ### Added
 
 - **容器化部署**
-  - 新增 `Dockerfile`（python:3.12-alpine + supervisor + 非 root + `VOLUME /data/warehouse` + 健康检查）
+  - 新增 `Dockerfile`（python:3.12-alpine + supervisor + 非 root + `VOLUME /data/depot` + 健康检查）
   - 新增 `docker/supervisord.conf`（supervisor 托管 uvicorn 8004）
   - 新增 `deploy_container.sh`（参照 collab：建容器 + systemd 开机自启；支持 `--token` / `--datahub-url` / `--data-dir` / `--no-systemd` / `--stop` / `--rm`）
   - 新增 `dev_start_headless.sh`（本地后台启动 + status/tail/logs/stop）
-  - `config.py` 支持**环境变量覆盖**：`WAREHOUSE_DIR` / `WAREHOUSE_DATAHUB_URL` / `WAREHOUSE_ACCESS_TOKEN` / `WAREHOUSE_PORT` / `WAREHOUSE_MAX_UPLOAD_MB`
+  - `config.py` 支持**环境变量覆盖**：`ARTIFACT_DEPOT_DIR` / `ARTIFACT_DEPOT_DATAHUB_URL` / `ARTIFACT_DEPOT_ACCESS_TOKEN` / `ARTIFACT_DEPOT_PORT` / `ARTIFACT_DEPOT_MAX_UPLOAD_MB`
   - Dockerfile 安装 `python-multipart`（上传必需）
 
 - **网页 UI 增强**
@@ -158,7 +167,7 @@ DataWarehouse v0.5.5 — 所有对本项目的重要更改都将记录在此文�
 
 ### Changed
 
-- 构建命令统一为 `env -u HTTP_PROXY ... podman build --network=host -t localhost/datawarehouse:0.4.0 .`
+- 构建命令统一为 `env -u HTTP_PROXY ... podman build --network=host -t localhost/artifactdepot:0.4.0 .`
 
 ## [0.3.0] - 2026-08-07
 
@@ -178,7 +187,7 @@ DataWarehouse v0.5.5 — 所有对本项目的重要更改都将记录在此文�
 ### Added
 
 - **Token 注册表（token 对应用户名）**
-  - 新增 `<warehouse_dir>/tokens.json`，记录每个用户 api_token 对应的用户名
+  - 新增 `<depot_dir>/tokens.json`，记录每个用户 api_token 对应的用户名
   - 管理接口（需管理员共享 token）：`GET/POST/DELETE /api/tokens`
   - 平台在注册/查 Token 时自动推送登记；网页「Token 管理」标签可查看/添加/移除
 
@@ -187,7 +196,7 @@ DataWarehouse v0.5.5 — 所有对本项目的重要更改都将记录在此文�
   - 修复此前只校验共享 token、无法区分「谁上传」的问题
 
 - **审计日志（谁在何时做了什么）**
-  - 追加写 `<warehouse_dir>/audit.log`（JSONL，一行一条，只增不改）
+  - 追加写 `<depot_dir>/audit.log`（JSONL，一行一条，只增不改）
   - 记录：time / action(upload/delete/download/presign) / bucket / key / actor / ip / size / sha256
   - 下载记 actor（平台模块带身份）或 anonymous + 来源 IP；预签名记生成者
   - `GET /api/audit`（需管理员 token）：按 bucket/key/actor/since 过滤查询
@@ -202,8 +211,8 @@ DataWarehouse v0.5.5 — 所有对本项目的重要更改都将记录在此文�
 ### Added
 
 - **初始版本：对象存储仓库站点（S3 模型）**
-  - 项目骨架：`src/datawarehouse/`（FastAPI），配置、存储引擎、认证、API、网页 UI 分层
-  - 存储布局：`<warehouse_dir>/<bucket>/<key>`，bucket=项目，key=任务/文件；每 bucket 一个隐藏元数据清单 `.warehouse.json`（size/sha256/mtime/source_url）
+  - 项目骨架：`src/artifactdepot/`（FastAPI），配置、存储引擎、认证、API、网页 UI 分层
+  - 存储布局：`<depot_dir>/<bucket>/<key>`，bucket=项目，key=任务/文件；每 bucket 一个隐藏元数据清单 `.depot.json`（size/sha256/mtime/source_url）
   - 文件系统为唯一事实源，列表以目录扫描为准；手工放入的文件也能列出
   - 路径穿越防护：bucket 名校验 + key 拒绝绝对路径/`..`/空段/反斜杠/点前缀
 

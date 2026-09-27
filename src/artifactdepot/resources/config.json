@@ -1,0 +1,16 @@
+{
+  "depot_dir": "./depot",
+  "meta_dir": "",
+  "datahub_url": "http://127.0.0.1:8002/api/data",
+  "host": "0.0.0.0",
+  "port": 8004,
+  "access_token": "y",
+  "max_upload_mb": 0,
+  "ui_enabled": true,
+  "signed_links": {
+    "count_min": 1,
+    "count_max": 10,
+    "expire_min_seconds": 60,
+    "expire_max_seconds": 604800
+  }
+}
