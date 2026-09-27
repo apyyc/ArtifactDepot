@@ -1,8 +1,8 @@
 """对象存储引擎 — S3 风格（bucket/key），文件系统为唯一事实源
 
 存储布局：
-  <warehouse_dir>/<bucket>/<key>...            # bucket=项目，key=任务/文件（扁平路径式）
-  <warehouse_dir>/<bucket>/.warehouse.json     # 每 bucket 元数据清单（隐藏，列表跳过）
+  <depot_dir>/<bucket>/<key>...                # bucket=项目，key=任务/文件（扁平路径式）
+  <depot_dir>/<bucket>/.depot.json             # 每 bucket 元数据清单（隐藏，列表跳过）
 
 要点：
   - 列目录以文件系统扫描为准（手工放入的文件也能列出），清单只做元数据补充
@@ -25,7 +25,7 @@ import httpx
 
 from fastapi import HTTPException
 
-from datawarehouse.config import get_config
+from artifactdepot.config import get_config
 
 # 隐藏清单文件名（上传/列表均跳过）
 MANIFEST = ".warehouse.json"
@@ -37,15 +37,32 @@ _DEFAULT_META = {"size": 0, "sha256": "", "mtime": "", "source_url": "", "upload
 # 路径解析与安全
 # ---------------------------------------------------------------------------
 
+def _migrate_legacy_dir(root: Path) -> None:
+    """一次性迁移（ArtifactDepot 0.6.1 改名）：旧 warehouse/ → depot/。
+
+    仅当旧目录存在、新目录不存在且为空位时执行同名 rename（同一文件系统，瞬间完成，
+    不移动文件内容）。已迁移/不存在则静默跳过。"""
+    legacy = root.parent / "warehouse"
+    if legacy.is_dir() and not root.exists():
+        try:
+            legacy.rename(root)
+            print(f"[artifactdepot] 已迁移数据目录: {legacy} -> {root}", flush=True)
+        except OSError as e:
+            print(f"[artifactdepot] 数据目录迁移失败（{e}），将继续使用旧目录", flush=True)
+            raise
+
+
 def get_root() -> Path:
-    return Path(get_config()["warehouse_dir"])
+    root = Path(get_config()["depot_dir"])
+    _migrate_legacy_dir(root)
+    return root
 
 
 def _meta_path(name: str) -> Path:
     """仓库状态文件（tokens.json / signed_links.json / audit.log）路径。
 
-    config.meta_dir 非空时放在该目录（相对路径按 warehouse_dir 解析），
-    否则默认放在 warehouse_dir 下。"""
+    config.meta_dir 非空时放在该目录（相对路径按 depot_dir 解析），
+    否则默认放在 depot_dir 下。"""
     base = get_root()
     d = get_config().get("meta_dir", "").strip()
     if d:

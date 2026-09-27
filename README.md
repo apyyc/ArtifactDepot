@@ -1,6 +1,6 @@
-# DataWarehouse — 对象存储仓库站点
+# ArtifactDepot — 对象存储仓库站点
 
-> 版本 0.5.5，端口 8004，独立服务
+> 版本 0.6.1，端口 8004，独立服务
 
 **一句话**：按行业标准（对象存储 / S3 模型）设计的文件仓库站点，收存处理产物（视频 / 文件），提供上传、列表、Range 下载、删除、新建目录、签名链接与审计，并带网页界面。业务 JSON 数据在 DataHub，**本服务不承担业务逻辑**。
 
@@ -48,7 +48,7 @@
 ### 数据流
 
 - 处理端（carryvideo server.py，跑在 8 或本机）处理完成后把产物推送进来（`POST /api/objects`，token 认证）
-- DataWarehouse（FastAPI :8004）由 `storage.py` 负责 bucket/key 落盘 + 元数据清单 + 签名链接注册表 + 审计：
+- ArtifactDepot（FastAPI :8004）由 `storage.py` 负责 bucket/key 落盘 + 元数据清单 + 签名链接注册表 + 审计：
   - `POST /api/objects` 上传（token 认证，可先 `/api/auth/check` 校验）
   - `POST /api/objects/mkdir` 新建目录
   - `GET /api/objects/list` 列文件
@@ -59,8 +59,8 @@
 
 ### 身份与审计工作流
 
-1. 用户在协作平台成员列表「查看我的 Token」输密码获得 api_token（平台把 token 与用户的映射登记到 DataWarehouse）
-2. 用户用 api_token 上传/下载，DataWarehouse 查本地 `tokens.json`（未命中先拉 DataHub）
+1. 用户在协作平台成员列表「查看我的 Token」输密码获得 api_token（平台把 token 与用户的映射登记到 ArtifactDepot）
+2. 用户用 api_token 上传/下载，ArtifactDepot 查本地 `tokens.json`（未命中先拉 DataHub）
 3. 审计日志记录谁在何时上传/下载/删除/建目录/签名了哪个文件（actor + 局域网 IP + 公网 IP + UTC 时间）
 
 **权限口径**：
@@ -77,29 +77,29 @@
 1. 开发机构建并自动导出
 
 ```bash
-cd DataWarehouse
-./build_image.sh                     # 构建 localhost/datawarehouse:0.5.5 + 自动导出 datawarehouse-0.5.5.tar
+cd ArtifactDepot
+./build_image.sh                     # 构建 localhost/artifactdepot:0.5.5 + 自动导出 artifactdepot-0.5.5.tar
 ```
 
 2. 把 tar 拷到生产机
 
 ```bash
-scp datawarehouse-0.5.5.tar apyyc@<生产机>:~/SERVER/datawarehouse/
+scp artifactdepot-0.5.5.tar apyyc@<生产机>:~/SERVER/artifactdepot/
 ```
 
 3. 生产机导入并部署
 
 ```bash
-cd ~/SERVER/datawarehouse
-podman load -i datawarehouse-0.5.5.tar
-cd DataWarehouse
+cd ~/SERVER/artifactdepot
+podman load -i artifactdepot-0.5.5.tar
+cd ArtifactDepot
 ./deploy_container.sh --token y      # 默认 host 网络；datahub_url 用挂载的 config.json
 ```
 
-> 升级到新版本时数据卷默认指到 `~/SERVER/datawarehouse/datawarehouse_0.5.5/warehouse`（新目录，空）。
-> 若想沿用上一版数据，用 `--data-dir ~/SERVER/datawarehouse/datawarehouse_0.5.2/warehouse` 指过去，
+> 升级到新版本时数据卷默认指到 `~/SERVER/artifactdepot/artifactdepot_0.6.1/warehouse`（新目录，空）。
+> 若想沿用上一版数据，用 `--data-dir ~/SERVER/artifactdepot/artifactdepot_0.5.2/warehouse` 指过去，
 > 或把旧数据目录内容拷贝/移动到新目录（`tokens.json` 可让同步从 DataHub 重新生成）。
-> 若 `~/SERVER` 不可写，脚本会自动回退到 `${XDG_DATA_HOME:-~/.local/share}/datawarehouse/datawarehouse_0.5.5/warehouse`。
+> 若 `~/SERVER` 不可写，脚本会自动回退到 `${XDG_DATA_HOME:-~/.local/share}/artifactdepot/artifactdepot_0.6.1/warehouse`。
 
 ---
 
@@ -124,8 +124,8 @@ pip install fastapi uvicorn httpx python-multipart
 ### 构建镜像（自动导出 tar）
 
 ```bash
-cd DataWarehouse
-./build_image.sh                      # 构建 + 自动导出 datawarehouse-0.5.5.tar
+cd ArtifactDepot
+./build_image.sh                      # 构建 + 自动导出 artifactdepot-0.5.5.tar
 ```
 
 常用参数：
@@ -133,7 +133,7 @@ cd DataWarehouse
 | 参数 | 说明 |
 |---|---|
 | `--no-save` | 只构建，不导出 tar |
-| `--save /path/to/out.tar` | 指定导出路径（默认同目录 `datawarehouse-<tag>.tar`） |
+| `--save /path/to/out.tar` | 指定导出路径（默认同目录 `artifactdepot-<tag>.tar`） |
 | `--no-cache` | 不用构建缓存（依赖层有改动时用） |
 | `--tag <版本>` | 自定义版本标签（默认 0.5.5） |
 | `--load /path/to/in.tar` | 不构建，直接导入已有 tar |
@@ -145,9 +145,9 @@ cd DataWarehouse
 
 ```bash
 # 导出（等价于 build_image.sh 的自动步骤）
-podman save -o datawarehouse-0.5.5.tar localhost/datawarehouse:0.5.5
+podman save -o artifactdepot-0.5.5.tar localhost/artifactdepot:0.5.5
 # 目标机导入
-podman load -i datawarehouse-0.5.5.tar
+podman load -i artifactdepot-0.5.5.tar
 ```
 
 ---
@@ -157,7 +157,7 @@ podman load -i datawarehouse-0.5.5.tar
 ### 本地开发
 
 ```bash
-cd DataWarehouse
+cd ArtifactDepot
 ./dev_start_headless.sh start       # 后台启动 + 日志
 ./dev_start_headless.sh status      # 查看状态
 ./dev_start_headless.sh tail        # 跟踪日志
@@ -176,11 +176,11 @@ cd DataWarehouse
 
 - **默认 host 网络**：容器共享宿主网络，不再映射端口；容器内 `127.0.0.1` 就是宿主机，同机连 DataHub（`http://127.0.0.1:8002/api/data`）最稳。用 `--port-map` 才改为端口映射（rootless 桥接下容器连宿主发布端口常不通）
 - **自启**：Podman 默认生成 `systemd --user` 服务；Docker 没有 `podman generate systemd`，脚本自动改用 `--restart=always`
-- `--token y` / 环境变量 `WAREHOUSE_ACCESS_TOKEN`：注入共享令牌（不传且 config.json 也无 access_token 时写入/管理接口 401）
-- `--datahub-url <地址>` / 环境变量 `WAREHOUSE_DATAHUB_URL`：**显式**注入 DataHub 地址；**不传则不注入**，以容器内配置文件的 `datahub_url` 为准
-- 数据卷默认 `~/SERVER/datawarehouse/datawarehouse_0.5.5/warehouse` 挂到容器 `/data/warehouse`（`--data-dir` 指定；默认目录不可写时自动回退到 `~/.local/share/datawarehouse/...`）
-- **配置挂载**：脚本自动探测 `~/SERVER/datawarehouse/config/config.json` 或 `~/SERVER/datawarehouse/datawarehouse_0.5.5/config/config.json`；也可用 `--config <宿主机路径>` 显式挂载
-- **meta_dir**：默认不注入 `WAREHOUSE_META_DIR`，完全以 config.json 的 `meta_dir` 为准；需要显式覆盖时用 `--meta-dir <容器内路径>`
+- `--token y` / 环境变量 `ARTIFACT_DEPOT_ACCESS_TOKEN`：注入共享令牌（不传且 config.json 也无 access_token 时写入/管理接口 401）
+- `--datahub-url <地址>` / 环境变量 `ARTIFACT_DEPOT_DATAHUB_URL`：**显式**注入 DataHub 地址；**不传则不注入**，以容器内配置文件的 `datahub_url` 为准
+- 数据卷默认 `~/SERVER/artifactdepot/artifactdepot_0.6.1/warehouse` 挂到容器 `/data/depot`（`--data-dir` 指定；默认目录不可写时自动回退到 `~/.local/share/artifactdepot/...`）
+- **配置挂载**：脚本自动探测 `~/SERVER/artifactdepot/config/config.json` 或 `~/SERVER/artifactdepot/artifactdepot_0.6.1/config/config.json`；也可用 `--config <宿主机路径>` 显式挂载
+- **meta_dir**：默认不注入 `ARTIFACT_DEPOT_META_DIR`，完全以 config.json 的 `meta_dir` 为准；需要显式覆盖时用 `--meta-dir <容器内路径>`
 
 ### 首次使用流程
 
@@ -195,13 +195,13 @@ cd DataWarehouse
 
 ## 配置说明
 
-配置文件：`src/datawarehouse/resources/config.json`（可用环境变量 `WAREHOUSE_CONFIG` 指定外部路径）。
+配置文件：`src/artifactdepot/resources/config.json`（可用环境变量 `ARTIFACT_DEPOT_CONFIG` 指定外部路径）。
 
 ### config.json 字段详解
 
 ```json
 {
-  "warehouse_dir": "./warehouse",
+  "depot_dir": "./warehouse",
   "meta_dir": "",
   "datahub_url": "http://127.0.0.1:8002/api/data",
   "host": "0.0.0.0",
@@ -220,8 +220,8 @@ cd DataWarehouse
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
-| `warehouse_dir` | `./warehouse` | 对象存储根目录。相对路径按**项目根**解析（本地免 sudo）；**容器部署填 `/data/warehouse` 卷路径** |
-| `meta_dir` | `""` | **状态文件目录**（`tokens.json` / `signed_links.json` / `audit.log`）。留空 = 放在 `warehouse_dir` 根下；设了则独立存放（相对路径按 `warehouse_dir` 解析）。生产建议 `"/data/warehouse/state"`，把可再生的状态文件与业务文件隔离、备份更清晰（0.5.0 新增） |
+| `depot_dir` | `./warehouse` | 对象存储根目录。相对路径按**项目根**解析（本地免 sudo）；**容器部署填 `/data/depot` 卷路径** |
+| `meta_dir` | `""` | **状态文件目录**（`tokens.json` / `signed_links.json` / `audit.log`）。留空 = 放在 `depot_dir` 根下；设了则独立存放（相对路径按 `depot_dir` 解析）。生产建议 `"/data/depot/state"`，把可再生的状态文件与业务文件隔离、备份更清晰（0.5.0 新增） |
 | `datahub_url` | `http://127.0.0.1:8002/api/data` | 从哪个 DataHub 拉取用户 token（collab 权威源）。**同机 host 网络**部署就用 `127.0.0.1:8002`；跨机用 `http://<IP>:8002/api/data` |
 | `host` | `0.0.0.0` | 监听地址 |
 | `port` | `8004` | 服务端口 |
@@ -239,36 +239,36 @@ cd DataWarehouse
 
 | 环境变量 | 覆盖字段 |
 |---|---|
-| `WAREHOUSE_CONFIG` | 指定整个配置文件路径（优先级最高） |
-| `WAREHOUSE_DIR` | `warehouse_dir` |
-| `WAREHOUSE_META_DIR` | `meta_dir`（0.5.0 新增） |
-| `WAREHOUSE_DATAHUB_URL` | `datahub_url` |
-| `WAREHOUSE_ACCESS_TOKEN` | `access_token` |
-| `WAREHOUSE_PORT` | `port` |
-| `WAREHOUSE_MAX_UPLOAD_MB` | `max_upload_mb` |
+| `ARTIFACT_DEPOT_CONFIG` | 指定整个配置文件路径（优先级最高） |
+| `ARTIFACT_DEPOT_DIR` | `depot_dir` |
+| `ARTIFACT_DEPOT_META_DIR` | `meta_dir`（0.5.0 新增） |
+| `ARTIFACT_DEPOT_DATAHUB_URL` | `datahub_url` |
+| `ARTIFACT_DEPOT_ACCESS_TOKEN` | `access_token` |
+| `ARTIFACT_DEPOT_PORT` | `port` |
+| `ARTIFACT_DEPOT_MAX_UPLOAD_MB` | `max_upload_mb` |
 
 > 优先级：**环境变量 > 配置文件 > 内置默认**。容器部署用 `-e` 传环境变量即可，无需改代码/文件。
 
 ### 配置优先级与生产模板
 
-**镜像内不要烤死 `datahub_url` 默认值**：`config.py` 里环境变量优先级高于配置文件，若 Dockerfile 用 `ENV` 预设 `WAREHOUSE_DATAHUB_URL=127.0.0.1`，即使挂载了写好的 config.json 也会被盖掉（0.5.0 已从 Dockerfile 移除该 ENV）。`datahub_url` 以**容器内配置文件的字段**为准，生产用 `--config` 或 `VOLUME_MAPS` 挂载宿主机 config.json 显式填写。
+**镜像内不要烤死 `datahub_url` 默认值**：`config.py` 里环境变量优先级高于配置文件，若 Dockerfile 用 `ENV` 预设 `ARTIFACT_DEPOT_DATAHUB_URL=127.0.0.1`，即使挂载了写好的 config.json 也会被盖掉（0.5.0 已从 Dockerfile 移除该 ENV）。`datahub_url` 以**容器内配置文件的字段**为准，生产用 `--config` 或 `VOLUME_MAPS` 挂载宿主机 config.json 显式填写。
 
 根目录附有 **`config.production.json`** 生产模板，可整份复制到生产机：
 
 ```bash
-# 生产机（假定文件放 ~/SERVER/datawarehouse/config/config.json）
-mkdir -p ~/SERVER/datawarehouse/config
-cp config.production.json ~/SERVER/datawarehouse/config/config.json
+# 生产机（假定文件放 ~/SERVER/artifactdepot/config/config.json）
+mkdir -p ~/SERVER/artifactdepot/config
+cp config.production.json ~/SERVER/artifactdepot/config/config.json
 # 按需修改 access_token / datahub_url / meta_dir，然后部署时显式挂载：
-./deploy_container.sh --config ~/SERVER/datawarehouse/config/config.json --token <你的token>
+./deploy_container.sh --config ~/SERVER/artifactdepot/config/config.json --token <你的token>
 # 也可只挂配置、token 从 config.json 读取：
-# ./deploy_container.sh --config ~/SERVER/datawarehouse/config/config.json
+# ./deploy_container.sh --config ~/SERVER/artifactdepot/config/config.json
 ```
 
 ```json
 {
-  "warehouse_dir": "/data/warehouse",
-  "meta_dir": "/data/warehouse/state",
+  "depot_dir": "/data/depot",
+  "meta_dir": "/data/depot/state",
   "datahub_url": "http://127.0.0.1:8002/api/data",
   "host": "0.0.0.0",
   "port": 8004,
@@ -291,7 +291,7 @@ cp config.production.json ~/SERVER/datawarehouse/config/config.json
 ## 目录结构
 
 ```
-DataWarehouse/
+ArtifactDepot/
 - README.md / CHANGELOG.md / docs/architecture.md
 - config.production.json          # 生产可直接复制的配置模板（0.5.0）
 - check_dw_sync.sh                # 生产诊断脚本（python3-only，不依赖 curl/jq）
@@ -302,7 +302,7 @@ DataWarehouse/
 - deploy_container.sh             # 部署脚本：建容器 + Podman systemd / Docker restart（--config/--meta-dir/--token/--datahub-url/--data-dir/--port-map）
 - dev_start_headless.sh           # 本地后台启动脚本
 - scripts/start.sh                # 本地启动脚本（自动找带 uvicorn 的 python）
-- src/datawarehouse/
+- src/artifactdepot/
   - main.py                       # FastAPI 入口 + lifespan（建目录 + 启动同步）
   - config.py                     # 配置加载（默认 < 文件 < 环境变量；meta_dir）
   - storage.py                    # 核心引擎：路径安全 / bucket-key / manifest / 签名链接注册表 / token 注册表 / 审计 / DataHub 同步 / mkdir / meta_dir
@@ -320,14 +320,14 @@ DataWarehouse/
 ### 磁盘存储布局
 
 ```
-<warehouse_dir>/                  # 如 ./warehouse 或 /data/warehouse
+<depot_dir>/                  # 如 ./warehouse 或 /data/depot
 - <bucket>/                       # bucket = 项目（如 音视门carryVdeio）
   - 任务1/交付物/a.mp4             # key = 路径，含 / 即子目录
   - 任务1/交付物/.keep             # 新建目录的隐藏占位（列表跳过）
-  - .warehouse.json               # 该 bucket 元数据清单（隐藏）
+  - .depot.json               # 该 bucket 元数据清单（隐藏）
 - ...（bucket 们）
 
-<meta_dir>/（可选，默认在 warehouse_dir 根下；0.5.0 起可用 meta_dir 单独放）
+<meta_dir>/（可选，默认在 depot_dir 根下；0.5.0 起可用 meta_dir 单独放）
 - tokens.json                     # token 与用户名映射注册表（DataHub 同步副本）
 - signed_links.json               # 签名链接注册表（时效/次数/作废）
 - audit.log                       # 审计日志（JSONL 追加）
@@ -335,7 +335,7 @@ DataWarehouse/
 
 **key 与目录**：`key` 是文件在 bucket 里的完整路径，含 `/` 自动建子目录（如 `key=任务1/交付物/a.mp4`）。网页点「新建目录」输入名（可含 `/` 多级）创建空目录，或直接以 `key=二级目录/文件名` 上传自动建目录。
 
-**meta_dir**：默认状态文件与 bucket 同根；设 `meta_dir` 后 `tokens.json` / `signed_links.json` / `audit.log` 移到指定目录（相对路径按 `warehouse_dir` 解析），与上传的业务文件隔离。
+**meta_dir**：默认状态文件与 bucket 同根；设 `meta_dir` 后 `tokens.json` / `signed_links.json` / `audit.log` 移到指定目录（相对路径按 `depot_dir` 解析），与上传的业务文件隔离。
 
 ---
 
@@ -343,8 +343,8 @@ DataWarehouse/
 
 | 模块 | 职责 |
 |---|---|
-| `config.py` | 合并 默认 < 配置文件 < 环境变量；相对路径按项目根解析；支持 `meta_dir` / `WAREHOUSE_META_DIR` |
-| `storage.py` | **核心引擎**：bucket/key 落盘、路径穿越防护、SHA-256、`.warehouse.json` 清单、签名链接注册表（创建/校验/次数递减/作废）、token 注册表、审计日志（双 IP + UTC）、DataHub 同步、mkdir、空目录删除策略、`_dir_recursive_info()` 目录递归统计（大小/最新 mtime）、`_meta_path` 状态文件定位（meta_dir） |
+| `config.py` | 合并 默认 < 配置文件 < 环境变量；相对路径按项目根解析；支持 `meta_dir` / `ARTIFACT_DEPOT_META_DIR` |
+| `storage.py` | **核心引擎**：bucket/key 落盘、路径穿越防护、SHA-256、`.depot.json` 清单、签名链接注册表（创建/校验/次数递减/作废）、token 注册表、审计日志（双 IP + UTC）、DataHub 同步、mkdir、空目录删除策略、`_dir_recursive_info()` 目录递归统计（大小/最新 mtime）、`_meta_path` 状态文件定位（meta_dir） |
 | `auth.py` | `check_admin_token`（UTF-8 字节常量时间比较，非 ASCII 安全）、`resolve_actor`、`resolve_actor_with_sync`（惰性同步）、`require_write_token` / `require_admin` |
 | `api/objects.py` | 对象 API：上传（multipart）、列表、下载（token 鉴权 + Range）、删除（仅管理员 + 空目录）、mkdir、签名链接（presign / config / list / revoke） |
 | `api/system.py` | 健康检查、bucket 列表、Token 注册表 CRUD、`/api/tokens/sync`（含 ok/error）、`/api/auth/check`、审计查询 |
@@ -376,9 +376,9 @@ DataWarehouse/
 |---|---|
 | 鉴权 | 任一有效 token |
 | 请求 | multipart/form-data：`file`(必)、`bucket`(必，=项目)、`key`(必，含 `/` 自动建目录)、`token`、`source_url`、`overwrite`(默认 `true`)、`public_ip` |
-| 成功 | `data:{bucket, key, size, sha256}`；`.warehouse.json` 同时记录 `uploader`（按 token 识别为「系统/工具」或用户名） |
+| 成功 | `data:{bucket, key, size, sha256}`；`.depot.json` 同时记录 `uploader`（按 token 识别为「系统/工具」或用户名） |
 | 错误 | `401` 无效 token；`413` 超过 `max_upload_mb` 上限；`409` `overwrite=false` 且对象已存在 |
-| 说明 | 流式落盘到 `<warehouse_dir>/<bucket>/<key>`，写审计（双 IP、UTC）；key 父目录自动创建；小文件/常规上传直接走本接口；大文件建议使用下面的分片接口 |
+| 说明 | 流式落盘到 `<depot_dir>/<bucket>/<key>`，写审计（双 IP、UTC）；key 父目录自动创建；小文件/常规上传直接走本接口；大文件建议使用下面的分片接口 |
 
 #### 分片上传（多线程）— `POST /api/objects/initiate|chunk|complete|abort`
 
@@ -391,7 +391,7 @@ DataWarehouse/
 | `complete` | `POST /api/objects/complete` | multipart/form-data：`upload_id`、`bucket`、`key`、`total_chunks`、`source_url`、`overwrite`、`public_ip`；合并并落盘 |
 | `abort` | `POST /api/objects/abort` | `upload_id`；放弃并清理临时分片 |
 
-> 说明：`complete` 会校验所有分片齐全、合并后复用 `put_object` 写 `.warehouse.json` 与审计；
+> 说明：`complete` 会校验所有分片齐全、合并后复用 `put_object` 写 `.depot.json` 与审计；
 > 前端对 `>8MB` 文件自动走分片流程（并发 4 路），`<=8MB` 走普通 `POST /api/objects`。
 
 #### 新建目录 — `POST /api/objects/mkdir`
@@ -455,7 +455,7 @@ DataWarehouse/
 `?token=` → `data:{valid: bool, actor: "用户名"|"系统/工具"|""}`；上传/下载前先审核。
 
 #### 健康检查 — `GET /health`
-`{"status":"ok","warehouse_dir":"...","exists":true}`
+`{"status":"ok","depot_dir":"...","exists":true}`
 
 #### 列 bucket — `GET /api/buckets`
 返回 `data:[...]` bucket（项目）列表。
@@ -503,17 +503,17 @@ curl -o out.mp4 "$BASE/api/objects/download?bucket=音视门carryVdeio&key=任�
 
 # 签名链接 —— 按时效
 curl -X POST -H "Content-Type: application/json" -H "Authorization: Bearer $USER" \
-  -d '{"bucket":"音视门carryVdeio","key":"datawarehouse_0.5.5.tar","mode":"time","expires":3600}' \
+  -d '{"bucket":"音视门carryVdeio","key":"artifactdepot_0.6.1.tar","mode":"time","expires":3600}' \
   "$BASE/api/objects/presign"
 
 # 签名链接 —— 按次数（3 次）
 curl -X POST -H "Content-Type: application/json" -H "Authorization: Bearer $USER" \
-  -d '{"bucket":"音视门carryVdeio","key":"datawarehouse_0.5.5.tar","mode":"count","count":3}' \
+  -d '{"bucket":"音视门carryVdeio","key":"artifactdepot_0.6.1.tar","mode":"count","count":3}' \
   "$BASE/api/objects/presign"
 
 # 签名链接 —— 永久
 curl -X POST -H "Content-Type: application/json" -H "Authorization: Bearer $USER" \
-  -d '{"bucket":"音视门carryVdeio","key":"datawarehouse_0.5.5.tar","mode":"permanent"}' \
+  -d '{"bucket":"音视门carryVdeio","key":"artifactdepot_0.6.1.tar","mode":"permanent"}' \
   "$BASE/api/objects/presign"
 
 # 删除（仅管理员；目录仅空可删）
@@ -558,7 +558,7 @@ curl -X POST -H "Authorization: Bearer $ADMIN" "$BASE/api/tokens/sync"
 | 审计时间不准 / 显示 UTC | 后端统一记 UTC（`...Z`），前端自动转**浏览器本地时间**；容器已设 `TZ=Asia/Shanghai` 兜底 |
 | 审计「公网 IP」为空 | 公网 IP 由浏览器调 ipify 尽力上报；外网不可达或签名链接外站直连时为空（局域网 IP 仍记录） |
 | 同步不到新用户 token | 两处 users.json 不一致（指向不同 DataHub）、JSON 重复键、该用户 `api_token` 为空；按钮会提示 DataHub 是否可达 |
-| **生产同步报 "All connection attempts failed"** | 三层根因（0.5.0 已修前两层）：1. 旧脚本默认注入 `WAREHOUSE_DATAHUB_URL=127.0.0.1` 指向自身，0.5.0 起不传 `--datahub-url` 就不注入，以 config.json 为准；2. 旧镜像 Dockerfile 烤死 `WAREHOUSE_DATAHUB_URL` 盖掉挂载 config，0.5.0 已移除该 ENV，**需重建镜像**；3. collab 的 DataHub 只绑 `127.0.0.1:8002` 宿主访问不通，supervisord.conf 改 `0.0.0.0`。用 `bash check_dw_sync.sh` 一键定位 |
+| **生产同步报 "All connection attempts failed"** | 三层根因（0.5.0 已修前两层）：1. 旧脚本默认注入 `ARTIFACT_DEPOT_DATAHUB_URL=127.0.0.1` 指向自身，0.5.0 起不传 `--datahub-url` 就不注入，以 config.json 为准；2. 旧镜像 Dockerfile 烤死 `ARTIFACT_DEPOT_DATAHUB_URL` 盖掉挂载 config，0.5.0 已移除该 ENV，**需重建镜像**；3. collab 的 DataHub 只绑 `127.0.0.1:8002` 宿主访问不通，supervisord.conf 改 `0.0.0.0`。用 `bash check_dw_sync.sh` 一键定位 |
 | **容器访问不到宿主 8002** | rootless pasta 网桥下容器连宿主发布端口常不通；`deploy_container.sh` 默认 host 网络即解决，容器内用 `127.0.0.1:8002` 直连 |
 | **tokens.json 生成位置不对** | 0.5.0 起可用 `meta_dir` 指定状态文件目录；改 `config.py`/`storage.py` 后**需重建镜像**再部署（运行中镜像不带新代码，只改配置不生效） |
 | 访问 `:8002` 连接被重置 | collab 容器默认只映射 8003；用多端口部署把 8002 也 `-p` 出来，并确认 DataHub 绑 `0.0.0.0` |

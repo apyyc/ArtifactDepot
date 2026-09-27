@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# DataWarehouse 本地启动脚本（源码模式，端口 8004）
+# ArtifactDepot 本地启动脚本（源码模式，端口 8004）
 # 用法: ./scripts/start.sh [--port 8004] [--config /path/to/config.json] [--reload]
 set -euo pipefail
 
@@ -18,9 +18,9 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-export WAREHOUSE_CONFIG="${CONFIG:-$DIR/src/datawarehouse/resources/config.json}"
+export ARTIFACT_DEPOT_CONFIG="${CONFIG:-$DIR/src/artifactdepot/resources/config.json}"
 cd "$DIR/src"
 PY="$(find_uvicorn_python)" || exit 1
-echo "[DataWarehouse] 启动于 0.0.0.0:${PORT}  reload=${RELOAD:-off}  python=${PY}"
-echo "[DataWarehouse] 配置: ${WAREHOUSE_CONFIG}"
-exec env PYTHONPATH=. "$PY" -m uvicorn datawarehouse.main:app --host 0.0.0.0 --port "$PORT" $RELOAD
+echo "[ArtifactDepot] 启动于 0.0.0.0:${PORT}  reload=${RELOAD:-off}  python=${PY}"
+echo "[ArtifactDepot] 配置: ${ARTIFACT_DEPOT_CONFIG}"
+exec env PYTHONPATH=. "$PY" -m uvicorn artifactdepot.main:app --host 0.0.0.0 --port "$PORT" $RELOAD

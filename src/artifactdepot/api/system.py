@@ -2,9 +2,9 @@
 from fastapi import APIRouter, Depends, Query, Request
 from pydantic import BaseModel
 
-from datawarehouse import storage
-from datawarehouse.auth import extract_token, require_admin, require_write_token, resolve_actor_with_sync
-from datawarehouse.config import get_config
+from artifactdepot import storage
+from artifactdepot.auth import extract_token, require_admin, require_write_token, resolve_actor_with_sync
+from artifactdepot.config import get_config
 
 router = APIRouter(tags=["System"])
 
@@ -24,7 +24,7 @@ async def auth_check(request: Request, token: str = Query("")):
 @router.get("/health")
 async def health():
     root = storage.get_root()
-    return {"status": "ok", "warehouse_dir": str(root), "exists": root.exists()}
+    return {"status": "ok", "depot_dir": str(root), "exists": root.exists()}
 
 
 @router.get("/api/buckets")

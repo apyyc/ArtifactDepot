@@ -12,9 +12,9 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Reques
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-from datawarehouse import storage
-from datawarehouse.auth import extract_token, require_admin, require_write_token, resolve_actor_with_sync
-from datawarehouse.config import get_config
+from artifactdepot import storage
+from artifactdepot.auth import extract_token, require_admin, require_write_token, resolve_actor_with_sync
+from artifactdepot.config import get_config
 
 router = APIRouter(prefix="/api/objects", tags=["Objects"])
 
@@ -41,7 +41,7 @@ async def upload(
 ):
     """上传对象（PutObject）。multipart：file + bucket + key + token + source_url + public_ip
 
-    写临时文件 → 流式落盘到 <warehouse_dir>/<bucket>/<key>，计算 SHA-256 记入清单与审计。
+    写临时文件 → 流式落盘到 <depot_dir>/<bucket>/<key>，计算 SHA-256 记入清单与审计。
     """
     # 令牌：query > 表单字段 > Bearer 头（未命中本地注册表时先拉 DataHub 一次）
     tok = request.query_params.get("token") or token

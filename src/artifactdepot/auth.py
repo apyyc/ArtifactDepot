@@ -13,8 +13,8 @@ import hmac
 
 from fastapi import HTTPException, Request
 
-from datawarehouse import storage
-from datawarehouse.config import get_config
+from artifactdepot import storage
+from artifactdepot.config import get_config
 
 
 def check_admin_token(token: str) -> bool:

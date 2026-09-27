@@ -1,5 +1,5 @@
 {
-  "warehouse_dir": "./warehouse",
+  "depot_dir": "./depot",
   "meta_dir": "",
   "datahub_url": "http://127.0.0.1:8002/api/data",
   "host": "0.0.0.0",

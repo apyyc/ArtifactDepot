@@ -4,7 +4,7 @@ from pathlib import Path
 from fastapi import APIRouter
 from fastapi.responses import HTMLResponse
 
-from datawarehouse.config import get_config
+from artifactdepot.config import get_config
 
 router = APIRouter(tags=["Web"])
 

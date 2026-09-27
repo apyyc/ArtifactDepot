@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 # ============================================================
-# DataWarehouse 生产诊断脚本（只依赖宿主 python3）
+# ArtifactDepot 生产诊断脚本（只依赖宿主 python3）
 #
 # 用法：
-#   bash check_dw_sync.sh [容器名]        # 默认容器名 datawarehouse
-#   FORCE=podman bash check_dw_sync.sh
-#   FORCE=docker bash check_dw_sync.sh
+#   bash check_ad_sync.sh [容器名]        # 默认容器名 artifactdepot
+#   FORCE=podman bash check_ad_sync.sh
+#   FORCE=docker bash check_ad_sync.sh
 #
 # 检查内容：
 #   1. 容器状态
-#   2. /data/warehouse 挂载与全部 bind mount
-#   3. WAREHOUSE_DIR / WAREHOUSE_META_DIR / WAREHOUSE_DATAHUB_URL 环境变量
-#   4. 容器内 resources/config.json 的 warehouse_dir / meta_dir / datahub_url
+#   2. /data/depot 挂载与全部 bind mount
+#   3. ARTIFACT_DEPOT_DIR / ARTIFACT_DEPOT_META_DIR / ARTIFACT_DEPOT_DATAHUB_URL 环境变量
+#   4. 容器内 resources/config.json 的 depot_dir / meta_dir / datahub_url
 #   5. 容器内访问 DataHub users.json
 #   6. 宿主机访问 DataHub users.json
 #   7. 应用 /health
@@ -23,14 +23,14 @@
 
 set -uo pipefail
 
-CONTAINER="${1:-datawarehouse}"
+CONTAINER="${1:-artifactdepot}"
 
 case "$CONTAINER" in
   -h|--help)
     cat <<'USAGE'
-用法: bash check_dw_sync.sh [容器名]
+用法: bash check_ad_sync.sh [容器名]
 
-默认容器名: datawarehouse
+默认容器名: artifactdepot
 环境变量: FORCE=podman|docker
 USAGE
     exit 0
@@ -125,7 +125,7 @@ else:
 # --- 2. 挂载检查 -----------------------------------------------------------
 mounts = data.get("Mounts") or []
 if not mounts:
-    warn("/data/warehouse 未发现 bind mount，数据可能写在容器内部")
+    warn("/data/depot 未发现 bind mount，数据可能写在容器内部")
 else:
     ok(f"发现 {len(mounts)} 个挂载:")
     for m in mounts:
@@ -133,11 +133,11 @@ else:
         dst = m.get("Destination", "?")
         mode = "rw" if m.get("RW", True) else "ro"
         print(f"       {src} → {dst} ({mode})")
-    main = [m for m in mounts if m.get("Destination") == "/data/warehouse"]
+    main = [m for m in mounts if m.get("Destination") == "/data/depot"]
     if main:
-        ok(f"/data/warehouse 已挂载: {main[0].get('Source')}")
+        ok(f"/data/depot 已挂载: {main[0].get('Source')}")
     else:
-        fail("/data/warehouse 没有绑定到宿主机目录")
+        fail("/data/depot 没有绑定到宿主机目录")
 
 # --- 3. 环境变量 -----------------------------------------------------------
 env_list = (data.get("Config") or {}).get("Env") or []
@@ -147,28 +147,28 @@ for item in env_list:
         k, v = item.split("=", 1)
         env[k] = v
 
-warehouse_dir_env = env.get("WAREHOUSE_DIR", "")
-meta_dir_env = env.get("WAREHOUSE_META_DIR", "")
-datahub_env = env.get("WAREHOUSE_DATAHUB_URL", "")
-token_env = env.get("WAREHOUSE_ACCESS_TOKEN", "")
+depot_dir_env = env.get("ARTIFACT_DEPOT_DIR", "")
+meta_dir_env = env.get("ARTIFACT_DEPOT_META_DIR", "")
+datahub_env = env.get("ARTIFACT_DEPOT_DATAHUB_URL", "")
+token_env = env.get("ARTIFACT_DEPOT_ACCESS_TOKEN", "")
 
-if warehouse_dir_env:
-    ok(f"WAREHOUSE_DIR={warehouse_dir_env}")
+if depot_dir_env:
+    ok(f"ARTIFACT_DEPOT_DIR={depot_dir_env}")
 else:
-    warn("WAREHOUSE_DIR 未注入，warehouse_dir 将按 config.json 解析")
+    warn("ARTIFACT_DEPOT_DIR 未注入，depot_dir 将按 config.json 解析")
 
 if meta_dir_env:
-    info(f"WAREHOUSE_META_DIR={meta_dir_env}（会覆盖 config.json 的 meta_dir）")
+    info(f"ARTIFACT_DEPOT_META_DIR={meta_dir_env}（会覆盖 config.json 的 meta_dir）")
 else:
-    info("WAREHOUSE_META_DIR 未注入（meta_dir 以 config.json 为准）")
+    info("ARTIFACT_DEPOT_META_DIR 未注入（meta_dir 以 config.json 为准）")
 
 if datahub_env:
-    info(f"WAREHOUSE_DATAHUB_URL={datahub_env}（会覆盖 config.json 的 datahub_url）")
+    info(f"ARTIFACT_DEPOT_DATAHUB_URL={datahub_env}（会覆盖 config.json 的 datahub_url）")
 else:
-    info("WAREHOUSE_DATAHUB_URL 未注入（datahub_url 以 config.json 为准）")
+    info("ARTIFACT_DEPOT_DATAHUB_URL 未注入（datahub_url 以 config.json 为准）")
 
 # --- 4. 容器内 config.json -------------------------------------------------
-config_path = "/app/datawarehouse/src/datawarehouse/resources/config.json"
+config_path = "/app/artifactdepot/src/artifactdepot/resources/config.json"
 cp = run([tool, "exec", container, "cat", config_path])
 config = {}
 if cp.returncode == 0:
@@ -183,17 +183,17 @@ else:
 def cfg(key, default=""):
     return config.get(key, default)
 
-warehouse_dir = warehouse_dir_env or cfg("warehouse_dir", "")
+depot_dir = depot_dir_env or cfg("depot_dir", "")
 meta_dir = meta_dir_env or cfg("meta_dir", "")
 datahub_url = datahub_env or cfg("datahub_url", "")
 token = token_env or cfg("access_token", "")
 
-if warehouse_dir:
-    info(f"最终 warehouse_dir: {warehouse_dir}")
+if depot_dir:
+    info(f"最终 depot_dir: {depot_dir}")
 if meta_dir:
     info(f"最终 meta_dir: {meta_dir}")
 else:
-    info("最终 meta_dir: 空（状态文件放在 warehouse_dir 根下）")
+    info("最终 meta_dir: 空（状态文件放在 depot_dir 根下）")
 if datahub_url:
     info(f"最终 datahub_url: {datahub_url}")
 else:

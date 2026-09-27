@@ -1,11 +1,11 @@
-# DataWarehouse 接口文档
+# ArtifactDepot 接口文档
 
 > 版本 0.6.0 · FastAPI 服务 · 默认端口 8004
 >
 > 0.6.0 变更：新增 `POST /api/buckets`（显式创建 bucket）、`POST /api/objects/rename`（重命名/移动目录）、`GET /api/objects/head`（对象元信息探测）；新增「十一、其他项目接入指南（bucket/目录/文件 push-pull）」。
 >
-> 本文档描述 DataWarehouse（对象存储仓库站点）对外提供的全部 HTTP 接口、调用规范与权限模型。
-> 接口定义源码：`src/datawarehouse/api/objects.py`、`src/datawarehouse/api/system.py`、`src/datawarehouse/web/ui.py`；鉴权实现：`src/datawarehouse/auth.py`。
+> 本文档描述 ArtifactDepot（对象存储仓库站点）对外提供的全部 HTTP 接口、调用规范与权限模型。
+> 接口定义源码：`src/artifactdepot/api/objects.py`、`src/artifactdepot/api/system.py`、`src/artifactdepot/web/ui.py`；鉴权实现：`src/artifactdepot/auth.py`。
 
 ---
 
@@ -13,13 +13,13 @@
 
 ### 1.1 服务地址与端口
 
-DataWarehouse 是独立 FastAPI 服务，默认监听 **8004** 端口（host 网络下 8004 即宿主机端口）：
+ArtifactDepot 是独立 FastAPI 服务，默认监听 **8004** 端口（host 网络下 8004 即宿主机端口）：
 
 ```
 http://<主机IP>:8004
 ```
 
-可选通过 Nginx 反代为 `location /warehouse/` 前缀，此时路径为 `http://<主机IP>/warehouse/...`，本文档以裸 8004 为基准。
+可选通过 Nginx 反代为 `location /depot/` 前缀，此时路径为 `http://<主机IP>/depot/...`，本文档以裸 8004 为基准。
 
 ### 1.2 统一响应格式
 
@@ -35,7 +35,7 @@ http://<主机IP>:8004
 
 - 成功时 HTTP 状态码通常为 **200**，`code` 字段为 `0`。
 - 失败时 HTTP 状态码直接表达错误类别（见 1.6 错误码），`detail` 字段带具体原因（FastAPI HTTPException 风格）。
-- `/health` 为健康检查专用，直接返回 `{"status":"ok","warehouse_dir":"...","exists":true}`，不使用统一包装。
+- `/health` 为健康检查专用，直接返回 `{"status":"ok","depot_dir":"...","exists":true}`，不使用统一包装。
 
 ### 1.3 鉴权模型（核心）
 
@@ -82,7 +82,7 @@ token 校验规则：
 
 - 不允许含 `\`；前后 `/` 会被自动去除，去除后不能为空。
 - 不允许出现空段、`.`、`..`（防路径穿越）。
-- 任意路径段都不允许以 `.` 开头（避免与 `.warehouse.json`、`.keep` 等隐藏约定冲突）。
+- 任意路径段都不允许以 `.` 开头（避免与 `.depot.json`、`.keep` 等隐藏约定冲突）。
 - 支持多级目录，如 `carryvideo/20260815/tranvideo-1_20260815/tranvideo-1_20260815.mp4`。
 - 对象操作接口（上传 / 下载 / 删除 / presign）要求 key 非空；列表接口的 `prefix` 可以为空（表示根目录）。
 
@@ -163,7 +163,7 @@ GET /api/objects/list
 
 - 目录：`{ "name", "key"（末尾带 /）, "is_dir": true, "size", "mtime" }`；空目录的 `mtime` 为目录自身 mtime。
 - 文件：`{ "name", "key", "is_dir": false, "size", "mtime", "sha256", "source_url", "uploader" }`。
-- 手工放入、没有 `.warehouse.json` 记录的文件也能列出，但 `sha256/source_url/uploader` 为空，`mtime` 回退为文件系统 mtime。
+- 手工放入、没有 `.depot.json` 记录的文件也能列出，但 `sha256/source_url/uploader` 为空，`mtime` 回退为文件系统 mtime。
 
 **示例**：
 
@@ -419,7 +419,7 @@ GET /health
 
 **鉴权**：公开
 
-返回 `{ "status": "ok", "warehouse_dir": "...", "exists": true }`。
+返回 `{ "status": "ok", "depot_dir": "...", "exists": true }`。
 
 ### 4.2 列出所有 bucket
 
@@ -570,14 +570,14 @@ GET /
 
 ## 九、配置项与调用相关
 
-DataWarehouse 配置优先级：内置默认 < `resources/config.json`（或 `WAREHOUSE_CONFIG` 指定文件）< 环境变量。
+ArtifactDepot 配置优先级：内置默认 < `resources/config.json`（或 `ARTIFACT_DEPOT_CONFIG` 指定文件）< 环境变量。
 
 影响接口调用的关键配置：
 
 | 配置 | 默认 | 说明 |
 |---|---|---|
-| `port` | 8004 | 服务端口（环境变量 `WAREHOUSE_PORT`） |
-| `access_token` | — | 管理员共享令牌，生产必须修改（`WAREHOUSE_ACCESS_TOKEN`） |
+| `port` | 8004 | 服务端口（环境变量 `ARTIFACT_DEPOT_PORT`） |
+| `access_token` | — | 管理员共享令牌，生产必须修改（`ARTIFACT_DEPOT_ACCESS_TOKEN`） |
 | `max_upload_mb` | 0（不限） | 单文件上传上限 |
 | `datahub_url` | `http://127.0.0.1:8002/api/data` | 用户 token 权威源 |
 | `ui_enabled` | true | 是否启用网页 UI |
@@ -594,7 +594,7 @@ DataWarehouse 配置优先级：内置默认 < `resources/config.json`（或 `WA
 
 ## 十一、其他项目接入指南（bucket / 目录 / 文件 push-pull）
 
-面向需要与 DataWarehouse 集成的业务项目，按功能给出标准调用序列。客户端建议封装成轻量 SDK，统一携带 `Authorization: Bearer <token>`、统一解析 1.2 响应结构。
+面向需要与 ArtifactDepot 集成的业务项目，按功能给出标准调用序列。客户端建议封装成轻量 SDK，统一携带 `Authorization: Bearer <token>`、统一解析 1.2 响应结构。
 
 ### 11.1 创建 bucket
 

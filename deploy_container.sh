@@ -1,26 +1,26 @@
 #!/usr/bin/env bash
 # ============================================================
-# DataWarehouse 部署脚本：从「已有镜像」创建容器 → 运行 → 配置自启
+# ArtifactDepot 部署脚本：从「已有镜像」创建容器 → 运行 → 配置自启
 #
-# 前提：镜像已存在（如 localhost/datawarehouse:0.5.5）
+# 前提：镜像已存在（如 localhost/artifactdepot:0.5.5）
 #
-# 数据卷：默认挂载 ${HOME}/SERVER/datawarehouse/datawarehouse_0.5.5/warehouse
-#   → /data/warehouse；若该默认路径不可写，会自动回退到
-#   ${XDG_DATA_HOME:-$HOME/.local/share}/datawarehouse/datawarehouse_0.5.5/warehouse。
+# 数据卷：默认挂载 ${HOME}/SERVER/artifactdepot/artifactdepot_0.6.1/warehouse
+#   → /data/depot；若该默认路径不可写，会自动回退到
+#   ${XDG_DATA_HOME:-$HOME/.local/share}/artifactdepot/artifactdepot_0.6.1/warehouse。
 #   - 用 --data-dir <路径> 显式指定挂载位置（显式路径不可写会直接报错）
 #   - 加 --no-volume 可跳过挂载（用镜像内数据，删除容器即丢失）
-#   - 主数据卷始终注入 WAREHOUSE_DIR=/data/warehouse，固定数据落点
+#   - 主数据卷始终注入 ARTIFACT_DEPOT_DIR=/data/depot，固定数据落点
 #   - meta_dir 默认不注入环境变量，以容器内 config.json 为准；
 #     需要覆盖时用 --meta-dir <容器内目录>
 #
 # 仓库令牌 / DataHub 地址：
-#   - token：--token <值> 或环境变量 WAREHOUSE_ACCESS_TOKEN
-#   - datahub_url：--datahub-url <地址> 或环境变量 WAREHOUSE_DATAHUB_URL；
+#   - token：--token <值> 或环境变量 ARTIFACT_DEPOT_ACCESS_TOKEN
+#   - datahub_url：--datahub-url <地址> 或环境变量 ARTIFACT_DEPOT_DATAHUB_URL；
 #     不传时**不注入环境变量**，以容器内配置文件的 datahub_url 为准。
 #
 # 配置文件挂载：
-#   - 默认自动探测 ${HOME}/SERVER/datawarehouse/config/config.json
-#     或 ${HOME}/SERVER/datawarehouse/<image>_<tag>/config/config.json
+#   - 默认自动探测 ${HOME}/SERVER/artifactdepot/config/config.json
+#     或 ${HOME}/SERVER/artifactdepot/<image>_<tag>/config/config.json
 #   - 也可用 --config <宿主机配置路径> 显式挂载到容器内 config.json
 #   - 未找到配置时使用镜像内 resources/config.json
 #
@@ -29,7 +29,7 @@
 #   ./deploy_container.sh --data-dir /path/to/data   # 指定挂载位置
 #   ./deploy_container.sh --config ~/dw/config.json  # 挂载外部配置
 #   ./deploy_container.sh --token xxx --datahub-url http://ip:8002/api/data
-#   ./deploy_container.sh --meta-dir /data/warehouse/state
+#   ./deploy_container.sh --meta-dir /data/depot/state
 #   ./deploy_container.sh --port-map                 # 改用端口映射
 #   ./deploy_container.sh --no-systemd               # 只建容器，不配自启
 #   ./deploy_container.sh --stop                     # 停止并禁用自启
@@ -46,29 +46,29 @@ set -euo pipefail
 : "${HOME:?HOME 未设置}"
 
 # ---------- 可配置参数（按需修改） ----------
-IMAGE_NAME="datawarehouse"           # 镜像名
+IMAGE_NAME="artifactdepot"           # 镜像名
 IMAGE_TAG="0.5.5"                    # 镜像版本标签
 FULL_IMAGE="localhost/${IMAGE_NAME}:${IMAGE_TAG}"
-CONTAINER_NAME="datawarehouse"       # 容器名
+CONTAINER_NAME="artifactdepot"       # 容器名
 HOST_PORT="8004"                     # 宿主机映射端口（仅 --port-map 使用）
 CONTAINER_PORT="8004"                # 容器内端口
-CONTAINER_DATA_PATH="/data/warehouse"  # 容器内数据目录（由 Dockerfile VOLUME 固定）
-CONTAINER_CONFIG_PATH="/app/datawarehouse/src/datawarehouse/resources/config.json"
+CONTAINER_DATA_PATH="/data/depot"  # 容器内数据目录（由 Dockerfile VOLUME 固定）
+CONTAINER_CONFIG_PATH="/app/artifactdepot/src/artifactdepot/resources/config.json"
 
 # 宿主机默认数据目录（按版本隔离）。默认不可写时自动回退到用户数据目录。
-DATA_BASE="${HOME}/SERVER/datawarehouse"
+DATA_BASE="${HOME}/SERVER/artifactdepot"
 DEFAULT_DATA_DIR="${DATA_BASE}/${IMAGE_NAME}_${IMAGE_TAG}/warehouse"
 DATA_DIR="$DEFAULT_DATA_DIR"
 DATA_DIR_EXPLICIT=false
 VOLUME_ENABLED=true
 
 # 容器内状态文件目录（tokens.json / signed_links.json / audit.log）。
-# 留空 = 不注入 WAREHOUSE_META_DIR，完全以容器内 config.json 的 meta_dir 为准。
+# 留空 = 不注入 ARTIFACT_DEPOT_META_DIR，完全以容器内 config.json 的 meta_dir 为准。
 META_DIR_CONTAINER=""
 
 # 默认配置文件候选路径：
-#   1) 多个版本共用的 ~/SERVER/datawarehouse/config/config.json
-#   2) 与数据目录同级的 ~/SERVER/datawarehouse/<image>_<tag>/config/config.json
+#   1) 多个版本共用的 ~/SERVER/artifactdepot/config/config.json
+#   2) 与数据目录同级的 ~/SERVER/artifactdepot/<image>_<tag>/config/config.json
 # 找到第一个存在的文件就自动挂载；也可用 --config 显式覆盖。
 DEFAULT_CONFIG_CANDIDATES=(
   "${DATA_BASE}/config/config.json"
@@ -84,8 +84,8 @@ done
 unset _cfg
 
 # 仓库令牌与 DataHub 地址（可用 --token / --datahub-url 覆盖，也可用环境变量）
-WAREHOUSE_TOKEN="${WAREHOUSE_ACCESS_TOKEN:-}"
-DATAHUB_URL="${WAREHOUSE_DATAHUB_URL:-}"
+ARTIFACT_DEPOT_TOKEN="${ARTIFACT_DEPOT_ACCESS_TOKEN:-}"
+DATAHUB_URL="${ARTIFACT_DEPOT_DATAHUB_URL:-}"
 
 SERVICE_NAME="container-${CONTAINER_NAME}"
 SYSTEMD_DIR="${HOME}/.config/systemd/user"
@@ -96,11 +96,11 @@ usage() {
 用法: ./deploy_container.sh [选项]
 
 选项:
-  --data-dir <路径>      宿主机数据目录（挂载到容器 /data/warehouse）
+  --data-dir <路径>      宿主机数据目录（挂载到容器 /data/depot）
   --config <路径>        宿主机 config.json（挂载到容器 resources/config.json）
-  --meta-dir <路径>      容器内 meta_dir；不传则不注入 WAREHOUSE_META_DIR
-  --token <值>           注入 WAREHOUSE_ACCESS_TOKEN
-  --datahub-url <地址>   注入 WAREHOUSE_DATAHUB_URL
+  --meta-dir <路径>      容器内 meta_dir；不传则不注入 ARTIFACT_DEPOT_META_DIR
+  --token <值>           注入 ARTIFACT_DEPOT_ACCESS_TOKEN
+  --datahub-url <地址>   注入 ARTIFACT_DEPOT_DATAHUB_URL
   --no-volume            不挂载数据卷（不推荐，数据随容器删除）
   --port-map             使用端口映射（默认 host 网络）
   --network-host         使用 host 网络（默认）
@@ -111,8 +111,8 @@ usage() {
 
 环境变量:
   FORCE=podman|docker           强制指定容器工具
-  WAREHOUSE_ACCESS_TOKEN        默认 token
-  WAREHOUSE_DATAHUB_URL         默认 DataHub 地址
+  ARTIFACT_DEPOT_ACCESS_TOKEN        默认 token
+  ARTIFACT_DEPOT_DATAHUB_URL         默认 DataHub 地址
   XDG_DATA_HOME                 默认数据目录回退根
 USAGE
 }
@@ -153,7 +153,7 @@ while [[ $# -gt 0 ]]; do
     --token)
       shift
       if [ $# -eq 0 ]; then echo "❌ --token 需要参数" >&2; exit 1; fi
-      WAREHOUSE_TOKEN="$1"
+      ARTIFACT_DEPOT_TOKEN="$1"
       ;;
     --datahub-url)
       shift
@@ -205,7 +205,7 @@ fi
 # stop/rm 不需要创建数据目录，跳过预检。
 if [ "$VOLUME_ENABLED" = true ] && [ "$DO_STOP" = false ] && [ "$DO_RM" = false ]; then
   if [ "$DATA_DIR_EXPLICIT" = false ] && ! can_write_path "$DATA_DIR"; then
-    FALLBACK_DATA_DIR="${XDG_DATA_HOME:-${HOME}/.local/share}/datawarehouse/${IMAGE_NAME}_${IMAGE_TAG}/warehouse"
+    FALLBACK_DATA_DIR="${XDG_DATA_HOME:-${HOME}/.local/share}/artifactdepot/${IMAGE_NAME}_${IMAGE_TAG}/warehouse"
     FALLBACK_DATA_DIR="$(make_absolute "$FALLBACK_DATA_DIR")"
     echo "⚠️  默认数据目录不可写: $DATA_DIR" >&2
     echo "   自动回退到: $FALLBACK_DATA_DIR" >&2
@@ -315,17 +315,17 @@ if [ "$VOLUME_ENABLED" = true ]; then
   VOLUME_ARGS=(-v "${DATA_DIR}:${CONTAINER_DATA_PATH}")
   echo "   挂载: ${DATA_DIR} → ${CONTAINER_DATA_PATH}"
   # 固定应用数据根到卷挂载点。
-  ENV_ARGS+=(-e "WAREHOUSE_DIR=${CONTAINER_DATA_PATH}")
-  echo "   WAREHOUSE_DIR=${CONTAINER_DATA_PATH}"
+  ENV_ARGS+=(-e "ARTIFACT_DEPOT_DIR=${CONTAINER_DATA_PATH}")
+  echo "   ARTIFACT_DEPOT_DIR=${CONTAINER_DATA_PATH}"
 else
   echo "   未挂载卷，使用镜像内数据（删除容器数据即丢失）"
 fi
 # meta_dir 不强制覆盖，保留 config.json 语义；只有 --meta-dir 显式指定才注入。
 if [ -n "$META_DIR_CONTAINER" ]; then
-  ENV_ARGS+=(-e "WAREHOUSE_META_DIR=${META_DIR_CONTAINER}")
-  echo "   WAREHOUSE_META_DIR=${META_DIR_CONTAINER}（显式注入，覆盖 config.json）"
+  ENV_ARGS+=(-e "ARTIFACT_DEPOT_META_DIR=${META_DIR_CONTAINER}")
+  echo "   ARTIFACT_DEPOT_META_DIR=${META_DIR_CONTAINER}（显式注入，覆盖 config.json）"
 else
-  echo "   WAREHOUSE_META_DIR 未注入 → meta_dir 以容器内 config.json 为准"
+  echo "   ARTIFACT_DEPOT_META_DIR 未注入 → meta_dir 以容器内 config.json 为准"
 fi
 
 # 附加卷映射（配置文件等）
@@ -343,14 +343,14 @@ if [ ${#VOLUME_MAPS[@]} -eq 0 ]; then
   echo "   ℹ️  未配置外部 config.json，使用镜像内 resources/config.json"
 fi
 
-if [ -n "$WAREHOUSE_TOKEN" ]; then
-  ENV_ARGS+=(-e "WAREHOUSE_ACCESS_TOKEN=$WAREHOUSE_TOKEN")
+if [ -n "$ARTIFACT_DEPOT_TOKEN" ]; then
+  ENV_ARGS+=(-e "ARTIFACT_DEPOT_ACCESS_TOKEN=$ARTIFACT_DEPOT_TOKEN")
   echo "   token: 已设置"
 else
-  echo "   ⚠️  未通过 --token / WAREHOUSE_ACCESS_TOKEN 注入 token；若 config.json 也无 access_token，写操作会 401"
+  echo "   ⚠️  未通过 --token / ARTIFACT_DEPOT_ACCESS_TOKEN 注入 token；若 config.json 也无 access_token，写操作会 401"
 fi
 if [ -n "$DATAHUB_URL" ]; then
-  ENV_ARGS+=(-e "WAREHOUSE_DATAHUB_URL=$DATAHUB_URL")
+  ENV_ARGS+=(-e "ARTIFACT_DEPOT_DATAHUB_URL=$DATAHUB_URL")
   echo "   datahub_url: $DATAHUB_URL（显式注入环境变量）"
 else
   echo "   datahub_url: 未显式指定 → 以容器内配置文件（config.json）的 datahub_url 为准"
