@@ -18,6 +18,7 @@ DEFAULT = {
     "access_token": "change-me",              # 写操作访问令牌（管理员/工具；生产必须修改）
     "max_upload_mb": 0,                       # 单文件上传上限（0 = 不限）
     "ui_enabled": True,                       # 是否启用网页 UI
+    "require_read_token": False,              # 读接口（buckets/list）是否也要求 token（默认 false 保持内网公开）
     "signed_links": {                         # 签名链接上下限（count=次数，expire=时效秒数）
         "count_min": 1,
         "count_max": 10,

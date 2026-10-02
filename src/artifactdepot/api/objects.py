@@ -1,8 +1,9 @@
-"""S3-like 对象 API：上传 / 列表 / 下载（Range）/ 删除 / 预签名
+"""S3-like 对象 API：上传 / 列表 / 下载（Range）/ 删除 / 预签名 / 分片
 
-所有写操作解析操作者身份（actor）并写审计日志：
-- 共享 access_token → "系统/工具"
-- 用户 token（tokens.json 注册表）→ 用户名
+所有受保护接口按「权限点（scope）」鉴权（见 permissions.py / auth.py）：
+- 每个接口对应一个 scope，可逐接口为 token 勾选启用；
+- 管理员共享 access_token 放行全部；
+- token 可限定 bucket / 路径前缀范围。
 """
 import mimetypes
 import tempfile
@@ -13,7 +14,10 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from artifactdepot import storage
-from artifactdepot.auth import extract_token, require_admin, require_write_token, resolve_actor_with_sync
+from artifactdepot.auth import (
+    Principal, ensure_scope, extract_form_token, extract_token, require_principal,
+    require_scope, resolve_principal,
+)
 from artifactdepot.config import get_config
 
 router = APIRouter(prefix="/api/objects", tags=["Objects"])
@@ -24,8 +28,28 @@ def _client_ip(request: Request) -> str:
 
 
 def _public_ip(request: Request) -> str:
-    """前端上报的公网 IP（query public_ip / 上传表单字段）；无则空"""
     return (request.query_params.get("public_ip") or "").strip()
+
+
+def _read_requires_token() -> bool:
+    """读接口是否要求带 token（默认 false，保持历史公开行为）"""
+    return bool(get_config().get("require_read_token", False))
+
+
+async def _optional_read_principal(request: Request, scope: str):
+    """读接口鉴权：require_read_token=true 时强制 scope；否则有 token 且具备 scope 才返回主体"""
+    token = extract_token(request)
+    principal = await resolve_principal(token) if token else None
+    if _read_requires_token():
+        if not principal:
+            raise HTTPException(401, detail="缺少或无效的访问令牌")
+        ensure_scope(principal, scope)
+        return principal
+    if principal is None:
+        return None
+    if not principal.is_admin and not principal.has_scope(scope):
+        return None
+    return principal
 
 
 @router.post("")
@@ -41,17 +65,12 @@ async def upload(
 ):
     """上传对象（PutObject）。multipart：file + bucket + key + token + source_url + public_ip
 
-    写临时文件 → 流式落盘到 <depot_dir>/<bucket>/<key>，计算 SHA-256 记入清单与审计。
+    权限：object:upload；token 有 bucket/前缀范围时按资源校验。
     """
-    # 令牌：query > 表单字段 > Bearer 头（未命中本地注册表时先拉 DataHub 一次）
-    tok = request.query_params.get("token") or token
-    if not tok:
-        auth = request.headers.get("authorization", "")
-        if auth.lower().startswith("bearer "):
-            tok = auth[7:].strip()
-    actor = await resolve_actor_with_sync(tok)
-    if not actor:
-        raise HTTPException(401, detail="无效的访问令牌")
+    tok = await extract_form_token(request) or token.strip()
+    principal = await resolve_principal(tok)
+    ensure_scope(principal, "object:upload", bucket=bucket, key=key)
+    storage.touch_token(tok)
 
     max_mb = get_config().get("max_upload_mb", 0) or 0
     suffix = Path(file.filename or "").suffix
@@ -67,21 +86,30 @@ async def upload(
         tmp_path = Path(tmp.name)
 
     try:
-        result = storage.put_object(bucket, key, tmp_path, source_url, overwrite, uploader=actor)
+        result = storage.put_object(bucket, key, tmp_path, source_url, overwrite, uploader=principal.actor)
     except HTTPException:
         raise
     finally:
         tmp_path.unlink(missing_ok=True)
 
-    storage.audit("upload", bucket, key, actor, _client_ip(request),
+    storage.audit("upload", bucket, key, principal.actor, _client_ip(request),
                   size=result["size"], sha256=result["sha256"],
                   public_ip=public_ip or _public_ip(request))
     return {"code": 0, "message": "success", "data": result}
 
 
 @router.get("/list")
-async def list_objects(bucket: str, prefix: str = ""):
-    """列对象（ListObjects）。bucket=项目，prefix=任务路径（可空）"""
+async def list_objects(request: Request, bucket: str, prefix: str = ""):
+    """列对象（ListObjects）。默认公开；require_read_token=true 时需 object:list。
+
+    带资源范围的 token：在允许范围内正常列出；范围外按匿名处理（公开模式下不阻断、
+    也不泄露额外信息）。require_read_token=true 时 `_optional_read_principal` 已强制校验。
+    """
+    principal = await _optional_read_principal(request, "object:list")
+    if principal is not None and not principal.is_admin:
+        from artifactdepot.auth import resource_allowed
+        if not resource_allowed(principal, bucket, prefix):
+            principal = None
     items = storage.list_objects(bucket, prefix)
     return {"code": 0, "message": "success",
             "data": {"bucket": bucket, "prefix": prefix, "items": items}}
@@ -89,8 +117,9 @@ async def list_objects(bucket: str, prefix: str = ""):
 
 @router.get("/head")
 async def head(request: Request, bucket: str, key: str,
-               actor: str = Depends(require_write_token)):
-    """对象元信息探测（0.6.0）：轻量判断文件/目录是否存在；不存在时 HTTP 仍为 200，exists=false"""
+               actor: Principal = Depends(require_scope("object:head"))):
+    """对象元信息探测：轻量判断文件/目录是否存在；不存在时 HTTP 仍为 200，exists=false"""
+    ensure_scope(actor, "object:head", bucket=bucket, key=key)
     return {"code": 0, "message": "success", "data": storage.head_object(bucket, key)}
 
 
@@ -103,19 +132,18 @@ async def download(
     sig: str = Query(None, description="旧式 HMAC 签名（兼容）"),
     link: str = Query(None, description="签名链接 ID（注册表）"),
     tk: str = Query(None, description="签名链接密钥"),
-    token: str = Query("", description="访问令牌（非签名链接时必填，管理员或用户 token）"),
+    token: str = Query("", description="访问令牌（非签名链接时必填）"),
 ):
-    """下载对象（GetObject）。Starlette FileResponse 原生支持 Range(206)，视频可拖动。
+    """下载对象（GetObject）。签名链接（link+tk / expires+sig）免 token；否则需 object:download。
 
     鉴权优先级：
     1. link+tk（注册表签名链接）→ 校验次数/过期/作废，免 token
     2. expires+sig（旧式 HMAC）→ 校验签名，免 token
-    3. 否则 → 必须带有效 token（管理员或用户），actor 从 token 推导
+    3. 否则 → token 必须含 object:download 且资源范围允许
     """
     p = storage.object_path(bucket, key)
 
     if link is not None or tk is not None:
-        # 先确认对象存在，再消费次数，避免「对象已不在但链接次数仍被扣掉」
         if not p.is_file():
             raise HTTPException(404, detail=f"对象不存在：{bucket}/{key}")
         ok, actor, err = storage.consume_signed_link(link or "", tk or "", bucket, key)
@@ -126,10 +154,11 @@ async def download(
             raise HTTPException(401, detail="签名无效或已过期")
         actor = "signed-link"
     else:
-        token = token or extract_token(request)
-        actor = await resolve_actor_with_sync(token)
-        if not actor:
-            raise HTTPException(401, detail="无效的访问令牌")
+        tok = token or extract_token(request)
+        principal = await resolve_principal(tok)
+        ensure_scope(principal, "object:download", bucket=bucket, key=key)
+        actor = principal.actor
+        storage.touch_token(tok)
 
     if not p.is_file():
         raise HTTPException(404, detail=f"对象不存在：{bucket}/{key}")
@@ -143,10 +172,11 @@ async def download(
 
 @router.delete("")
 async def delete(bucket: str, key: str,
-                 request: Request, actor: str = Depends(require_admin)):
-    """删除对象或目录（DeleteObject）。仅管理员共享 token 可删"""
+                 request: Request, actor: Principal = Depends(require_scope("object:delete"))):
+    """删除对象或目录（DeleteObject）。需要 object:delete 权限"""
+    ensure_scope(actor, "object:delete", bucket=bucket, key=key)
     result = storage.delete_object(bucket, key)
-    storage.audit("delete", bucket, key, actor, _client_ip(request), public_ip=_public_ip(request))
+    storage.audit("delete", bucket, key, actor.actor, _client_ip(request), public_ip=_public_ip(request))
     return {"code": 0, "message": "success", "data": result}
 
 
@@ -156,10 +186,12 @@ class MkdirRequest(BaseModel):
 
 
 @router.post("/mkdir")
-async def mkdir(body: MkdirRequest, request: Request, actor: str = Depends(require_write_token)):
-    """新建目录（任一有效 token）：按 key 创建目录树 + 隐藏 .keep 占位"""
+async def mkdir(body: MkdirRequest, request: Request,
+                actor: Principal = Depends(require_scope("object:mkdir"))):
+    """新建目录：按 key 创建目录树 + 隐藏 .keep 占位"""
+    ensure_scope(actor, "object:mkdir", bucket=body.bucket, key=body.key)
     result = storage.mkdir(body.bucket, body.key)
-    storage.audit("mkdir", body.bucket, body.key, actor, _client_ip(request), public_ip=_public_ip(request))
+    storage.audit("mkdir", body.bucket, body.key, actor.actor, _client_ip(request), public_ip=_public_ip(request))
     return {"code": 0, "message": "success", "data": result}
 
 
@@ -171,10 +203,13 @@ class RenameRequest(BaseModel):
 
 
 @router.post("/rename")
-async def rename(body: RenameRequest, request: Request, actor: str = Depends(require_write_token)):
-    """重命名/移动目录或对象（0.6.0）：整体迁移前缀下对象与 .keep 占位，失败回滚"""
+async def rename(body: RenameRequest, request: Request,
+                 actor: Principal = Depends(require_scope("object:rename"))):
+    """重命名/移动目录或对象：整体迁移前缀下对象与 .keep 占位，失败回滚"""
+    ensure_scope(actor, "object:rename", bucket=body.bucket, key=body.key)
+    ensure_scope(actor, "object:rename", bucket=body.bucket, key=body.new_key)
     result = storage.rename_object(body.bucket, body.key, body.new_key, body.overwrite)
-    storage.audit("rename", body.bucket, body.key, actor, _client_ip(request),
+    storage.audit("rename", body.bucket, body.key, actor.actor, _client_ip(request),
                   public_ip=_public_ip(request),
                   extra={"from_key": result["from_key"], "to_key": result["to_key"]})
     return {"code": 0, "message": "success", "data": result}
@@ -190,14 +225,15 @@ class PresignRequest(BaseModel):
 
 @router.post("/presign")
 async def presign(body: PresignRequest,
-                  request: Request, actor: str = Depends(require_write_token)):
-    """生成签名下载链接（任一有效 token 可签）。mode: count/time/permanent"""
+                  request: Request, actor: Principal = Depends(require_scope("link:create"))):
+    """生成签名下载链接。需要 link:create；资源范围允许的 bucket/key 才能签"""
+    ensure_scope(actor, "link:create", bucket=body.bucket, key=body.key)
     entry = storage.create_signed_link(body.bucket, body.key, body.mode,
                                        count=body.count, expires=body.expires,
-                                       created_by=actor)
+                                       created_by=actor.actor)
     url = (f"/api/objects/download?bucket={entry['bucket']}&key={entry['key']}"
            f"&link={entry['id']}&tk={entry['token']}")
-    storage.audit("presign", entry["bucket"], entry["key"], actor, _client_ip(request), public_ip=_public_ip(request))
+    storage.audit("presign", entry["bucket"], entry["key"], actor.actor, _client_ip(request), public_ip=_public_ip(request))
     return {"code": 0, "message": "success",
             "data": {"url": url, "id": entry["id"], "mode": entry["mode"],
                      "max_uses": entry["max_uses"], "remaining": entry["remaining"],
@@ -217,30 +253,44 @@ async def signed_links_config():
 
 
 @router.get("/signed-links")
-async def list_signed_links(request: Request, actor: str = Depends(require_write_token)):
-    """列签名链接：任一有效 token 可见全部条目；完整链接 URL 仅管理员/创建者可看，密钥不回传"""
+async def list_signed_links(request: Request,
+                            actor: Principal = Depends(require_scope("link:list"))):
+    """列签名链接：有 link:list 权限可见；完整链接 URL 仅管理员/创建者可看"""
     links = storage.load_signed_links()
+    out = []
     for l in links:
-        is_mine = actor == "系统/工具" or l.get("created_by") == actor
+        if not actor.is_admin and not _link_in_scope(actor, l):
+            continue
+        l = dict(l)
+        is_mine = actor.is_admin or l.get("created_by") == actor.actor
         if is_mine:
             l["url"] = (f"/api/objects/download?bucket={l.get('bucket','')}"
                         f"&key={l.get('key','')}&link={l.get('id','')}&tk={l.get('token','')}")
         else:
             l["url"] = ""
         l.pop("token", None)
-    return {"code": 0, "message": "success", "data": links}
+        out.append(l)
+    return {"code": 0, "message": "success", "data": out}
+
+
+def _link_in_scope(principal: Principal, link: dict) -> bool:
+    from artifactdepot.auth import resource_allowed
+    return resource_allowed(principal, link.get("bucket", ""), link.get("key", ""))
 
 
 @router.post("/signed-links/{link_id}/revoke")
-async def revoke_link(link_id: str, request: Request, actor: str = Depends(require_write_token)):
+async def revoke_link(link_id: str, request: Request,
+                      actor: Principal = Depends(require_scope("link:revoke"))):
     """作废签名链接：管理员可作废任意；用户只能作废自己创建的"""
     entry = storage.get_signed_link(link_id)
     if not entry:
         raise HTTPException(404, detail="链接不存在")
-    if actor != "系统/工具" and entry.get("created_by") != actor:
+    ensure_scope(actor, "link:revoke", bucket=entry.get("bucket", ""), key=entry.get("key", ""))
+    if not actor.is_admin and entry.get("created_by") != actor.actor:
         raise HTTPException(403, detail="只能作废自己创建的链接")
     storage.revoke_signed_link(link_id)
-    storage.audit("revoke", entry.get("bucket", ""), entry.get("key", ""), actor, _client_ip(request), public_ip=_public_ip(request))
+    storage.audit("revoke", entry.get("bucket", ""), entry.get("key", ""), actor.actor,
+                  _client_ip(request), public_ip=_public_ip(request))
     return {"code": 0, "message": "success"}
 
 
@@ -252,7 +302,8 @@ CHUNK_SIZE = 8 * 1024 * 1024
 
 
 @router.post("/initiate")
-async def initiate_upload(request: Request, actor: str = Depends(require_write_token)):
+async def initiate_upload(request: Request,
+                          actor: Principal = Depends(require_scope("upload:initiate"))):
     """创建分片上传会话，返回 upload_id 与 chunk_size"""
     upload_id = storage.create_chunk_session()
     return {"code": 0, "message": "success",
@@ -265,9 +316,13 @@ async def upload_chunk(
     upload_id: str = Form(...),
     index: int = Form(...),
     chunk: UploadFile = File(...),
-    actor: str = Depends(require_write_token),
+    token: str = Form(""),
 ):
-    """上传一个分片（multipart：upload_id + index + chunk 文件）"""
+    """上传一个分片（multipart：upload_id + index + chunk 文件）。权限 upload:chunk"""
+    tok = await extract_form_token(request) or token.strip()
+    principal = await resolve_principal(tok)
+    ensure_scope(principal, "upload:chunk")
+    storage.touch_token(tok)
     suffix = Path(chunk.filename or "").suffix or ".bin"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         while part := await chunk.read(1024 * 1024):
@@ -290,14 +345,18 @@ async def complete_upload(
     source_url: str = Form(""),
     overwrite: bool = Form(True),
     public_ip: str = Form(""),
-    actor: str = Depends(require_write_token),
+    token: str = Form(""),
 ):
-    """合并分片并完成上传"""
+    """合并分片并完成上传。权限 upload:complete，并校验 bucket/key 资源范围"""
+    tok = await extract_form_token(request) or token.strip()
+    principal = await resolve_principal(tok)
+    ensure_scope(principal, "upload:complete", bucket=bucket, key=key)
+    storage.touch_token(tok)
     result = storage.finalize_chunk_upload(
         upload_id, bucket, key, total_chunks,
-        source_url, uploader=actor, overwrite=overwrite,
+        source_url, uploader=principal.actor, overwrite=overwrite,
     )
-    storage.audit("upload", bucket, key, actor, _client_ip(request),
+    storage.audit("upload", bucket, key, principal.actor, _client_ip(request),
                   size=result["size"], sha256=result["sha256"],
                   public_ip=public_ip or _public_ip(request))
     return {"code": 0, "message": "success", "data": result}
@@ -307,8 +366,12 @@ async def complete_upload(
 async def abort_upload(
     request: Request,
     upload_id: str = Form(...),
-    actor: str = Depends(require_write_token),
+    token: str = Form(""),
 ):
-    """取消分片上传并清理临时分片"""
+    """取消分片上传并清理临时分片。权限 upload:abort"""
+    tok = await extract_form_token(request) or token.strip()
+    principal = await resolve_principal(tok)
+    ensure_scope(principal, "upload:abort")
+    storage.touch_token(tok)
     result = storage.abort_chunk_session(upload_id)
     return {"code": 0, "message": "success", "data": result}

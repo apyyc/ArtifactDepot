@@ -1,11 +1,49 @@
 # Changelog
 
-ArtifactDepot v0.6.1 — 所有对本项目的重要更改都将记录在此文件中。
+ArtifactDepot v0.7.0 — 所有对本项目的重要更改都将记录在此文件中。
 
 本日志格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本号遵循 [语义化版本规范](https://semver.org/lang/zh-CN/)。
 
 ---
+
+## [0.7.0] - 2026-10-02
+
+### Added
+
+- **权限点（scope）模型**：每个受保护接口对应一个权限点，新增 `permissions.py` 权限目录与角色预设（`viewer` / `downloader` / `uploader` / `publisher` / `operator` / `auditor` / `user` / `custom` / `admin`）。
+- **自定义 Token 生成**：`POST /api/tokens` 支持 `role` + `scopes`（逐接口勾选）+ `allow_buckets` + `allow_prefixes` + `expires_at` + `description`；`token` 留空由服务端生成，响应一次性返回明文。
+- **权限目录接口**：`GET /api/auth/permissions` 返回全部接口、权限点、角色预设，供前端渲染「逐接口勾选」；`GET /api/auth/check` 返回 `role/scopes/allow_buckets/expires_at`。
+- **资源范围约束**：token 可限定 bucket 白名单与 bucket 内路径前缀白名单（带路径边界判断，`a/b` 不匹配 `a/bc`）。
+- **Token 更新接口**：`PUT /api/tokens/{value}` 可改权限/范围/过期/禁用；`GET /api/tokens?reveal=true` 管理员可看明文（默认脱敏）。
+- **Token 管理页改造**：角色预设下拉、逐接口勾选（按功能组）、bucket/前缀/过期/说明输入、「生成本轮 Token」按钮与一次性明文展示；列表展示角色/权限点数/范围/过期/状态。
+- **配置项 `require_read_token`**（默认 false）：为 true 时读接口 `GET /api/buckets`、`GET /api/objects/list` 也要求 `bucket:list` / `object:list`，实现全量最小权限。
+- **审计**：新增 `token_create` / `token_delete` 动作记录。
+
+### Changed
+
+- **`tokens.json` 升级为 v2 结构**（`{"_version":2,"tokens":{...}}`）；旧字符串格式自动兼容为 `role=user`，行为与历史一致（上传/下载/签名/建目录/建 bucket/改名，无删除与管理）。
+- **`GET /api/objects/head` 由“写 token”改为 `object:head` 读权限**。
+- **删除接口**由“仅管理员”改为 `object:delete` 权限点，可按需授予运营 token（管理员仍可）。
+- **权限依赖重构**：`require_write_token` / `require_admin` 保留兼容，新增 `require_scope(...)` 与端点内 `ensure_scope(...)`；下载、上传、分片、签名、rename 等均做资源范围校验。
+- **DataHub 同步语义加固**：同步只更新用户身份，**不覆盖**已有的 role/scopes/资源范围/过期。
+- 平台旧协议 `POST /api/tokens {token,user}`（不带权限字段）只更新用户名，保留已有权限，避免把精细权限重置。
+
+### Security
+
+- 非管理员 `GET /api/tokens` 不再以明文 token 作为返回 key（改为脱敏 key + 脱敏展示）。
+- 带资源范围的 token 列 bucket / 列表 / 签名链接时按范围过滤。
+
+### Docs
+
+- `docs/api_rules.md` 新增第十二章「权限点与自定义 Token 生成」；`README.md` 更新鉴权表与配置项。
+
+### Backward Compatibility
+
+- 共享 `access_token` 行为不变（超管）。
+- 旧 token 无需迁移，继续可用（等价 `role=user`）。
+- 公开读接口默认行为不变；如需收紧设 `require_read_token=true`。
+
 
 ## [0.6.1] - 2026-09-28
 

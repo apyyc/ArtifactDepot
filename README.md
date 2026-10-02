@@ -1,6 +1,6 @@
 # ArtifactDepot — 对象存储仓库站点
 
-> 版本 0.6.1，端口 8004，独立服务
+> 版本 0.7.0，端口 8004，独立服务
 
 **一句话**：按行业标准（对象存储 / S3 模型）设计的文件仓库站点，收存处理产物（视频 / 文件），提供上传、列表、Range 下载、删除、新建目录、签名链接与审计，并带网页界面。业务 JSON 数据在 DataHub，**本服务不承担业务逻辑**。
 
@@ -228,6 +228,7 @@ cd ArtifactDepot
 | `access_token` | `change-me` | **管理员/工具共享令牌**：识别为「系统/工具」，可执行全部操作；管理接口（Token/审计）也用它。生产必改 |
 | `max_upload_mb` | `0` | 单文件上传上限（MB）。`0` = 不限 |
 | `ui_enabled` | `true` | 是否启用网页 UI（`false` 时 `GET /` 返回 403，API 照常） |
+| `require_read_token` | `false` | 读接口（`/api/buckets`、`/api/objects/list`）是否要求 `bucket:list` / `object:list` 权限；默认 false 保持内网公开 |
 | `signed_links.count_min` | `1` | 签名链接**次数**下限（按次数类型） |
 | `signed_links.count_max` | `10` | 签名链接**次数**上限 |
 | `signed_links.expire_min_seconds` | `60` | 签名链接**时效**下限（秒） |
@@ -363,8 +364,10 @@ ArtifactDepot/
 | 等级 | 令牌 | 权限 |
 |---|---|---|
 | 管理员共享 token | `config.json` 的 `access_token` | 全部操作（含 Token/审计管理、删除） |
-| 用户 token | 协作平台「查看我的 Token」 | 上传 / 下载 / 建目录 / 签名 / 列表 |
+| 用户 token | 协作平台「查看我的 Token」或管理员生成 | 由 token 携带的权限点（scope）决定；旧 token 默认相当于历史全量写权限 |
 | 签名链接 | `link` + `tk` 参数 | 仅该链接指向对象的下载（免 token） |
+
+> 0.7.0 起支持**逐接口勾选生成自定义 Token**：管理员在「Token 管理」页选择角色/勾选接口/限定 bucket 与路径前缀/设置过期时间，点击「生成本轮 Token」。接口权限目录见 `GET /api/auth/permissions`；详见 `docs/api_rules.md` 第十二章。
 
 传递方式：`?token=` 查询参数，或 `Authorization: Bearer <token>`，或 multipart 表单 `token` 字段。
 
