@@ -115,26 +115,62 @@
   <!-- ============ Token 管理（管理员） ============ -->
   <div id="sec-tokens" style="display:none;">
     <div class="card">
-      <h3 style="margin:0 0 8px;font-size:14px;">Token 注册表（token → 用户名）</h3>
+      <h3 style="margin:0 0 8px;font-size:14px;">Token 注册表</h3>
       <div class="row">
         <label>管理员令牌:</label>
         <input id="admToken" placeholder="共享 access_token" style="width:220px;" />
         <button onclick="loadTokens()">查询</button>
         <button class="ghost" onclick="syncTokens()">从 DataHub 同步</button>
+        <label style="margin-left:8px;"><input type="checkbox" id="tkReveal" onchange="loadTokens()"> 显示明文</label>
         <span class="muted" id="syncInfo"></span>
       </div>
       <table>
-        <thead><tr><th>用户</th><th>Token</th><th>操作</th></tr></thead>
+        <thead><tr><th>用户</th><th>Token</th><th>角色</th><th>权限点数</th><th>资源范围</th><th>过期</th><th>状态</th><th>操作</th></tr></thead>
         <tbody id="tokensBody"></tbody>
       </table>
-      <hr style="margin:10px 0;" />
-      <h4 style="margin:4px 0 8px;font-size:13px;">登记 / 更新</h4>
+      <div class="muted" style="margin-top:4px;">每行下方展示该 token 的具体权限点；「显示明文」需管理员令牌。</div>
+    </div>
+
+    <div class="card">
+      <h3 style="margin:0 0 8px;font-size:14px;">生成本轮 Token（逐接口勾选）</h3>
       <div class="row">
-        <input id="tkToken" placeholder="token" class="mono" style="width:260px;" />
-        <input id="tkUser" placeholder="用户名" style="width:140px;" />
-        <button onclick="addToken()">添加/更新</button>
+        <label>用户名:</label>
+        <input id="tkUser" placeholder="如 zhangsan / 处理端-8" style="width:180px;" />
+        <label>角色预设:</label>
+        <select id="tkRole" onchange="applyRolePreset()" style="width:230px;"></select>
+        <label>过期:</label>
+        <input id="tkExpires" placeholder="留空=永久；如 2026-12-31" style="width:160px;" />
+        <label>说明:</label>
+        <input id="tkDesc" placeholder="用途备注（可选）" style="width:200px;" />
       </div>
-      <div class="muted" style="margin-top:4px;">平台会在注册/查Token时自动登记；此处供手动补录/修正。</div>
+      <div class="row">
+        <label>Bucket 白名单:</label>
+        <input id="tkBuckets" placeholder="留空=全部；逗号分隔，如 voicevideo,myproj" style="width:340px;" class="mono" />
+      </div>
+      <div class="row">
+        <label>路径前缀白名单:</label>
+        <input id="tkPrefixes" placeholder="留空=全部；格式 bucket:前缀，逗号分隔，如 voicevideo:carryvideo/2026/" style="width:420px;" class="mono" />
+      </div>
+
+      <div class="row" style="margin-top:8px;">
+        <button class="ghost" onclick="tkSelectAll(true)">全选</button>
+        <button class="ghost" onclick="tkSelectAll(false)">全不选</button>
+        <button class="ghost" onclick="tkSelectWrite(false)">仅勾选读</button>
+        <button class="ghost" onclick="tkSelectWrite(true)">仅勾选写</button>
+      </div>
+
+      <div id="tkCatalog"></div>
+
+      <div class="row" style="margin-top:12px;">
+        <button onclick="generateToken()">生成本轮 Token</button>
+        <span class="muted">Token 由服务端生成，仅生成后展示一次，请立即复制保存。</span>
+      </div>
+
+      <div class="row" id="tkResultRow" style="display:none; margin-top:8px;">
+        <label>新 Token:</label>
+        <input id="tkResult" readonly class="mono" style="flex:1; font-size:12px;" onfocus="this.select()" />
+        <button class="ghost" onclick="copyTkResult()">复制</button>
+      </div>
     </div>
   </div>
 
@@ -840,6 +876,150 @@ document.addEventListener('drop', (e) => {
 
 // ---- Token 管理 ----
 
+let TKCATALOG = { permissions: [], public: [], roles: [], default_role: 'user' }
+
+async function loadTokenCatalog() {
+  try {
+    const b = await api('/api/auth/permissions')
+    TKCATALOG = b.data || TKCATALOG
+    renderTokenCatalog()
+  } catch (e) { /* 忽略：目录加载失败仍可手填 */ }
+}
+
+function scopeLabel(key) {
+  const p = (TKCATALOG.permissions || []).find(x => x.key === key)
+  return p ? p.label : key
+}
+
+function renderTokenCatalog() {
+  const box = $('tkCatalog')
+  if (!box) return
+  // 角色下拉
+  const sel = $('tkRole')
+  sel.innerHTML = ''
+  ;(TKCATALOG.roles || []).forEach(r => {
+    const o = document.createElement('option')
+    o.value = r.key
+    o.textContent = r.key + ' — ' + r.label
+    sel.appendChild(o)
+  })
+  sel.value = TKCATALOG.default_role || 'user'
+
+  // 逐接口勾选（按 group 分组）
+  const groups = {}
+  ;(TKCATALOG.permissions || []).forEach(p => {
+    ;(groups[p.group] = groups[p.group] || []).push(p)
+  })
+  let html = ''
+  Object.keys(groups).forEach(g => {
+    html += '<div style="margin-top:8px;"><strong style="font-size:13px;">' + esc(g) + '</strong>'
+    html += '<table style="margin-top:4px;"><thead><tr><th style="width:40px;">启用</th><th style="width:210px;">接口</th><th style="width:90px;">权限点</th><th>说明</th></tr></thead><tbody>'
+    groups[g].forEach(p => {
+      html += '<tr>' +
+        '<td><input type="checkbox" class="tkScope" value="' + esc(p.key) + '"' + (p.write ? '' : '') + '></td>' +
+        '<td class="mono">' + esc(p.method) + ' ' + esc(p.path) + '</td>' +
+        '<td class="mono">' + esc(p.key) + '</td>' +
+        '<td>' + esc(p.label) + '</td>' +
+        '</tr>'
+    })
+    html += '</tbody></table></div>'
+  })
+  if (TKCATALOG.public && TKCATALOG.public.length) {
+    html += '<div style="margin-top:8px;"><strong style="font-size:13px;">公开接口（无需 token，始终可用）</strong>' +
+      '<div class="muted mono" style="margin-top:4px;">' +
+      TKCATALOG.public.map(p => esc(p.method + ' ' + p.path)).join('　') + '</div></div>'
+  }
+  box.innerHTML = html
+  applyRolePreset()
+}
+
+function tkScopeChecks() {
+  return Array.from(document.querySelectorAll('.tkScope'))
+}
+
+function setChecked(boxes, on) {
+  boxes.forEach(b => { b.checked = !!on })
+}
+
+function tkSelectAll(on) {
+  const boxes = tkScopeChecks()
+  setChecked(boxes, on)
+}
+
+function tkSelectWrite(write) {
+  const boxes = tkScopeChecks()
+  boxes.forEach(b => {
+    const p = (TKCATALOG.permissions || []).find(x => x.key === b.value)
+    b.checked = !!(p && !!p.write === !!write)
+  })
+}
+
+function applyRolePreset() {
+  const role = $('tkRole').value
+  const preset = (TKCATALOG.roles || []).find(r => r.key === role)
+  if (!preset) return
+  const set = new Set(preset.scopes || [])
+  tkScopeChecks().forEach(b => { b.checked = set.has(b.value) })
+}
+
+function collectScopes() {
+  return tkScopeChecks().filter(b => b.checked).map(b => b.value)
+}
+
+function parseList(text) {
+  return (text || '').split(/[,，\s]+/).map(x => x.trim()).filter(Boolean)
+}
+
+function parsePrefixes(text) {
+  const out = {}
+  parseList(text).forEach(item => {
+    const i = item.indexOf(':')
+    if (i <= 0) return
+    const b = item.slice(0, i).trim()
+    const p = item.slice(i + 1).trim()
+    if (!b || !p) return
+    ;(out[b] = out[b] || []).push(p)
+  })
+  return out
+}
+
+async function generateToken() {
+  const t = $('admToken').value.trim()
+  if (!t) { toast('请先填写管理员令牌', false); return }
+  const user = $('tkUser').value.trim()
+  if (!user) { toast('请填写用户名', false); return }
+  const scopes = collectScopes()
+  const role = $('tkRole').value
+  if (!scopes.length && role !== 'custom') {
+    if (!confirm('尚未勾选任何接口，生成的 token 将没有任何权限。继续？')) return
+  }
+  try {
+    const body = await api('/api/tokens?token=' + encodeURIComponent(t), {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        user,
+        role,
+        scopes,
+        allow_buckets: parseList($('tkBuckets').value),
+        allow_prefixes: parsePrefixes($('tkPrefixes').value),
+        expires_at: $('tkExpires').value.trim(),
+        description: $('tkDesc').value.trim(),
+      }),
+    })
+    const d = body.data || {}
+    $('tkResult').value = d.token || ''
+    $('tkResultRow').style.display = ''
+    toast('已生成 token（仅展示本次）')
+    await loadTokens()
+  } catch (e) { toast(e.message, false) }
+}
+
+function copyTkResult() {
+  const v = $('tkResult').value
+  if (!v) return
+  navigator.clipboard && navigator.clipboard.writeText(v).then(() => toast('已复制')).catch(() => {})
+}
+
 async function syncTokens() {
   const t = $('admToken').value.trim()
   if (!t) { toast('请输入管理员令牌', false); return }
@@ -857,54 +1037,68 @@ async function syncTokens() {
   } catch (e) { toast(e.message, false) }
 }
 
+function fmtScopeRange(rec) {
+  const bs = (rec.allow_buckets || []).join(',')
+  const ps = Object.entries(rec.allow_prefixes || {}).map(([b, arr]) => b + ': ' + arr.join(' / ')).join('; ')
+  const parts = []
+  if (bs) parts.push('bucket=' + bs)
+  if (ps) parts.push('前缀=' + ps)
+  return parts.length ? parts.join('；') : '全部'
+}
+
 async function loadTokens() {
   const t = $('admToken').value.trim()
   if (!t) { toast('请输入管理员令牌', false); return }
+  const reveal = $('tkReveal') && $('tkReveal').checked
   try {
-    const body = await api('/api/tokens?token=' + encodeURIComponent(t))
+    const body = await api('/api/tokens?token=' + encodeURIComponent(t) + (reveal ? '&reveal=true' : ''))
     const tb = document.querySelector('#tokensBody')
     tb.innerHTML = ''
     const map = body.data || {}
-    const rows = Object.entries(map).sort((a, b) => a[1].localeCompare(b[1]))
-    if (!rows.length) tb.innerHTML = '<tr><td colspan="3" class="muted">（暂无登记）</td></tr>'
-    for (const [tk, user] of rows) {
+    const rows = Object.values(map).sort((a, b) => String(a.user).localeCompare(String(b.user)))
+    if (!rows.length) { tb.innerHTML = '<tr><td colspan="8" class="muted">（暂无登记）</td></tr>'; return }
+    for (const rec of rows) {
       const tr = document.createElement('tr')
-      tr.innerHTML = '<td>' + esc(user) + '</td><td class="mono">' + esc(tk) + '</td>' +
-        '<td><button class="danger" onclick="removeToken(\'' + esc(tk) + '\')">移除</button></td>'
+      const state = rec.expired ? '<span style="color:#f56c6c;">已过期</span>'
+        : (rec.enabled === false ? '<span style="color:#f56c6c;">已禁用</span>'
+          : '<span style="color:#67c23a;">有效</span>')
+      tr.innerHTML = '<td>' + esc(rec.user) + '</td>' +
+        '<td class="mono">' + esc(rec.token) + '</td>' +
+        '<td>' + esc(rec.role || '') + '</td>' +
+        '<td>' + (rec.scopes || []).length + '</td>' +
+        '<td class="muted">' + esc(fmtScopeRange(rec)) + '</td>' +
+        '<td>' + esc(rec.expires_at || '永久') + '</td>' +
+        '<td>' + state + '</td>' +
+        '<td><button class="danger" onclick="removeToken(\'' + esc(rec.token) + '\')">移除</button></td>'
       tb.appendChild(tr)
+      const detail = document.createElement('tr')
+      detail.innerHTML = '<td colspan="8" class="muted mono" style="font-size:12px;">' +
+        esc((rec.scopes || []).join('  ')) + (rec.description ? '　|　' + esc(rec.description) : '') + '</td>'
+      tb.appendChild(detail)
     }
   } catch (e) { toast(e.message, false) }
 }
 
-async function addToken() {
-  const t = $('admToken').value.trim()
-  const token = $('tkToken').value.trim()
-  const user = $('tkUser').value.trim()
-  if (!t) { toast('请输入管理员令牌', false); return }
-  if (!token || !user) { toast('token 与 用户名 都要填', false); return }
-  try {
-    await api('/api/tokens?token=' + encodeURIComponent(t), {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ token, user }),
-    })
-    toast('已登记')
-    $('tkToken').value = ''; $('tkUser').value = ''
-    await loadTokens()
-  } catch (e) { toast(e.message, false) }
-}
-
-async function removeToken(token) {
+async function removeToken(masked) {
   const t = $('admToken').value.trim()
   if (!t) { toast('请输入管理员令牌', false); return }
+  // 表格默认脱敏，必须知道明文；reveal 模式下才可直接移除
+  let value = masked
+  if (String(masked).includes('****')) {
+    value = prompt('请输入要移除的完整 token') || ''
+    if (!value) return
+  }
   const ok = await confirmDialog('确定移除该 token？')
   if (!ok) return
   try {
-    await api('/api/tokens?token=' + encodeURIComponent(t) + '&value=' + encodeURIComponent(token), {
+    await api('/api/tokens?token=' + encodeURIComponent(t) + '&value=' + encodeURIComponent(value), {
       method: 'DELETE' })
     toast('已移除')
     await loadTokens()
   } catch (e) { toast(e.message, false) }
 }
+
+loadTokenCatalog()
 
 // ---- 审计 ----
 

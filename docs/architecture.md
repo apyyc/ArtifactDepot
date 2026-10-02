@@ -1,6 +1,6 @@
 # ArtifactDepot 架构说明
 
-> 版本 **0.5.5**
+> 版本 **0.7.0**
 
 ## 定位
 
@@ -108,15 +108,20 @@ ArtifactDepot/
 | GET | `/api/objects/download` | 下载，Range 206，需 token（签名链接免） | GetObject |
 | DELETE | `/api/objects` | 删除对象/目录（仅管理员；目录仅空可删） | DeleteObject |
 | POST | `/api/objects/presign` | 生成签名链接（count/time/permanent） | Presigned URL |
-| GET/POST/DELETE | `/api/tokens` | Token 注册表管理（管理员） | - |
+| GET/POST/DELETE/PUT | `/api/tokens` | Token 注册表管理（`token:*` 权限点） | - |
+| GET | `/api/auth/permissions` | 权限点/接口目录（公开） | - |
 | POST | `/api/tokens/sync` | 从 DataHub 拉取并合并用户 token（返回 ok/error） | - |
 | GET | `/api/buckets` | 列 bucket | ListBuckets |
 | GET | `/api/audit` | 审计查询（管理员） | - |
 | GET | `/health` | 健康检查 | - |
 | GET | `/` | 网页 UI | - |
 
-写操作（上传/删除/预签名/mkdir）需有效 token（`?token=` 或 `Authorization: Bearer`）。
-读操作（列表/下载）默认内网开放、下载需 token；也可用签名链接限时/限次访问。
+0.7.0 起每个受保护接口对应一个**权限点（scope）**（见 `permissions.py`）：
+- 管理员共享 `access_token` 放行全部；
+- 用户 token 携带 role/scopes，可限定 bucket 与路径前缀范围、设置过期时间；
+- 生成方式：`POST /api/tokens`（逐接口勾选）或网页「Token 管理 → 生成本轮 Token」；
+- 旧 token 自动兼容为 `role=user`（历史全量非管理权限）；
+- 读接口（list/buckets）默认内网公开，`require_read_token=true` 时改为必须 `bucket:list` / `object:list`。
 
 ## 安全要点
 

@@ -8,7 +8,7 @@ FROM docker.io/library/python:3.12-alpine
 
 LABEL org.opencontainers.image.title="ArtifactDepot-ObjectStorage"
 LABEL org.opencontainers.image.description="Object storage depot (FastAPI :8004)"
-LABEL org.opencontainers.image.version="0.6.1"
+LABEL org.opencontainers.image.version="0.7.0"
 
 # 安装 Supervisor + curl（健康检查用）+ tzdata（容器内统一中国时区）
 # 先把 Alpine apk 源换成清华镜像：官方源 dl-cdn.alpinelinux.org 的 DNS 返回 IPv6，

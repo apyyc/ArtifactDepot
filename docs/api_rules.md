@@ -1,7 +1,8 @@
 # ArtifactDepot 接口文档
 
-> 版本 0.6.0 · FastAPI 服务 · 默认端口 8004
+> 版本 0.7.0 · FastAPI 服务 · 默认端口 8004
 >
+> 0.7.0 变更：引入**权限点（scope）+ 自定义 Token**：管理员可逐接口勾选生成不同权限的 token（见第十二章）；`GET /api/auth/permissions` 返回接口/权限目录；旧 token 自动按 `user` 角色兼容；新增配置 `require_read_token`（默认 false，读接口仍公开）。
 > 0.6.0 变更：新增 `POST /api/buckets`（显式创建 bucket）、`POST /api/objects/rename`（重命名/移动目录）、`GET /api/objects/head`（对象元信息探测）；新增「十一、其他项目接入指南（bucket/目录/文件 push-pull）」。
 >
 > 本文档描述 ArtifactDepot（对象存储仓库站点）对外提供的全部 HTTP 接口、调用规范与权限模型。
@@ -58,16 +59,23 @@ token 校验规则：
 - 管理员 token 用 **常量时间比较**（`hmac.compare_digest`）与 `access_token` 比对。
 - 用户 token 在 `tokens.json` 注册表命中；本地未命中时先从 DataHub 拉一次再判定（惰性同步）。
 
-### 1.4 权限等级
+### 1.4 权限模型（0.7.0）
+
+普通用户 token 不再是“万能写权限”，而是携带一组**权限点（scope）**，每个受保护接口对应一个权限点，可在生成 token 时逐接口勾选。
+
+| 身份 | 说明 |
+|---|---|
+| 管理员共享 token | 配置 `access_token`，放行全部权限（含 token/审计/删除） |
+| 用户 token | `tokens.json` 注册表，携带 `role` + `scopes` + 可选 bucket/路径前缀范围 + 过期时间 |
+| 签名链接 | `link`+`tk` / `expires`+`sig`，免 token 下载（由 `link:create` 决定谁能签发） |
 
 | 等级 | 说明 | 适用接口 |
 |---|---|---|
-| 公开（无鉴权） | 知道地址即可调，用于内网 | `/health`、`/api/buckets`、`/api/objects/list`、`/`、`/api/auth/check`、`/api/objects/signed-links/config` |
-| 写 token | 管理员或已登记用户 token | 上传、mkdir、rename（目录改名/移动）、head、presign、分片上传、签名链接管理 |
-| 下载 | token 或签名链接（三选一） | `/api/objects/download` |
-| 仅管理员 | 仅共享 `access_token` | `/api/tokens`、`/api/audit`、删除对象 |
+| 公开（默认，可收紧） | 知道地址即可调，内网设计；`require_read_token=true` 时读接口也需 scope | `/health`、`/api/auth/check`、`/api/auth/permissions`、`/api/objects/signed-links/config`、`/`，以及默认公开的 `GET /api/buckets`、`GET /api/objects/list` |
+| 按 scope 授权 | 生成 token 时勾选对应权限点 | 上传/下载/建目录/改名/删除/签名链接/分片/审计/token 管理等 |
+| 管理员 | 共享 `access_token` | 全部 |
 
-> 安全提示：`list` / `buckets` 等读接口为「内网开放」设计，依赖网络层隔离兜底；**不宜将 8004 直接暴露公网**。
+> 安全提示：默认仍保留 `list` / `buckets` 内网公开以兼容历史；若需最小权限，可设 `require_read_token=true` 并给读方签发 `bucket:list` / `object:list`。**不宜将 8004 直接暴露公网。**
 
 ### 1.5 bucket 与 key 约束
 
@@ -699,3 +707,116 @@ POST /api/objects/presign（bucket, key, mode=count/time/permanent）
 6. GET  /api/objects/download        pull 文件，按 sha256 校验
 7. DELETE /api/objects（管理员）      清理过期目录（须先清空，空目录才可删）
 ```
+
+
+---
+
+## 十二、权限点与自定义 Token 生成（0.7.0 新增）
+
+### 12.1 权限目录接口（公开）
+
+```
+GET /api/auth/permissions
+```
+
+返回三部分，供「逐接口勾选 → 生成 token」的前端渲染：
+
+- `permissions`：受保护接口清单，每项 `{key, group, label, method, path, write}`；
+- `public`：公开接口清单（不可勾选）；
+- `roles`：角色预设 `{key, label, scopes}`；`default_role`；`require_read_token`。
+
+### 12.2 权限点总表
+
+| 权限点 | 接口 | 说明 |
+|---|---|---|
+| `bucket:list` | GET `/api/buckets` | 列 bucket（默认公开；`require_read_token=true` 时校验） |
+| `bucket:create` | POST `/api/buckets` | 创建 bucket |
+| `object:list` | GET `/api/objects/list` | 列对象/目录（默认公开） |
+| `object:head` | GET `/api/objects/head` | 探测对象元信息（由“写”改为“读”） |
+| `object:download` | GET `/api/objects/download` | 下载（签名链接免） |
+| `object:upload` | POST `/api/objects` | 单请求上传 |
+| `upload:initiate` | POST `/api/objects/initiate` | 分片-发起会话 |
+| `upload:chunk` | POST `/api/objects/chunk` | 分片-上传分片 |
+| `upload:complete` | POST `/api/objects/complete` | 分片-合并完成（校验 bucket/key 范围） |
+| `upload:abort` | POST `/api/objects/abort` | 分片-取消 |
+| `object:mkdir` | POST `/api/objects/mkdir` | 新建目录 |
+| `object:rename` | POST `/api/objects/rename` | 重命名/移动（源与目标都校验） |
+| `object:delete` | DELETE `/api/objects` | 删除对象/空目录 |
+| `link:create` | POST `/api/objects/presign` | 生成签名链接 |
+| `link:list` | GET `/api/objects/signed-links` | 查看签名链接列表 |
+| `link:revoke` | POST `/api/objects/signed-links/{id}/revoke` | 作废（本人；管理员任意） |
+| `token:read` | GET `/api/tokens` | 查看 token 注册表 |
+| `token:write` | POST `/api/tokens`、PUT `/api/tokens/{value}` | 生成/登记/更新 token |
+| `token:delete` | DELETE `/api/tokens` | 移除 token |
+| `token:sync` | POST `/api/tokens/sync` | 从 DataHub 同步 |
+| `audit:read` | GET `/api/audit` | 查询审计 |
+
+### 12.3 角色预设
+
+| role | 权限点 |
+|---|---|
+| `viewer` | bucket:list, object:list |
+| `downloader` | viewer + object:head, object:download |
+| `uploader` | viewer + object:head, object:upload, upload:initiate/chunk/complete/abort, object:mkdir |
+| `publisher` | uploader + object:rename, link:create |
+| `operator` | publisher + bucket:create, object:delete, link:list, link:revoke |
+| `auditor` | bucket:list, object:list, audit:read, token:read |
+| `user` | 历史兼容：上传/下载/签名/建目录/建 bucket/改名，无删除与管理 |
+| `custom` | 完全按勾选 |
+| `admin` | 全部权限点 |
+
+### 12.4 生成 Token（逐接口勾选）
+
+```
+POST /api/tokens
+```
+
+**鉴权**：`token:write`
+
+**请求体**：
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `user` | string | 是 | 操作者名（审计 actor） |
+| `token` | string | 否 | 留空由服务端生成（`secrets.token_urlsafe(32)`） |
+| `role` | string | 否 | 角色预设，默认 `user` |
+| `scopes` | string[] | 否 | **逐接口勾选结果**；传入则以此为准（空数组 = 无权限） |
+| `allow_buckets` | string[] | 否 | bucket 白名单，空 = 全部 |
+| `allow_prefixes` | object | 否 | `{"bucket": ["前缀/"]}`，路径边界安全匹配 |
+| `expires_at` | string | 否 | `YYYY-MM-DD` 或 ISO 时间；空 = 永久 |
+| `description` | string | 否 | 备注 |
+
+**响应**：`data` 为 token 记录，**仅本次返回明文 `token`**，请立即保存。
+
+```bash
+# 只给“往 voicevideo/carryvideo/2026/ 上传 + 列表”的 token
+curl -X POST "http://<IP>:8004/api/tokens?token=<admin>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "user": "处理端-8",
+    "role": "custom",
+    "scopes": ["object:upload","upload:initiate","upload:chunk","upload:complete","upload:abort","object:list","object:head"],
+    "allow_buckets": ["voicevideo"],
+    "allow_prefixes": {"voicevideo": ["carryvideo/2026/"]},
+    "description": "2026 批次处理端推送"
+  }'
+```
+
+### 12.5 Token 管理补充
+
+| 方法 | 路径 | 鉴权 | 说明 |
+|---|---|---|---|
+| GET | `/api/auth/permissions` | 公开 | 权限目录 |
+| GET | `/api/auth/check` | 公开 | 返回 `valid/actor/role/scopes/allow_buckets/expires_at` |
+| GET | `/api/tokens` | `token:read` | 默认脱敏；管理员可 `?reveal=true` 看明文 |
+| POST | `/api/tokens` | `token:write` | 生成/登记（支持逐接口勾选） |
+| PUT | `/api/tokens/{value}` | `token:write` | 更新权限/范围/过期/禁用 |
+| DELETE | `/api/tokens` | `token:delete` | 移除 |
+| POST | `/api/tokens/sync` | `token:sync` | 从 DataHub 同步（权限字段不被覆盖） |
+
+### 12.6 兼容性
+
+- 旧 `tokens.json`（`{"<token>":"用户名"}`）自动迁移为 v2 结构并解释为 `role=user`；
+- 协作平台旧协议 `POST /api/tokens {token,user}`（不带 role/scopes/范围）只更新用户名，**保留已有权限配置**；
+- DataHub 同步只新增/更新用户身份，不覆盖已配置的 role/scopes/资源范围；
+- 共享 `access_token` 行为不变（超管）。

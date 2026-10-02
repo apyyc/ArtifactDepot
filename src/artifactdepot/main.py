@@ -23,7 +23,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="ArtifactDepot - Object Storage", version="0.6.1", lifespan=lifespan)
+app = FastAPI(title="ArtifactDepot - Object Storage", version="0.7.0", lifespan=lifespan)
 app.include_router(system_router)
 app.include_router(objects_router)
 app.include_router(web_router)

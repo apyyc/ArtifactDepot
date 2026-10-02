@@ -608,51 +608,274 @@ def _tokens_path() -> Path:
     return _meta_path("tokens.json")
 
 
-def load_tokens() -> dict:
-    """返回 {token: user_name} 映射（文件不存在返回空）"""
+# 角色预设（延迟导入，避免循环依赖）
+def _role_preset_scopes(role: str):
+    from artifactdepot.permissions import role_scopes
+    return role_scopes(role)
+
+
+def _default_token_record(user: str, role: str = "user") -> dict:
+    """构造一个默认 token 记录；scopes 为角色预设的有效权限点列表"""
+    scopes = _role_preset_scopes(role) if role != "custom" else []
+    if scopes is None:
+        role = "user"
+        scopes = _role_preset_scopes(role) or []
+    return {
+        "user": (user or "").strip(),
+        "role": role,
+        "scopes": list(scopes),
+        "allow_buckets": [],
+        "allow_prefixes": {},
+        "enabled": True,
+        "expires_at": "",
+        "description": "",
+        "created_by": "",
+        "created_at": _utc_now_iso(),
+        "last_used_at": "",
+    }
+
+
+def _normalize_token_record(value, token: str = "") -> dict:
+    """把任意历史形态归一化为记录 dict。
+
+    - 旧格式：`"用户名"` → role=user 的完整记录（保持历史全部非管理权限）
+    - 新格式：dict；缺字段补默认，scopes 缺失时按 role 预设补
+    """
+    if isinstance(value, str):
+        return _default_token_record(value, "user")
+    if not isinstance(value, dict):
+        return _default_token_record("", "user")
+    rec = dict(value)
+    user = (rec.get("user") or rec.get("name") or "").strip()
+    role = (rec.get("role") or "user").strip() or "user"
+    scopes = rec.get("scopes")
+    if not isinstance(scopes, list) or not scopes:
+        preset = _role_preset_scopes(role)
+        scopes = list(preset or [])
+    rec["user"] = user
+    rec["role"] = role
+    rec["scopes"] = [str(x).strip() for x in scopes if str(x).strip()]
+    if not isinstance(rec.get("allow_buckets"), list):
+        rec["allow_buckets"] = []
+    if not isinstance(rec.get("allow_prefixes"), dict):
+        rec["allow_prefixes"] = {}
+    rec["enabled"] = bool(rec.get("enabled", True))
+    rec["expires_at"] = str(rec.get("expires_at") or "").strip()
+    rec["description"] = str(rec.get("description") or "").strip()
+    rec["created_by"] = str(rec.get("created_by") or "").strip()
+    rec["created_at"] = str(rec.get("created_at") or "").strip()
+    rec["last_used_at"] = str(rec.get("last_used_at") or "").strip()
+    return rec
+
+
+def _read_tokens_raw() -> dict:
+    """读取 tokens.json，返回原始 token → value 字典（兼容 v1/v2）"""
     p = _tokens_path()
-    if p.exists():
-        try:
-            data = json.loads(p.read_text(encoding="utf-8"))
-            return data if isinstance(data, dict) else {}
-        except Exception:
-            return {}
-    return {}
+    if not p.exists():
+        return {}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    # v2：{"_version":2, "tokens":{...}}
+    if "tokens" in data and isinstance(data.get("tokens"), dict):
+        return data["tokens"]
+    # v1：{"<token>": "用户名"}
+    return {k: v for k, v in data.items() if k != "_version"}
+
+
+def load_tokens() -> dict:
+    """返回 {token: 记录} 映射（未知/旧格式自动归一化）"""
+    return {tok: _normalize_token_record(val, tok) for tok, val in _read_tokens_raw().items()}
 
 
 def _save_tokens(mapping: dict) -> None:
+    """写回 tokens.json（统一 v2 结构；value 可为字符串，自动归一化）"""
     p = _tokens_path()
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(mapping, ensure_ascii=False, indent=2), encoding="utf-8")
+    normalized = {}
+    for tok, val in mapping.items():
+        if not tok:
+            continue
+        normalized[tok] = _normalize_token_record(val, tok) if not isinstance(val, str) \
+            else _default_token_record(val, "user")
+    payload = {"_version": 2, "tokens": normalized}
+    p.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def add_token(token: str, user: str) -> dict:
-    """登记/更新 token→用户名（一个 token 只属一个用户）"""
+def _parse_ts(ts: str):
+    """解析 expires_at（支持 YYYY-MM-DD / ISO 8601 / 带 Z）"""
+    ts = (ts or "").strip()
+    if not ts:
+        return None
+    try:
+        text = ts.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        try:
+            dt = datetime.strptime(ts, "%Y-%m-%d")
+            return dt.replace(tzinfo=timezone.utc)
+        except Exception:
+            return None
+
+
+def token_record_expired(rec: dict) -> bool:
+    exp = _parse_ts((rec or {}).get("expires_at", ""))
+    if exp is None:
+        return False
+    return datetime.now(timezone.utc) >= exp
+
+
+def get_token_record(token: str):
+    """按 token 取有效记录；不存在/被禁用/已过期返回 None（过期状态由调用方区分）"""
+    token = (token or "").strip()
+    if not token:
+        return None
+    raw = _read_tokens_raw()
+    if token not in raw:
+        return None
+    rec = _normalize_token_record(raw[token], token)
+    if not rec.get("enabled", True):
+        return None
+    if token_record_expired(rec):
+        return None
+    return rec
+
+
+def touch_token(token: str) -> None:
+    """记录 token 最近使用时间（尽力而为，失败不阻断；>=300s 才写一次，避免每请求落盘）"""
+    token = (token or "").strip()
+    if not token:
+        return
+    try:
+        raw = _read_tokens_raw()
+        if token not in raw:
+            return
+        rec = _normalize_token_record(raw[token], token)
+        last = _parse_ts(rec.get("last_used_at", ""))
+        if last is not None and (datetime.now(timezone.utc) - last).total_seconds() < 300:
+            return
+        rec["last_used_at"] = _utc_now_iso()
+        raw[token] = rec
+        _save_tokens(raw)
+    except Exception:
+        pass
+
+
+def add_token(token: str, user: str, role: str = "", scopes=None,
+              allow_buckets=None, allow_prefixes=None, expires_at: str = "",
+              description: str = "", created_by: str = "",
+              keep_existing_permissions: bool = False) -> dict:
+    """登记/更新 token → 权限记录（一个 token 只属一个用户）。
+
+    - token 为空时由服务端生成（secrets.token_urlsafe(32)）
+    - scopes 显式传入则优先；否则用 role 预设；role 缺省为 user（兼容旧行为）
+    - keep_existing_permissions=True 时（平台按旧协议只推 token+user）仅更新用户名，
+      保留已有 role/scopes/资源范围，避免协作平台登记动作把精细权限重置成 role=user
+    - 返回记录（含明文 token），由调用方决定是否回显
+    """
     token = (token or "").strip()
     user = (user or "").strip()
-    if not token or not user:
-        raise HTTPException(400, detail="token 与 user 不能为空")
-    mapping = load_tokens()
-    mapping[token] = user
-    _save_tokens(mapping)
-    return {"token": token, "user": user}
+    if not token:
+        token = secrets.token_urlsafe(32)
+    if not user:
+        raise HTTPException(400, detail="user 不能为空")
+
+    raw0 = _read_tokens_raw()
+    if keep_existing_permissions and token in raw0:
+        rec = _normalize_token_record(raw0[token], token)
+        rec["user"] = user
+        raw0[token] = rec
+        _save_tokens(raw0)
+        out = dict(rec)
+        out["token"] = token
+        return out
+
+    role = (role or "user").strip() or "user"
+    if role != "custom" and _role_preset_scopes(role) is None:
+        raise HTTPException(400, detail=f"未知角色：{role}")
+    if scopes is None:
+        # 未显式勾选：用角色预设；role 缺省为 user（兼容旧行为）
+        preset = _role_preset_scopes(role)
+        if preset is None:
+            raise HTTPException(400, detail=f"未知角色：{role}")
+        scopes = list(preset)
+    if not isinstance(scopes, (list, tuple)):
+        raise HTTPException(400, detail="scopes 必须是数组")
+    if isinstance(scopes, (list, tuple)) and len(scopes) == 0 and role not in ("custom", ""):
+        # 显式传空数组 = 明确不带任何权限；保留 role 作为标签
+        pass
+
+    from artifactdepot.permissions import is_valid_scope
+    clean_scopes = []
+    for sc in scopes:
+        sc = str(sc).strip()
+        if not sc:
+            continue
+        if not is_valid_scope(sc):
+            raise HTTPException(400, detail=f"未知权限点：{sc}")
+        if sc not in clean_scopes:
+            clean_scopes.append(sc)
+
+    if allow_buckets is None:
+        allow_buckets = []
+    if not isinstance(allow_buckets, list):
+        raise HTTPException(400, detail="allow_buckets 必须是数组")
+    allow_buckets = [str(b).strip() for b in allow_buckets if str(b).strip()]
+
+    if allow_prefixes is None:
+        allow_prefixes = {}
+    if not isinstance(allow_prefixes, dict):
+        raise HTTPException(400, detail="allow_prefixes 必须是对象")
+    clean_prefixes = {}
+    for b, prefixes in allow_prefixes.items():
+        b = str(b).strip()
+        if not b:
+            continue
+        if isinstance(prefixes, str):
+            prefixes = [prefixes]
+        if not isinstance(prefixes, list):
+            raise HTTPException(400, detail=f"allow_prefixes[{b}] 必须是数组")
+        clean_prefixes[b] = [str(x).strip().strip("/") for x in prefixes if str(x).strip()]
+
+    raw = _read_tokens_raw()
+    existing = _normalize_token_record(raw.get(token, {}), token) if token in raw else None
+    rec = _default_token_record(user, role)
+    rec["scopes"] = clean_scopes
+    rec["allow_buckets"] = allow_buckets
+    rec["allow_prefixes"] = clean_prefixes
+    rec["expires_at"] = (expires_at or "").strip()
+    rec["description"] = (description or "").strip()
+    rec["created_by"] = (created_by or "").strip() or "系统/工具"
+    if existing:
+        rec["created_at"] = existing.get("created_at") or rec["created_at"]
+        rec["last_used_at"] = existing.get("last_used_at") or ""
+    raw[token] = rec
+    _save_tokens(raw)
+    out = dict(rec)
+    out["token"] = token
+    return out
 
 
 def remove_token(token: str) -> dict:
     token = (token or "").strip()
-    mapping = load_tokens()
-    if token not in mapping:
+    raw = _read_tokens_raw()
+    if token not in raw:
         raise HTTPException(404, detail="token 不存在")
-    user = mapping.pop(token)
-    _save_tokens(mapping)
-    return {"removed": token, "user": user}
+    rec = _normalize_token_record(raw.pop(token), token)
+    _save_tokens(raw)
+    return {"removed": token, "user": rec.get("user", "")}
 
 
 def resolve_user(token: str):
-    """按 token 查用户名（未登记返回 None）"""
-    if not token:
-        return None
-    return load_tokens().get(token)
+    """按 token 查用户名（未登记/禁用/过期返回 None）"""
+    rec = get_token_record(token)
+    return rec.get("user") if rec else None
 
 
 # ---------------------------------------------------------------------------
@@ -678,51 +901,54 @@ async def _fetch_datahub_users(datahub_url: str):
         return None, str(e) or "DataHub 不可达"
 
 
-async def sync_tokens_from_datahub(datahub_url: str, force: bool = False) -> dict:
-    """从 DataHub users.json 拉取 {api_token: user_name}，合并写回本地 tokens.json
+def _merge_datahub_users(users) -> dict:
+    """把 DataHub 用户合并进本地记录：只补/更新身份，绝不覆盖权限配置。
 
-    合并语义：DataHub 的 token→用户 覆盖本地同名；本地独有条目保留（只增不删）。
-    DataHub 不可用/未配置时静默返回本地表。"""
+    - 已存在 token：仅更新 user 名（保留 role/scopes/资源范围/过期）
+    - 新 token：按默认 role=user 建立记录（与旧行为一致）
+    """
+    raw = _read_tokens_raw()
+    for u in users or []:
+        tok = (u.get("api_token") or "").strip()
+        name = (u.get("name") or "").strip()
+        if not tok or not name:
+            continue
+        if tok in raw:
+            rec = _normalize_token_record(raw[tok], tok)
+            rec["user"] = name
+        else:
+            rec = _default_token_record(name, "user")
+        raw[tok] = rec
+    _save_tokens(raw)
+    return load_tokens()
+
+
+async def sync_tokens_from_datahub(datahub_url: str, force: bool = False) -> dict:
+    """从 DataHub users.json 拉取并合并用户 token（只增不删、权限字段保留）"""
     global _last_sync
     now = time.time()
     if not force and now - _last_sync < SYNC_INTERVAL:
         return load_tokens()
     users, err = await _fetch_datahub_users(datahub_url)
     if err is not None:
-        # DataHub 不可达/解析失败：沿用本地缓存，不阻断
         return load_tokens()
-    merged = load_tokens()
-    for u in users:
-        tok = (u.get("api_token") or "").strip()
-        name = (u.get("name") or "").strip()
-        if tok and name:
-            merged[tok] = name
-    _save_tokens(merged)
+    merged = _merge_datahub_users(users)
     _last_sync = time.time()
     return merged
 
 
 async def sync_tokens_detailed(datahub_url: str, force: bool = True) -> dict:
-    """手动同步接口用：返回 {mapping, ok, error, datahub_url}，让前端能提示 DataHub 是否可达"""
+    """手动同步接口用：返回 {mapping, ok, error, datahub_url}"""
     global _last_sync
     now = time.time()
     if not force and now - _last_sync < SYNC_INTERVAL:
-        return {"mapping": load_tokens(), "ok": True, "error": "",
-                "datahub_url": datahub_url}
+        return {"mapping": load_tokens(), "ok": True, "error": "", "datahub_url": datahub_url}
     users, err = await _fetch_datahub_users(datahub_url)
     if err is not None:
-        return {"mapping": load_tokens(), "ok": False, "error": err,
-                "datahub_url": datahub_url}
-    merged = load_tokens()
-    for u in users:
-        tok = (u.get("api_token") or "").strip()
-        name = (u.get("name") or "").strip()
-        if tok and name:
-            merged[tok] = name
-    _save_tokens(merged)
+        return {"mapping": load_tokens(), "ok": False, "error": err, "datahub_url": datahub_url}
+    merged = _merge_datahub_users(users)
     _last_sync = time.time()
-    return {"mapping": merged, "ok": True, "error": "",
-            "datahub_url": datahub_url}
+    return {"mapping": merged, "ok": True, "error": "", "datahub_url": datahub_url}
 
 
 # ---------------------------------------------------------------------------
