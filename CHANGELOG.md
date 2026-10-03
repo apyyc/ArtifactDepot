@@ -1,11 +1,46 @@
 # Changelog
 
-ArtifactDepot v0.7.0 — 所有对本项目的重要更改都将记录在此文件中。
+ArtifactDepot v0.7.1 — 所有对本项目的重要更改都将记录在此文件中。
 
 本日志格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本号遵循 [语义化版本规范](https://semver.org/lang/zh-CN/)。
 
 ---
+
+## [0.7.1] - 2026-10-03
+
+> 本次为**前端文档入口 + 语义一致性修复**发布：网页 UI 新增「API 文档」标签页，并提供 Swagger / ReDoc 入口；
+> 同时修复两处「文档描述与实现不一致」的问题（均在 `docs/api_rules.md` 中已有约定）。
+
+### Added
+
+- **前端 API 文档入口**：网页 UI 顶部标签栏新增「API 文档」页（`src/artifactdepot/resources/index.html`），
+  页面内渲染 `docs/api_rules.md` / `docs/architecture.md` / `README.md` / `CHANGELOG.md`；
+  内置**轻量 Markdown 渲染**（标题 / 表格 / 围栏代码 / 引用 / 列表 / 行内样式 / 链接），
+  不依赖任何外网 CDN，适配内网与离线环境；HTML 先转义再替换，避免文档内容注入 XSS。
+- **文档 API**（`src/artifactdepot/api/docs.py`，公开只读）：
+  - `GET /api/docs` 文档清单（`name` / `title` / `available`）；
+  - `GET /api/docs/{name}` 文档内容（统一响应结构）；
+  - `GET /api/docs/{name}?raw=1` 直接返回 `text/plain` 原文（供新窗口查看）。
+  - `name` 走白名单（`api_rules` / `architecture` / `readme` / `changelog`），不接受任意路径，避免目录穿越。
+- **标签栏 Swagger / ReDoc 快捷入口**：直接打开 FastAPI 自动生成的 `/docs`、`/redoc`（可在线调试）。
+- **镜像包含文档**：`Dockerfile` 复制 `docs/` 与 `README.md` / `CHANGELOG.md`，`.dockerignore` 不再排除它们，
+  使容器部署同样能使用前端文档入口。
+- **回归测试** `tests/test_docs_and_scopes.py`（3 个用例）：文档接口、空 scopes 语义、读接口资源范围越界。
+
+### Fixed
+
+- **`scopes: []` 现在真正表示「无任何权限」**：`_normalize_token_record` 此前把空数组当作「字段缺失」回退成角色预设（`storage.py`），
+  导致按文档 `12.4`（`空数组 = 无权限`）生成的 token 反而拿到角色全量权限；改为仅在字段缺失/非数组时回退预设。
+- **读接口资源范围越界不再泄露数据**：`require_read_token=true` 时，`GET /api/objects/list` 对
+  bucket/前缀白名单之外的目标此前按匿名放行并返回真实列表（可越过范围约束读取任意 bucket）；
+  现改为返回 `403`（`api/objects.py`）。公开模式（`require_read_token=false`）行为不变，仍按匿名语义不阻断。
+
+### Changed
+
+- 版本号统一为 `0.7.1`（`main.py` / `build_image.conf` / `Dockerfile` / `deploy_container.sh` / 文档）。
+- `docs/api_rules.md`：新增「7.1 文档接口」；「八、接口速查总表」改为**权限点（scope）**列并补全 `PUT /api/tokens/{value}`、
+  `/api/docs`；修正各接口「写 token / 仅管理员」等旧表述为对应权限点；补全 `GET /api/buckets`、`/api/auth/check` 的返回结构说明。
 
 ## [0.7.0] - 2026-10-02
 

@@ -47,7 +47,7 @@ set -euo pipefail
 
 # ---------- 可配置参数（按需修改） ----------
 IMAGE_NAME="artifactdepot"           # 镜像名
-IMAGE_TAG="0.7.0"                    # 镜像版本标签
+IMAGE_TAG="0.7.1"                    # 镜像版本标签
 FULL_IMAGE="localhost/${IMAGE_NAME}:${IMAGE_TAG}"
 CONTAINER_NAME="artifactdepot"       # 容器名
 HOST_PORT="8004"                     # 宿主机映射端口（仅 --port-map 使用）
