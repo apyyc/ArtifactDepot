@@ -6,8 +6,5 @@
 *.tar
 depot/
 logs/
-docs/
-README.md
-CHANGELOG.md
 *.sh
 config.production.json

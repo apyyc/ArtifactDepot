@@ -70,6 +70,7 @@ PERMISSION_CATALOG = [
 # 公开接口（无需 token；仅展示，不可勾选）
 PUBLIC_CATALOG = [
     {"key": "", "group": "公开接口", "label": "健康检查", "method": "GET", "path": "/health", "write": False},
+    {"key": "", "group": "公开接口", "label": "前端 API 文档", "method": "GET", "path": "/api/docs", "write": False},
     {"key": "", "group": "公开接口", "label": "校验 token", "method": "GET", "path": "/api/auth/check", "write": False},
     {"key": "", "group": "公开接口", "label": "获取权限目录", "method": "GET", "path": "/api/auth/permissions", "write": False},
     {"key": "", "group": "公开接口", "label": "签名链接配置上下限", "method": "GET",

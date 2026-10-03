@@ -103,12 +103,16 @@ async def list_objects(request: Request, bucket: str, prefix: str = ""):
     """列对象（ListObjects）。默认公开；require_read_token=true 时需 object:list。
 
     带资源范围的 token：在允许范围内正常列出；范围外按匿名处理（公开模式下不阻断、
-    也不泄露额外信息）。require_read_token=true 时 `_optional_read_principal` 已强制校验。
+    也不泄露额外信息）。require_read_token=true 时 `_optional_read_principal` 已强制校验，
+    且资源范围越界必须返回 403（否则会绕过范围约束、泄露白名单外 bucket 的内容）。
     """
     principal = await _optional_read_principal(request, "object:list")
     if principal is not None and not principal.is_admin:
         from artifactdepot.auth import resource_allowed
         if not resource_allowed(principal, bucket, prefix):
+            if _read_requires_token():
+                raise HTTPException(
+                    403, detail="权限不足：token 的资源范围不允许该 bucket / 路径")
             principal = None
     items = storage.list_objects(bucket, prefix)
     return {"code": 0, "message": "success",

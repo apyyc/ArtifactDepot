@@ -1,6 +1,6 @@
 # ArtifactDepot 架构说明
 
-> 版本 **0.7.0**
+> 版本 **0.7.1**
 
 ## 定位
 
@@ -47,8 +47,10 @@ ArtifactDepot 合并写回 <meta_dir>/tokens.json（只增不删；DataHub 不�
 ArtifactDepot/
 ├── README.md / CHANGELOG.md
 ├── config.production.json        # 生产可复制的配置模板
-├── check_dw_sync.sh              # 生产诊断（仅 python3）
-├── docs/architecture.md          # 本文档
+├── check_ad_sync.sh              # 生产诊断（仅 python3）
+├── docs/
+│   ├── api_rules.md              # 对外接口文档（前端「API 文档」页数据源）
+│   └── architecture.md           # 本文档
 ├── scripts/start.sh              # 本地启动脚本
 ├── build_image.sh                # 构建 + 自动导出 tar
 ├── deploy_container.sh           # 部署（host 网络默认 + --config/VOLUME_MAPS）
@@ -59,8 +61,10 @@ ArtifactDepot/
     ├── auth.py                 # 写操作 token 校验（query / Bearer）
     ├── api/
     │   ├── objects.py          # S3-like 对象 API
-    │   └── system.py           # /health /api/buckets /api/tokens /api/audit
+    │   ├── system.py           # /health /api/buckets /api/tokens /api/audit
+    │   └── docs.py             # /api/docs 文档清单与内容（前端文档页数据源）
     ├── web/ui.py               # 网页 UI
+    ├── permissions.py          # 权限点目录与角色预设
     └── resources/
         ├── config.json         # 运行配置
         └── index.html          # 单页浏览界面
@@ -72,7 +76,7 @@ ArtifactDepot/
 <depot_dir>/                  # 默认 ./warehouse（项目内）；容器部署用 /data/depot 卷
 ├── <bucket>/                     # bucket = 项目（如 project_1）
 │   ├── task_5/xxx.mp4            # key = 任务/文件名（扁平路径式命名）
-│   └── .depot.json           # 每 bucket 元数据清单（隐藏，列表跳过）
+│   └── .warehouse.json           # 每 bucket 元数据清单（隐藏，列表跳过）
 └── …
 
 <meta_dir>/（可选；默认放 depot_dir 根下，0.5.0 起可用 meta_dir 单独放）
@@ -82,7 +86,7 @@ ArtifactDepot/
 ```
 
 - **文件系统是唯一事实源**：列表以目录扫描为准，手工放入的文件也能列出；
-  `.depot.json` 清单只做元数据补充（size/sha256/mtime/source_url）。
+  `.warehouse.json` 清单只做元数据补充（size/sha256/mtime/source_url）。
 - 隐藏点文件（`.` 开头）不在列表展示、不可作为上传 key，防止覆盖清单。
 - **`meta_dir`**：`tokens.json` / `signed_links.json` / `audit.log` 是**可再生状态**，
   与业务文件（bucket）分层存放，便于隔离与备份；留空时保持旧行为在仓库根下。
@@ -106,15 +110,16 @@ ArtifactDepot/
 | POST | `/api/objects/mkdir` | 新建目录（key 可含 `/` 多级） | - |
 | GET | `/api/objects/list` | 列对象（bucket/prefix） | ListObjects |
 | GET | `/api/objects/download` | 下载，Range 206，需 token（签名链接免） | GetObject |
-| DELETE | `/api/objects` | 删除对象/目录（仅管理员；目录仅空可删） | DeleteObject |
+| DELETE | `/api/objects` | 删除对象/空目录（权限点 `object:delete`） | DeleteObject |
 | POST | `/api/objects/presign` | 生成签名链接（count/time/permanent） | Presigned URL |
-| GET/POST/DELETE/PUT | `/api/tokens` | Token 注册表管理（`token:*` 权限点） | - |
+| GET/POST/DELETE/PUT | `/api/tokens` | Token 注册表管理（`token:read/write/delete`） | - |
 | GET | `/api/auth/permissions` | 权限点/接口目录（公开） | - |
-| POST | `/api/tokens/sync` | 从 DataHub 拉取并合并用户 token（返回 ok/error） | - |
+| POST | `/api/tokens/sync` | 从 DataHub 拉取并合并用户 token（`token:sync`，返回 ok/error） | - |
 | GET | `/api/buckets` | 列 bucket | ListBuckets |
-| GET | `/api/audit` | 审计查询（管理员） | - |
+| GET | `/api/audit` | 审计查询（`audit:read`） | - |
 | GET | `/health` | 健康检查 | - |
-| GET | `/` | 网页 UI | - |
+| GET | `/api/docs` | 前端文档入口数据源（只读，白名单） | - |
+| GET | `/` | 网页 UI（含 API 文档页、Swagger/ReDoc 入口） | - |
 
 0.7.0 起每个受保护接口对应一个**权限点（scope）**（见 `permissions.py`）：
 - 管理员共享 `access_token` 放行全部；
@@ -129,21 +134,21 @@ ArtifactDepot/
 - 上传上限：`max_upload_mb`（0 不限）。
 - 写令牌：UTF-8 字节常量时间比较（hmac.compare_digest，非 ASCII 安全）。
 - 预签名：HMAC-SHA256(secret=access_token, bucket|key|expires)，过期即拒。
-- 删除：仅管理员共享 token；目录仅空可删（防误删）。
+- 删除：权限点 `object:delete`（管理员共享 token 默认拥有）；目录仅空可删（防误删）。
 
 ## 部署
 
 - **build → save → 拷贝 → load → deploy**：
-  - 开发机 `./build_image.sh`（构建 + 自动导出 `artifactdepot-0.5.5.tar`）
+  - 开发机 `./build_image.sh`（构建 + 自动导出 `artifactdepot-0.7.1.tar`）
   - 拷贝 tar 到生产机 → `podman load -i` → `./deploy_container.sh --token y`
 - **host 网络默认**：容器共享宿主网络，`datahub_url` 用 `127.0.0.1:8002` 直连同机 DataHub；
   `--port-map` 可改回端口映射（不推荐，rootless 桥接常不通）。
 - **config.json 挂载**：`deploy_container.sh` 自动探测 `~/SERVER/artifactdepot/config/config.json`，
   也可用 `--config <宿主机路径>` 显式挂到容器内 `resources/config.json`，生产配置显式可改、无需重建镜像。
-- 数据卷默认 `~/SERVER/artifactdepot/artifactdepot_0.6.1/warehouse` → 容器 `/data/depot`；
+- 数据卷默认 `~/SERVER/artifactdepot/artifactdepot_0.7.1/warehouse` → 容器 `/data/depot`；
   若该路径不可写，脚本自动回退到 `~/.local/share/artifactdepot/...`。
 - **自启**：Podman 走 `systemd --user`；Docker 走 `--restart=always`。
-- 排障：`bash check_dw_sync.sh` 逐段定位 token 同步链路。
+- 排障：`bash check_ad_sync.sh` 逐段定位 token 同步链路。
 - 可选 Nginx `location /depot/` 反代到 8004。
 - carryVideo `server.py` 处理完推送 + ProjectCollab"任务数据"子模块对接，见 README 集成指引。
 

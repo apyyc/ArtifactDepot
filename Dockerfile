@@ -8,7 +8,7 @@ FROM docker.io/library/python:3.12-alpine
 
 LABEL org.opencontainers.image.title="ArtifactDepot-ObjectStorage"
 LABEL org.opencontainers.image.description="Object storage depot (FastAPI :8004)"
-LABEL org.opencontainers.image.version="0.7.0"
+LABEL org.opencontainers.image.version="0.7.1"
 
 # 安装 Supervisor + curl（健康检查用）+ tzdata（容器内统一中国时区）
 # 先把 Alpine apk 源换成清华镜像：官方源 dl-cdn.alpinelinux.org 的 DNS 返回 IPv6，
@@ -25,9 +25,11 @@ RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple \
     httpx \
     python-multipart
 
-# 复制源码
+# 复制源码 + 文档（前端「API 文档」入口读 docs/*.md、README/CHANGELOG）
 WORKDIR /app/artifactdepot
 COPY src/ /app/artifactdepot/src/
+COPY docs/ /app/artifactdepot/docs/
+COPY README.md CHANGELOG.md /app/artifactdepot/
 
 # 预留非 root 用户。注意：当前 supervisor 仍以 root 启动；
 # 如需真正切换到非 root，必须同时处理 /data/depot 卷权限。

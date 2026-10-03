@@ -38,6 +38,22 @@
   .up-item .st { flex: 0 0 130px; text-align: right; color: #888; }
   .up-item .st.ok { color: #67c23a; }
   .up-item .st.bad { color: #f56c6c; }
+  .doc-link { align-self: center; margin-left: 6px; padding: 5px 10px; border: 1px solid #dcdfe6; border-radius: 4px; color: #606266; font-size: 12px; text-decoration: none; }
+  .doc-link:hover { color: #409eff; border-color: #409eff; }
+  #docRender { max-width: 100%; }
+  #docRender h1 { font-size: 20px; border-bottom: 1px solid #ebeef5; padding-bottom: 6px; }
+  #docRender h2 { font-size: 17px; border-bottom: 1px solid #f2f6fc; padding-bottom: 4px; margin-top: 22px; }
+  #docRender h3 { font-size: 15px; margin-top: 18px; }
+  #docRender h4 { font-size: 14px; margin-top: 14px; }
+  #docRender p, #docRender li { font-size: 13px; line-height: 1.7; }
+  #docRender table { width: 100%; border-collapse: collapse; font-size: 12.5px; margin: 8px 0; }
+  #docRender th, #docRender td { border: 1px solid #ebeef5; padding: 5px 8px; text-align: left; vertical-align: top; }
+  #docRender th { background: #fafafa; white-space: nowrap; }
+  #docRender pre { background: #1f2937; color: #e5e7eb; padding: 10px 12px; border-radius: 6px; overflow-x: auto; font-size: 12px; line-height: 1.6; }
+  #docRender pre code { background: none; color: inherit; padding: 0; }
+  #docRender code { background: #f2f3f5; padding: 1px 4px; border-radius: 3px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; }
+  #docRender blockquote { margin: 8px 0; padding: 6px 12px; border-left: 3px solid #409eff; background: #ecf5ff; color: #606266; font-size: 12.5px; }
+  #docRender a { color: #409eff; }
   .modal-mask { position: fixed; inset: 0; background: rgba(0,0,0,.4); display: flex; align-items: center; justify-content: center; z-index: 1000; }
   .modal { background: #fff; padding: 18px 22px; border-radius: 8px; min-width: 380px; box-shadow: 0 4px 20px rgba(0,0,0,.2); }
 </style>
@@ -53,6 +69,10 @@
   <button data-t="links" onclick="switchTab('links')">签名链接</button>
   <button data-t="tokens" onclick="switchTab('tokens')">Token 管理</button>
   <button data-t="audit" onclick="switchTab('audit')">审计</button>
+  <button data-t="api" onclick="switchTab('api')">API 文档</button>
+  <span style="flex:1;"></span>
+  <a class="doc-link" href="/docs" target="_blank" rel="noopener" title="FastAPI 自动生成的交互式 API 调试台">Swagger</a>
+  <a class="doc-link" href="/redoc" target="_blank" rel="noopener" title="FastAPI ReDoc 只读文档">ReDoc</a>
 </div>
 
 <main>
@@ -194,6 +214,24 @@
       <div class="muted" style="margin-top:4px;">动作为 upload / download / delete / presign。</div>
     </div>
   </div>
+
+  <!-- ============ API 文档 ============ -->
+  <div id="sec-api" style="display:none;">
+    <div class="card">
+      <div class="row">
+        <label>文档:</label>
+        <select id="docSelect" onchange="loadDoc()" style="min-width:260px;"></select>
+        <button class="ghost" onclick="loadDoc()">刷新</button>
+        <button class="ghost" onclick="openDocRaw()">在新窗口打开 Markdown</button>
+        <button class="ghost" onclick="openSwagger()">打开 Swagger 调试台</button>
+        <span class="muted" id="docInfo"></span>
+      </div>
+      <div class="muted">接口文档与源码同源（`docs/*.md`），由服务端 `GET /api/docs` 提供；Swagger / ReDoc 由 FastAPI 依据实际路由生成，可直接在线调试。</div>
+    </div>
+    <div class="card">
+      <div id="docRender" class="doc-body"><span class="muted">（加载中…）</span></div>
+    </div>
+  </div>
 </main>
 
 <div id="msg"></div>
@@ -260,7 +298,7 @@
 
 <script>
 const $ = (id) => document.getElementById(id)
-let state = { bucket: '', prefix: '' }
+let state = { bucket: '', prefix: '', docLoaded: false, docName: '' }
 let myPublicIp = ''
 
 // 尽力获取浏览器公网 IP（用于审计双 IP；失败则留空）
@@ -287,9 +325,10 @@ function toast(text, ok = true) {
 
 function switchTab(t) {
   document.querySelectorAll('.tabs button').forEach(b => b.classList.toggle('active', b.dataset.t === t))
-  ;['browse', 'links', 'tokens', 'audit'].forEach(s => {
+  ;['browse', 'links', 'tokens', 'audit', 'api'].forEach(s => {
     $('sec-' + s).style.display = s === t ? '' : 'none'
   })
+  if (t === 'api' && !state.docLoaded) loadDocsCatalog()
 }
 
 async function api(url, opts) {
@@ -1097,6 +1136,169 @@ async function removeToken(masked) {
     await loadTokens()
   } catch (e) { toast(e.message, false) }
 }
+
+// ---- API 文档（只读渲染 docs/*.md） ----
+// 说明：不依赖任何外部 CDN，避免离线/内网环境白屏；Markdown 解析覆盖本项目文档用到的子集
+// （标题 / 表格 / 围栏代码 / 引用 / 有序无序列表 / 行内代码与粗斜体 / 链接）。
+
+let DOC_CATALOG = []
+
+function escAttr(s) { return esc(s).replace(/"/g, '&quot;') }
+
+// 行内 Markdown → HTML：先转义，再替换（避免 XSS）
+function inlineMd(text) {
+  let out = esc(text)
+  out = out.replace(/`([^`]+)`/g, (m, c) => '<code>' + c + '</code>')
+  out = out.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+  out = out.replace(/(^|[^*])\*([^*]+)\*/g, '$1<em>$2</em>')
+  // 链接：允许 URL 内出现一层括号，如 [x](https://a/b_(1))
+  out = out.replace(/\[([^\]]+)\]\(((?:[^()]|\([^()]*\))*)\)/g, (m, t, u) => {
+    const safe = /^https?:\/\//i.test(u) ? u : '#'
+    return '<a href="' + escAttr(safe) + '" target="_blank" rel="noopener">' + t + '</a>'
+  })
+  return out
+}
+
+// 找 Markdown 表格单元格边界：忽略 `code` 内的竖线
+function splitTableRow(line) {
+  const t = line.trim().replace(/^\|/, '').replace(/\|$/, '')
+  const cells = []
+  let buf = ''
+  let inCode = false
+  for (const ch of t) {
+    if (ch === '`') { inCode = !inCode; buf += ch; continue }
+    if (ch === '|' && !inCode) { cells.push(buf.trim()); buf = ''; continue }
+    buf += ch
+  }
+  cells.push(buf.trim())
+  return cells
+}
+
+function renderMarkdown(md) {
+  const lines = String(md || '').replace(/\r\n?/g, '\n').split('\n')
+  const html = []
+  let i = 0
+  let listType = null            // 'ul' | 'ol' | null
+  const closeList = () => { if (listType) { html.push('</' + listType + '>'); listType = null } }
+  while (i < lines.length) {
+    const line = lines[i]
+    // 围栏代码块
+    if (/^\s*```/.test(line)) {
+      closeList()
+      const buf = []
+      i++
+      while (i < lines.length && !/^\s*```/.test(lines[i])) { buf.push(lines[i]); i++ }
+      i++   // 跳过结束围栏
+      html.push('<pre><code>' + esc(buf.join('\n')) + '</code></pre>')
+      continue
+    }
+    // 表格：当前行含 | 且下一行是分隔行
+    if (line.includes('|') && i + 1 < lines.length && /^\s*\|?\s*:?-{2,}/.test(lines[i + 1])) {
+      closeList()
+      const head = splitTableRow(line)
+      i += 2
+      const rows = []
+      while (i < lines.length && lines[i].includes('|') && lines[i].trim()) {
+        rows.push(splitTableRow(lines[i])); i++
+      }
+      html.push('<table><thead><tr>' + head.map(c => '<th>' + inlineMd(c) + '</th>').join('') + '</tr></thead><tbody>')
+      rows.forEach(r => { html.push('<tr>' + r.map(c => '<td>' + inlineMd(c) + '</td>').join('') + '</tr>') })
+      html.push('</tbody></table>')
+      continue
+    }
+    const h = line.match(/^(#{1,6})\s+(.*)$/)
+    if (h) { closeList(); const lv = h[1].length; html.push('<h' + lv + '>' + inlineMd(h[2]) + '</h' + lv + '>'); i++; continue }
+    if (/^\s*(---+|\*\*\*+|___+)\s*$/.test(line)) { closeList(); html.push('<hr />'); i++; continue }
+    if (/^\s*>/.test(line)) {
+      closeList()
+      // 连续的 > 行合并为一个引用块；空行结束（避免文档顶部多段引用被挤成一行）
+      const buf = []
+      while (i < lines.length && /^\s*>/.test(lines[i])) {
+        buf.push(lines[i].replace(/^\s*>\s?/, '')); i++
+      }
+      html.push('<blockquote>' + inlineMd(buf.join(' ')) + '</blockquote>')
+      continue
+    }
+    // 列表项的续行（缩进且本身不是新列表项/表格/标题/代码/引用）：并入上一项，避免被当成普通段落
+    if (listType && /^\s{2,}\S/.test(line) && !/^\s*(?:[-*+]|\d+\.)\s/.test(line)
+        && !/^\s*(?:[|`#>])/.test(line)) {
+      const last = html.length - 1
+      if (html[last] && /<\/li>$/.test(html[last])) {
+        html[last] = html[last].replace(/<\/li>$/, ' ' + inlineMd(line.trim()) + '</li>')
+        i++
+        continue
+      }
+    }
+    const ul = line.match(/^\s*[-*+]\s+(.*)$/)
+    const ol = line.match(/^\s*\d+\.\s+(.*)$/)
+    if (ul || ol) {
+      const want = ul ? 'ul' : 'ol'
+      if (listType !== want) { closeList(); html.push('<' + want + '>'); listType = want }
+      html.push('<li>' + inlineMd((ul || ol)[1]) + '</li>')
+      i++
+      continue
+    }
+    if (!line.trim()) { closeList(); i++; continue }
+    closeList()
+    html.push('<p>' + inlineMd(line) + '</p>')
+    i++
+  }
+  closeList()
+  return html.join('\n')
+}
+
+async function loadDocsCatalog() {
+  state.docLoaded = true
+  try {
+    const b = await api('/api/docs')
+    DOC_CATALOG = b.data || []
+  } catch (e) {
+    DOC_CATALOG = []
+    $('docRender').innerHTML = '<p class="muted">文档接口不可用：' + esc(e.message) + '</p>'
+    return
+  }
+  const sel = $('docSelect')
+  sel.innerHTML = ''
+  DOC_CATALOG.forEach(d => {
+    const o = document.createElement('option')
+    o.value = d.name
+    o.textContent = d.title + (d.available ? '' : '（镜像未包含）')
+    sel.appendChild(o)
+  })
+  if (DOC_CATALOG.length) {
+    sel.value = state.docName || DOC_CATALOG[0].name
+    await loadDoc()
+  } else {
+    $('docRender').innerHTML = '<p class="muted">（无可查看文档）</p>'
+  }
+}
+
+async function loadDoc() {
+  const name = $('docSelect').value
+  if (!name) return
+  state.docName = name
+  $('docInfo').textContent = ''
+  $('docRender').innerHTML = '<span class="muted">（加载中…）</span>'
+  try {
+    const b = await api('/api/docs/' + encodeURIComponent(name))
+    const d = b.data || {}
+    $('docRender').innerHTML = renderMarkdown(d.content || '')
+  } catch (e) {
+    $('docRender').innerHTML = '<p class="muted">加载失败：' + esc(e.message) +
+      '<br />若为镜像未包含 docs/ 目录，请重新构建镜像；或直接访问 Swagger 调试台。</p>'
+  }
+}
+
+function openDocRaw() {
+  const name = $('docSelect').value || (DOC_CATALOG[0] && DOC_CATALOG[0].name)
+  if (!name) return
+  window.open('/api/docs/' + encodeURIComponent(name) + '?raw=1', '_blank', 'noopener')
+}
+
+function openSwagger() {
+  window.open('/docs', '_blank', 'noopener')
+}
+
 
 loadTokenCatalog()
 

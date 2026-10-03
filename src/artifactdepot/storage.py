@@ -649,7 +649,9 @@ def _normalize_token_record(value, token: str = "") -> dict:
     user = (rec.get("user") or rec.get("name") or "").strip()
     role = (rec.get("role") or "user").strip() or "user"
     scopes = rec.get("scopes")
-    if not isinstance(scopes, list) or not scopes:
+    # 仅“字段缺失 / 非数组”时回退到角色预设；显式空数组是合法语义（= 无任何权限，
+    # 见 docs/api_rules.md 12.4），必须原样保留，否则无法生成“无权限 token”。
+    if scopes is None or not isinstance(scopes, list):
         preset = _role_preset_scopes(role)
         scopes = list(preset or [])
     rec["user"] = user

@@ -8,6 +8,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from artifactdepot import storage
+from artifactdepot.api.docs import router as docs_router
 from artifactdepot.api.objects import router as objects_router
 from artifactdepot.api.system import router as system_router
 from artifactdepot.config import get_config
@@ -23,7 +24,8 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="ArtifactDepot - Object Storage", version="0.7.0", lifespan=lifespan)
+app = FastAPI(title="ArtifactDepot - Object Storage", version="0.7.1", lifespan=lifespan)
 app.include_router(system_router)
 app.include_router(objects_router)
+app.include_router(docs_router)
 app.include_router(web_router)

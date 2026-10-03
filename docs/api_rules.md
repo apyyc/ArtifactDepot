@@ -1,6 +1,8 @@
 # ArtifactDepot 接口文档
 
-> 版本 0.7.0 · FastAPI 服务 · 默认端口 8004
+> 版本 0.7.1 · FastAPI 服务 · 默认端口 8004
+>
+> 0.7.1 变更：新增 `GET /api/docs`（前端「API 文档」入口的数据源，公开、只读文档清单 + 内容）；网页 UI 新增「API 文档」标签页（内置轻量 Markdown 渲染，不依赖外网 CDN），并在标签栏提供 Swagger / ReDoc 入口；修复两处与文档语义不一致的问题：`scopes: []` 现在真正表示「无权限」（此前会被回退成角色预设），`require_read_token=true` 时资源范围外调用 `GET /api/objects/list` 返回 `403`（此前会忽略范围过滤、返回白名单外 bucket 的内容）。
 >
 > 0.7.0 变更：引入**权限点（scope）+ 自定义 Token**：管理员可逐接口勾选生成不同权限的 token（见第十二章）；`GET /api/auth/permissions` 返回接口/权限目录；旧 token 自动按 `user` 角色兼容；新增配置 `require_read_token`（默认 false，读接口仍公开）。
 > 0.6.0 变更：新增 `POST /api/buckets`（显式创建 bucket）、`POST /api/objects/rename`（重命名/移动目录）、`GET /api/objects/head`（对象元信息探测）；新增「十一、其他项目接入指南（bucket/目录/文件 push-pull）」。
@@ -71,7 +73,7 @@ token 校验规则：
 
 | 等级 | 说明 | 适用接口 |
 |---|---|---|
-| 公开（默认，可收紧） | 知道地址即可调，内网设计；`require_read_token=true` 时读接口也需 scope | `/health`、`/api/auth/check`、`/api/auth/permissions`、`/api/objects/signed-links/config`、`/`，以及默认公开的 `GET /api/buckets`、`GET /api/objects/list` |
+| 公开（默认，可收紧） | 知道地址即可调，内网设计；`require_read_token=true` 时读接口也需 scope | `/health`、`/api/auth/check`、`/api/auth/permissions`、`/api/docs`、`/api/objects/signed-links/config`、`/`，以及默认公开的 `GET /api/buckets`、`GET /api/objects/list` |
 | 按 scope 授权 | 生成 token 时勾选对应权限点 | 上传/下载/建目录/改名/删除/签名链接/分片/审计/token 管理等 |
 | 管理员 | 共享 `access_token` | 全部 |
 
@@ -90,7 +92,7 @@ token 校验规则：
 
 - 不允许含 `\`；前后 `/` 会被自动去除，去除后不能为空。
 - 不允许出现空段、`.`、`..`（防路径穿越）。
-- 任意路径段都不允许以 `.` 开头（避免与 `.depot.json`、`.keep` 等隐藏约定冲突）。
+- 任意路径段都不允许以 `.` 开头（避免与 `.warehouse.json`、`.keep` 等隐藏约定冲突）。
 - 支持多级目录，如 `carryvideo/20260815/tranvideo-1_20260815/tranvideo-1_20260815.mp4`。
 - 对象操作接口（上传 / 下载 / 删除 / presign）要求 key 非空；列表接口的 `prefix` 可以为空（表示根目录）。
 
@@ -100,7 +102,7 @@ token 校验规则：
 |---|---|
 | 400 | 参数非法（bucket/key 非法、prefix 越界等） |
 | 401 | 缺少/无效令牌、token 无效、签名无效或过期 |
-| 403 | 已认证但权限不足（如普通用户调管理员接口、非创建者作废他人链接） |
+| 403 | 已认证但权限不足（缺权限点、token 资源范围越界、非创建者作废他人链接） |
 | 404 | 对象/目录不存在 |
 | 409 | 对象已存在（`overwrite=false` 时） |
 | 413 | 超过单文件上传上限 `max_upload_mb` |
@@ -117,7 +119,7 @@ token 校验规则：
 POST /api/objects
 ```
 
-**鉴权**：写 token（管理员或用户）
+**鉴权**：权限点 `object:upload`（并校验 bucket/key 资源范围）
 
 **请求**（`multipart/form-data`）：
 
@@ -171,7 +173,7 @@ GET /api/objects/list
 
 - 目录：`{ "name", "key"（末尾带 /）, "is_dir": true, "size", "mtime" }`；空目录的 `mtime` 为目录自身 mtime。
 - 文件：`{ "name", "key", "is_dir": false, "size", "mtime", "sha256", "source_url", "uploader" }`。
-- 手工放入、没有 `.depot.json` 记录的文件也能列出，但 `sha256/source_url/uploader` 为空，`mtime` 回退为文件系统 mtime。
+- 手工放入、没有 `.warehouse.json` 记录的文件也能列出，但 `sha256/source_url/uploader` 为空，`mtime` 回退为文件系统 mtime。
 
 **示例**：
 
@@ -189,7 +191,7 @@ GET /api/objects/download
 
 1. `link` + `tk`（注册表签名链接）—— 校验次数/过期/作废，免 token
 2. `expires` + `sig`（旧式 HMAC 签名）—— 校验签名，免 token
-3. `token`（管理员或用户）—— 必需
+3. `token`—— 需权限点 `object:download`（管理员共享 token 放行全部）
 
 **查询参数**：
 
@@ -224,11 +226,11 @@ curl -o out.mp4 "http://<IP>:8004/api/objects/download?bucket=voicevideo&key=...
 DELETE /api/objects
 ```
 
-**鉴权**：仅管理员（共享 `access_token`）
+**鉴权**：权限点 `object:delete`（管理员共享 token 始终放行；普通用户 token 需显式授予该权限点）
 
 **查询参数**：`bucket`（必填）、`key`（必填）、`public_ip`（可选，记入审计）。
 
-**说明**：删除文件或目录；目录仅空目录可删（防误删）。仅管理员 token 可调用；普通用户 token 返回 `403`。
+**说明**：删除文件或目录；目录仅空目录可删（防误删）。无 token/无效 token 返回 `401`，token 缺少 `object:delete` 返回 `403`。
 
 ```bash
 curl -X DELETE "http://<IP>:8004/api/objects?bucket=voicevideo&key=path/to/obj&token=<admin_token>"
@@ -240,7 +242,7 @@ curl -X DELETE "http://<IP>:8004/api/objects?bucket=voicevideo&key=path/to/obj&t
 POST /api/objects/mkdir
 ```
 
-**鉴权**：写 token
+**鉴权**：权限点 `object:mkdir`（并校验资源范围）
 
 **请求体**（JSON）：
 
@@ -262,7 +264,7 @@ curl -X POST "http://<IP>:8004/api/objects/mkdir?token=<token>" \
 POST /api/objects/rename
 ```
 
-**鉴权**：写 token
+**鉴权**：权限点 `object:rename`（源与目标 key 都校验）
 
 **请求体**（JSON）：
 
@@ -302,7 +304,7 @@ curl -X POST "http://<IP>:8004/api/objects/rename?token=<token>" \
 GET /api/objects/head
 ```
 
-**鉴权**：写 token
+**鉴权**：权限点 `object:head`（并校验资源范围）
 
 **查询参数**：`bucket`（必填）、`key`（必填）。
 
@@ -314,7 +316,7 @@ GET /api/objects/head
 POST /api/objects/presign
 ```
 
-**鉴权**：写 token
+**鉴权**：权限点 `link:create`（并校验资源范围）
 
 **请求体**（JSON）：
 
@@ -357,9 +359,7 @@ GET /api/objects/signed-links/config
 GET /api/objects/signed-links
 ```
 
-**鉴权**：写 token
-
-**说明**：任一有效 token 可见全部条目；完整链接 URL 仅管理员/创建者可看，密钥不回传（`token` 字段被剥离）。
+**鉴权**：权限点 `link:list`；带资源范围的 token 只能看到范围内的链接。完整链接 URL 仅管理员/创建者可看，密钥不回传（`token` 字段被剥离）。
 
 ### 2.11 作废签名链接
 
@@ -367,7 +367,7 @@ GET /api/objects/signed-links
 POST /api/objects/signed-links/{link_id}/revoke
 ```
 
-**鉴权**：写 token；管理员可作废任意，用户只能作废自己创建的。可选 query `public_ip` 记入审计。
+**鉴权**：权限点 `link:revoke`；管理员可作废任意，用户只能作废自己创建的。可选 query `public_ip` 记入审计。
 
 ---
 
@@ -381,7 +381,7 @@ POST /api/objects/signed-links/{link_id}/revoke
 POST /api/objects/initiate
 ```
 
-**鉴权**：写 token
+**鉴权**：权限点 `upload:initiate`
 
 返回 `{ "upload_id", "chunk_size" }`（`chunk_size` 固定 8 MB）。
 
@@ -391,7 +391,7 @@ POST /api/objects/initiate
 POST /api/objects/chunk
 ```
 
-**鉴权**：写 token
+**鉴权**：权限点 `upload:chunk`
 
 **请求**（multipart）：`upload_id`、`index`（分片序号）、`chunk`（文件）。
 
@@ -401,7 +401,7 @@ POST /api/objects/chunk
 POST /api/objects/complete
 ```
 
-**鉴权**：写 token
+**鉴权**：权限点 `upload:complete`（并校验 bucket/key 资源范围）
 
 **请求**（multipart）：`upload_id`、`bucket`、`key`、`total_chunks`、可选 `source_url`、`overwrite`、`public_ip`。
 
@@ -411,7 +411,7 @@ POST /api/objects/complete
 POST /api/objects/abort
 ```
 
-**鉴权**：写 token
+**鉴权**：权限点 `upload:abort`
 
 **请求**：`upload_id`（multipart 表单）。
 
@@ -435,9 +435,9 @@ GET /health
 GET /api/buckets
 ```
 
-**鉴权**：公开
+**鉴权**：公开（默认内网开放）；`require_read_token=true` 时需权限点 `bucket:list`；带资源范围的 token 只列出允许的 bucket。
 
-**说明**：查看已存在的 bucket 列表，返回 `data.buckets` 为字符串数组。
+**说明**：返回 `data` 为 bucket 名字符串数组。
 
 ### 4.3 创建 bucket —— 0.6.0 新增
 
@@ -445,7 +445,7 @@ GET /api/buckets
 POST /api/buckets
 ```
 
-**鉴权**：写 token
+**鉴权**：权限点 `bucket:create`
 
 **请求体**（JSON）：
 
@@ -467,15 +467,15 @@ curl -X POST "http://<IP>:8004/api/buckets?token=<token>" \
 GET /api/auth/check?token=<token>
 ```
 
-**鉴权**：公开（带 token 返回其身份）
+**鉴权**：公开（带 token 返回其身份与权限）
 
-返回 `{ "valid": true/false, "actor": "系统/工具" 或 用户名 }`。
+返回 `data`：`{ "valid": bool, "actor": "系统/工具" 或 用户名, "role", "scopes", "allow_buckets", "allow_prefixes", "expires_at", "expired", "enabled" }`。
 
 ---
 
-## 五、Token 管理接口（仅管理员）
+## 五、Token 管理接口（按权限点授权）
 
-以下接口均需**管理员共享 `access_token`**（`?token=` 或 `Authorization: Bearer`）。
+以下接口分别需要权限点 `token:read` / `token:write` / `token:delete` / `token:sync`（管理员共享 `access_token` 放行全部）。token 通过 `?token=` 或 `Authorization: Bearer` 传递。
 
 ### 5.1 查看 token 映射
 
@@ -491,7 +491,7 @@ GET /api/tokens
 POST /api/tokens
 ```
 
-**请求体**（JSON）：`{ "token": "...", "user": "..." }`
+**请求体**（JSON）：完整字段见 12.4（`user` / `token` / `role` / `scopes` / `allow_buckets` / `allow_prefixes` / `expires_at` / `description`）。仅传 `token`+`user` 为兼容旧协议的登记，只更新用户名、保留已有权限。
 
 ### 5.3 移除 token
 
@@ -512,13 +512,13 @@ POST /api/tokens/sync
 
 ---
 
-## 六、审计查询（仅管理员）
+## 六、审计查询
 
 ```
 GET /api/audit
 ```
 
-**鉴权**：仅管理员
+**鉴权**：权限点 `audit:read`
 
 **查询参数**：
 
@@ -540,39 +540,58 @@ GET /
 
 **鉴权**：公开（可设 `ui_enabled=false` 禁用）。
 
-单页目录浏览 + 上传 + 下载。
+单页控制台：目录浏览 + 上传（拖拽/分片）+ 下载 + 新建目录 + 签名链接管理 + Token 管理 + 审计 + **API 文档**。
+
+- 「API 文档」标签页在页面内渲染 `docs/api_rules.md` 等文档（数据来自 `GET /api/docs`），并提供在新窗口打开 Markdown 原文的入口；
+- 标签栏右侧的 **Swagger** / **ReDoc** 链接由 FastAPI 自动生成，可在线调试（Swagger UI 依赖外网 CDN，内网环境建议以本页文档为准）。
+
+### 7.1 文档接口（0.7.1 新增，公开）
+
+```
+GET /api/docs              # 文档清单：[{name, title, available}]
+GET /api/docs/{name}       # 文档内容（JSON：{name,title,content}）
+GET /api/docs/{name}?raw=1 # 直接返回 text/plain 原文
+```
+
+`name` 白名单（不可任意路径读取）：`api_rules`（本文档）、`architecture`、`readme`、`changelog`。
+文档按**项目根**解析（开发态 `<repo>/docs/...`，容器内 `/app/artifactdepot/docs/...`）；
+镜像未包含文档时 `available=false`、获取返回 `404` 并带可读原因。
 
 ---
 
 ## 八、接口速查总表
 
-| 方法 | 路径 | 鉴权 | 说明 |
+| 方法 | 路径 | 权限点（scope） | 说明 |
 |---|---|---|---|
 | GET | `/health` | 公开 | 健康检查 |
-| GET | `/api/buckets` | 公开 | 列出 bucket |
 | GET | `/api/auth/check` | 公开 | 校验 token |
-| GET | `/api/objects/list` | 公开 | 列对象/目录 |
+| GET | `/api/auth/permissions` | 公开 | 权限点目录 |
+| GET | `/api/docs` | 公开 | 文档清单 |
+| GET | `/api/docs/{name}` | 公开 | 文档内容（`?raw=1` 返回 text/plain） |
 | GET | `/api/objects/signed-links/config` | 公开 | 签名链接上下限 |
 | GET | `/` | 公开 | 网页 UI |
-| POST | `/api/objects` | 写 token | 上传对象 |
-| POST | `/api/buckets` | 写 token | 创建 bucket（0.6.0） |
-| POST | `/api/objects/mkdir` | 写 token | 建目录 |
-| POST | `/api/objects/rename` | 写 token | 目录/对象重命名·移动（0.6.0） |
-| GET | `/api/objects/head` | 写 token | 元信息探测（0.6.0） |
-| POST | `/api/objects/presign` | 写 token | 生成共享链接 |
-| GET | `/api/objects/download` | token/签名 | 下载（Range） |
-| DELETE | `/api/objects` | 仅管理员 | 删除 |
-| GET | `/api/objects/signed-links` | 写 token | 列签名链接 |
-| POST | `/api/objects/signed-links/{id}/revoke` | 写 token | 作废签名链接 |
-| POST | `/api/objects/initiate` | 写 token | 发起分片上传 |
-| POST | `/api/objects/chunk` | 写 token | 上传分片 |
-| POST | `/api/objects/complete` | 写 token | 合并分片 |
-| POST | `/api/objects/abort` | 写 token | 取消分片 |
-| GET | `/api/tokens` | 仅管理员 | 查看 token→用户映射 |
-| POST | `/api/tokens` | 仅管理员 | 登记/更新 token |
-| DELETE | `/api/tokens` | 仅管理员 | 移除 token |
-| POST | `/api/tokens/sync` | 仅管理员 | 从 DataHub 同步 |
-| GET | `/api/audit` | 仅管理员 | 审计查询 |
+| GET | `/api/buckets` | 公开 · `bucket:list` | 列出 bucket |
+| GET | `/api/objects/list` | 公开 · `object:list` | 列对象/目录 |
+| POST | `/api/buckets` | `bucket:create` | 创建 bucket |
+| POST | `/api/objects` | `object:upload` | 上传对象 |
+| POST | `/api/objects/mkdir` | `object:mkdir` | 建目录 |
+| POST | `/api/objects/rename` | `object:rename` | 目录/对象重命名·移动 |
+| GET | `/api/objects/head` | `object:head` | 元信息探测 |
+| POST | `/api/objects/presign` | `link:create` | 生成共享链接 |
+| GET | `/api/objects/download` | `object:download` / 签名 | 下载（Range） |
+| DELETE | `/api/objects` | `object:delete` | 删除对象/空目录 |
+| GET | `/api/objects/signed-links` | `link:list` | 列签名链接 |
+| POST | `/api/objects/signed-links/{id}/revoke` | `link:revoke` | 作废签名链接 |
+| POST | `/api/objects/initiate` | `upload:initiate` | 发起分片上传 |
+| POST | `/api/objects/chunk` | `upload:chunk` | 上传分片 |
+| POST | `/api/objects/complete` | `upload:complete` | 合并分片 |
+| POST | `/api/objects/abort` | `upload:abort` | 取消分片 |
+| GET | `/api/tokens` | `token:read` | 查看 token 注册表 |
+| POST | `/api/tokens` | `token:write` | 生成/登记 token |
+| PUT | `/api/tokens/{value}` | `token:write` | 更新 token 权限 |
+| DELETE | `/api/tokens` | `token:delete` | 移除 token |
+| POST | `/api/tokens/sync` | `token:sync` | 从 DataHub 同步 |
+| GET | `/api/audit` | `audit:read` | 审计查询 |
 
 ---
 
@@ -598,7 +617,7 @@ ArtifactDepot 配置优先级：内置默认 < `resources/config.json`（或 `AR
 1. 读接口（list/buckets）为「内网开放」设计，切勿直接暴露公网，建议前置 Nginx 鉴权或防火墙/VPN 隔离。
 2. 管理员 `access_token` 与用户 token 属敏感凭据，不得写入 git / 文档 / 日志。
 3. key/bucket 有路径穿越防护，但调用方仍应避免传不可信输入。
-4. 删除接口仅管理员可调，且目录仅空可删。
+4. 删除接口需要权限点 `object:delete`（管理员共享 token 默认拥有全部），且目录仅空可删。
 
 ## 十一、其他项目接入指南（bucket / 目录 / 文件 push-pull）
 
@@ -780,7 +799,7 @@ POST /api/tokens
 | `user` | string | 是 | 操作者名（审计 actor） |
 | `token` | string | 否 | 留空由服务端生成（`secrets.token_urlsafe(32)`） |
 | `role` | string | 否 | 角色预设，默认 `user` |
-| `scopes` | string[] | 否 | **逐接口勾选结果**；传入则以此为准（空数组 = 无权限） |
+| `scopes` | string[] | 否 | **逐接口勾选结果**；传入则以此为准。显式空数组 = **无任何权限**（0.7.1 修复：此前会被回退成角色预设） |
 | `allow_buckets` | string[] | 否 | bucket 白名单，空 = 全部 |
 | `allow_prefixes` | object | 否 | `{"bucket": ["前缀/"]}`，路径边界安全匹配 |
 | `expires_at` | string | 否 | `YYYY-MM-DD` 或 ISO 时间；空 = 永久 |
@@ -807,12 +826,15 @@ curl -X POST "http://<IP>:8004/api/tokens?token=<admin>" \
 | 方法 | 路径 | 鉴权 | 说明 |
 |---|---|---|---|
 | GET | `/api/auth/permissions` | 公开 | 权限目录 |
+| GET | `/api/docs` | 公开 | 文档清单（前端「API 文档」页） |
+| GET | `/api/docs/{name}` | 公开 | 文档内容（`?raw=1` 返回纯文本） |
 | GET | `/api/auth/check` | 公开 | 返回 `valid/actor/role/scopes/allow_buckets/expires_at` |
 | GET | `/api/tokens` | `token:read` | 默认脱敏；管理员可 `?reveal=true` 看明文 |
 | POST | `/api/tokens` | `token:write` | 生成/登记（支持逐接口勾选） |
 | PUT | `/api/tokens/{value}` | `token:write` | 更新权限/范围/过期/禁用 |
 | DELETE | `/api/tokens` | `token:delete` | 移除 |
 | POST | `/api/tokens/sync` | `token:sync` | 从 DataHub 同步（权限字段不被覆盖） |
+| POST | `/api/objects/*` 分片四步 | `upload:initiate` / `upload:chunk` / `upload:complete` / `upload:abort` | 大文件分片上传 |
 
 ### 12.6 兼容性
 
