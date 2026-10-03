@@ -9,21 +9,18 @@ ArtifactDepot v0.7.1 — 所有对本项目的重要更改都将记录在此文�
 
 ## [0.7.1] - 2026-10-03
 
-> 本次为**前端文档入口 + 语义一致性修复**发布：网页 UI 新增「API 文档」标签页，并提供 Swagger / ReDoc 入口；
+> 本次为**前端文档入口 + 语义一致性修复**发布：网页 UI 标签栏新增 Swagger / ReDoc 入口；
 > 同时修复两处「文档描述与实现不一致」的问题（均在 `docs/api_rules.md` 中已有约定）。
 
 ### Added
 
-- **前端 API 文档入口**：网页 UI 顶部标签栏新增「API 文档」页（`src/artifactdepot/resources/index.html`），
-  页面内渲染 `docs/api_rules.md` / `docs/architecture.md` / `README.md` / `CHANGELOG.md`；
-  内置**轻量 Markdown 渲染**（标题 / 表格 / 围栏代码 / 引用 / 列表 / 行内样式 / 链接），
-  不依赖任何外网 CDN，适配内网与离线环境；HTML 先转义再替换，避免文档内容注入 XSS。
-- **文档 API**（`src/artifactdepot/api/docs.py`，公开只读）：
+- **网页 UI 文档入口**：顶部标签栏右侧新增 **Swagger**（`/docs`）/ **ReDoc**（`/redoc`）链接
+  （`src/artifactdepot/resources/index.html`），由 FastAPI 依据实际路由生成，可直接在线调试。
+- **文档 API**（`src/artifactdepot/api/docs.py`，公开只读；用于查看/抓取原始 Markdown）：
   - `GET /api/docs` 文档清单（`name` / `title` / `available`）；
   - `GET /api/docs/{name}` 文档内容（统一响应结构）；
   - `GET /api/docs/{name}?raw=1` 直接返回 `text/plain` 原文（供新窗口查看）。
   - `name` 走白名单（`api_rules` / `architecture` / `readme` / `changelog`），不接受任意路径，避免目录穿越。
-- **标签栏 Swagger / ReDoc 快捷入口**：直接打开 FastAPI 自动生成的 `/docs`、`/redoc`（可在线调试）。
 - **镜像包含文档**：`Dockerfile` 复制 `docs/` 与 `README.md` / `CHANGELOG.md`，`.dockerignore` 不再排除它们，
   使容器部署同样能使用前端文档入口。
 - **回归测试** `tests/test_docs_and_scopes.py`（3 个用例）：文档接口、空 scopes 语义、读接口资源范围越界。

@@ -49,7 +49,7 @@ ArtifactDepot/
 ├── config.production.json        # 生产可复制的配置模板
 ├── check_ad_sync.sh              # 生产诊断（仅 python3）
 ├── docs/
-│   ├── api_rules.md              # 对外接口文档（前端「API 文档」页数据源）
+│   ├── api_rules.md              # 对外接口文档（也由 /api/docs 提供原文）
 │   └── architecture.md           # 本文档
 ├── scripts/start.sh              # 本地启动脚本
 ├── build_image.sh                # 构建 + 自动导出 tar
@@ -118,8 +118,8 @@ ArtifactDepot/
 | GET | `/api/buckets` | 列 bucket | ListBuckets |
 | GET | `/api/audit` | 审计查询（`audit:read`） | - |
 | GET | `/health` | 健康检查 | - |
-| GET | `/api/docs` | 前端文档入口数据源（只读，白名单） | - |
-| GET | `/` | 网页 UI（含 API 文档页、Swagger/ReDoc 入口） | - |
+| GET | `/api/docs` | 文档清单/内容（公开只读，白名单） | - |
+| GET | `/` | 网页 UI（标签栏含 Swagger/ReDoc 入口） | - |
 
 0.7.0 起每个受保护接口对应一个**权限点（scope）**（见 `permissions.py`）：
 - 管理员共享 `access_token` 放行全部；

@@ -38,7 +38,7 @@
 | Token 同步 | 从 DataHub `users.json` 拉取用户 token（collab 权威源，本地副本，只增不删；DataHub 不可达时明确提示） |
 | 状态文件可迁移 | `meta_dir` 配置项把 `tokens.json` / `signed_links.json` / `audit.log` 移出仓库根，与业务文件隔离、便于备份 |
 | 生产部署 | 脚本**构建完自动导出 tar**（`--no-save` 跳过）；部署默认 **host 网络**（容器内 `127.0.0.1` = 宿主机，同机连 DataHub 最稳）；Podman 走 systemd user 自启，Docker 走 `--restart=always`；`--config` / `VOLUME_MAPS` 可挂载外部 config.json |
-| 网页 UI | bucket 点击选中 + 高亮、整页拖拽、新建目录、签名链接管理、Token 管理、审计、**API 文档**（页内渲染 `docs/*.md`，含 Markdown 原文/ Swagger / ReDoc 入口）；自定义确认框（不依赖浏览器原生弹窗） |
+| 网页 UI | bucket 点击选中 + 高亮、整页拖拽、新建目录、签名链接管理、Token 管理、审计；标签栏右侧提供 **Swagger / ReDoc** 入口（在线调试）；自定义确认框（不依赖浏览器原生弹窗） |
 | 跳转免填 | 支持 URL 携带 token/bucket 直接进入：`/?token=<api_token>[&bucket=<bucket>]` 自动填充令牌并进入目标 bucket，落地即清除地址栏 token（协作平台「任务数据」跳转自动认证） |
 
 ---
@@ -190,7 +190,7 @@ cd ArtifactDepot
 4. 点「新建目录」输入目录名（可含 `/` 多级）组织文件；目录「删除」仅空目录可删
 5. 需要分享时点文件「签名链接」，弹窗选按时效/按次数/永久，生成后内嵌显示、可复制
 6. 管理员在「签名链接」页可看全部链接（含每行复制）、作废；「Token 管理」页同步/登记
-7. 需要查接口说明时点顶部「API 文档」标签（页内读 `docs/api_rules.md`），或点标签栏右侧 Swagger / ReDoc 在线调试
+7. 需要查接口说明时点标签栏右侧的 **Swagger / ReDoc**（由 FastAPI 依据实际路由生成，可在线调试）
 
 ---
 
@@ -312,19 +312,19 @@ ArtifactDepot/
   - api/
     - objects.py                  # 对象 API（上传/列表/下载/删除/mkdir/签名/作废）
     - system.py                   # /health /api/buckets /api/tokens /api/audit /api/auth/check
-    - docs.py                     # /api/docs 文档清单与内容（前端「API 文档」页数据源）
+    - docs.py                     # /api/docs 文档清单与内容（公开只读，供外部/脚本读取）
   - permissions.py                # 权限点目录与角色预设
 - tests/                          # pytest 回归测试（权限点 / 文档接口 / 资源范围）
   - web/
     - ui.py                       # 网页 UI（读 resources/index.html）
   - resources/
     - config.json                 # 运行配置（含 signed_links 上下限、meta_dir）
-    - index.html                  # 单页界面（拖拽/新建目录/签名/Token/审计/API 文档）
+    - index.html                  # 单页界面（拖拽/新建目录/签名/Token/审计；标签栏含 Swagger/ReDoc 入口）
 ```
 
 > 文档相关：`docs/api_rules.md` 是对外接口文档；`docs/architecture.md` 是架构说明。
-> 两者（含 README / CHANGELOG）都可通过网页 UI 的「API 文档」标签页查看，
-> 数据由公开只读接口 `GET /api/docs` 提供；也可直接打开 FastAPI 的 `/docs`（Swagger）/ `/redoc`。
+> 两者（含 README / CHANGELOG）都可通过公开只读接口 `GET /api/docs` 读取（`?raw=1` 返回纯文本）；
+> 网页 UI 标签栏右侧提供 **Swagger `/docs`**（可直接调试）与 **ReDoc `/redoc`** 入口。
 
 ### 磁盘存储布局
 
@@ -377,7 +377,8 @@ ArtifactDepot/
 
 > 0.7.0 起支持**逐接口勾选生成自定义 Token**：管理员在「Token 管理」页选择角色/勾选接口/限定 bucket 与路径前缀/设置过期时间，点击「生成本轮 Token」。接口权限目录见 `GET /api/auth/permissions`；详见 `docs/api_rules.md` 第十二章。
 >
-> 网页 UI 顶部「API 文档」标签页可**页内查看接口文档**（读 `GET /api/docs`；含 `docs/api_rules.md`、`docs/architecture.md`、README、CHANGELOG），标签栏右侧还有 Swagger / ReDoc 入口可直接在线调试。
+> 接口文档在网页 UI 标签栏右侧的 **Swagger**（`/docs`，可直接在线调试）与 **ReDoc**（`/redoc`）查看；
+> 若需原始 Markdown，可用公开只读接口 `GET /api/docs`（清单）与 `GET /api/docs/{name}`（`?raw=1` 返回纯文本）。
 
 传递方式：`?token=` 查询参数，或 `Authorization: Bearer <token>`，或 multipart 表单 `token` 字段。
 
@@ -497,7 +498,7 @@ Query：`bucket`/`key`/`actor`/`since`(YYYY-MM-DD 起)/`limit`(默认 500)。返
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/` | 网页控制台（bucket 选择、整页拖拽上传、新建目录、签名链接/Token/审计管理、API 文档页；标签栏含 Swagger/ReDoc 入口） |
+| GET | `/` | 网页控制台（bucket 选择、整页拖拽上传、新建目录、签名链接/Token/审计管理；标签栏右侧含 Swagger/ReDoc 入口） |
 
 ### 调用示例
 
@@ -583,7 +584,7 @@ curl -X POST -H "Authorization: Bearer $ADMIN" "$BASE/api/tokens/sync"
 | **容器访问不到宿主 8002** | rootless pasta 网桥下容器连宿主发布端口常不通；`deploy_container.sh` 默认 host 网络即解决，容器内用 `127.0.0.1:8002` 直连 |
 | **tokens.json 生成位置不对** | 0.5.0 起可用 `meta_dir` 指定状态文件目录；改 `config.py`/`storage.py` 后**需重建镜像**再部署（运行中镜像不带新代码，只改配置不生效） |
 | 访问 `:8002` 连接被重置 | collab 容器默认只映射 8003；用多端口部署把 8002 也 `-p` 出来，并确认 DataHub 绑 `0.0.0.0` |
-| 点「API 文档」看不到内容 | 先确认 `GET /api/docs` 有返回（可用 curl 自测）；容器部署需镜像内带 `docs/`（0.7.1 起 `Dockerfile` 已 COPY，旧镜像重建即可）；Swagger `/docs` 依赖外网 CDN，内网以页内文档为准 |
+| 点 Swagger / ReDoc 打不开或样式为空 | Swagger UI / ReDoc 依赖外部 CDN（jsdelivr）加载前端资源，内网/离线环境会白屏；此时改用公开只读接口 `GET /api/docs`（清单）与 `GET /api/docs/{name}?raw=1`（Markdown 原文） |
 | 大文件上传「没反应」 | 看进度条；uvicorn 访问日志在**请求完成后**才打印，传输期间终端安静是正常的 |
 | 启动报 `No module named uvicorn` | `python3` 解析到无 uvicorn 的 `/usr/bin/python3`；`scripts/start.sh` 已自动探测 |
 | 容器里服务反复退出 | 缺 `python-multipart`（上传必需）；确认镜像构建时已安装 |

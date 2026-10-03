@@ -2,7 +2,7 @@
 
 > 版本 0.7.1 · FastAPI 服务 · 默认端口 8004
 >
-> 0.7.1 变更：新增 `GET /api/docs`（前端「API 文档」入口的数据源，公开、只读文档清单 + 内容）；网页 UI 新增「API 文档」标签页（内置轻量 Markdown 渲染，不依赖外网 CDN），并在标签栏提供 Swagger / ReDoc 入口；修复两处与文档语义不一致的问题：`scopes: []` 现在真正表示「无权限」（此前会被回退成角色预设），`require_read_token=true` 时资源范围外调用 `GET /api/objects/list` 返回 `403`（此前会忽略范围过滤、返回白名单外 bucket 的内容）。
+> 0.7.1 变更：新增 `GET /api/docs`（公开、只读文档清单 + 内容，供查看原始 Markdown）；网页 UI 标签栏右侧提供 Swagger / ReDoc 入口（FastAPI 自动生成，可在线调试）；修复两处与文档语义不一致的问题：`scopes: []` 现在真正表示「无权限」（此前会被回退成角色预设），`require_read_token=true` 时资源范围外调用 `GET /api/objects/list` 返回 `403`（此前会忽略范围过滤、返回白名单外 bucket 的内容）。
 >
 > 0.7.0 变更：引入**权限点（scope）+ 自定义 Token**：管理员可逐接口勾选生成不同权限的 token（见第十二章）；`GET /api/auth/permissions` 返回接口/权限目录；旧 token 自动按 `user` 角色兼容；新增配置 `require_read_token`（默认 false，读接口仍公开）。
 > 0.6.0 变更：新增 `POST /api/buckets`（显式创建 bucket）、`POST /api/objects/rename`（重命名/移动目录）、`GET /api/objects/head`（对象元信息探测）；新增「十一、其他项目接入指南（bucket/目录/文件 push-pull）」。
@@ -540,10 +540,10 @@ GET /
 
 **鉴权**：公开（可设 `ui_enabled=false` 禁用）。
 
-单页控制台：目录浏览 + 上传（拖拽/分片）+ 下载 + 新建目录 + 签名链接管理 + Token 管理 + 审计 + **API 文档**。
+单页控制台：目录浏览 + 上传（拖拽/分片）+ 下载 + 新建目录 + 签名链接管理 + Token 管理 + 审计。
 
-- 「API 文档」标签页在页面内渲染 `docs/api_rules.md` 等文档（数据来自 `GET /api/docs`），并提供在新窗口打开 Markdown 原文的入口；
-- 标签栏右侧的 **Swagger** / **ReDoc** 链接由 FastAPI 自动生成，可在线调试（Swagger UI 依赖外网 CDN，内网环境建议以本页文档为准）。
+- 标签栏右侧提供 **Swagger**（`/docs`）/ **ReDoc**（`/redoc`）入口，由 FastAPI 依据实际路由自动生成，可直接在线调试；
+- 两者依赖外网 CDN 加载前端资源，内网/离线环境可改用公开只读接口 `GET /api/docs` 查看原始 Markdown。
 
 ### 7.1 文档接口（0.7.1 新增，公开）
 
@@ -826,7 +826,7 @@ curl -X POST "http://<IP>:8004/api/tokens?token=<admin>" \
 | 方法 | 路径 | 鉴权 | 说明 |
 |---|---|---|---|
 | GET | `/api/auth/permissions` | 公开 | 权限目录 |
-| GET | `/api/docs` | 公开 | 文档清单（前端「API 文档」页） |
+| GET | `/api/docs` | 公开 | 文档清单 |
 | GET | `/api/docs/{name}` | 公开 | 文档内容（`?raw=1` 返回纯文本） |
 | GET | `/api/auth/check` | 公开 | 返回 `valid/actor/role/scopes/allow_buckets/expires_at` |
 | GET | `/api/tokens` | `token:read` | 默认脱敏；管理员可 `?reveal=true` 看明文 |
