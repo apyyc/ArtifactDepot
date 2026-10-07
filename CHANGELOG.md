@@ -1,9 +1,60 @@
 # Changelog
 
-ArtifactDepot v0.7.2 — 所有对本项目的重要更改都将记录在此文件中。
+ArtifactDepot v0.7.3 — 所有对本项目的重要更改都将记录在此文件中。
 
 本日志格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本号遵循 [语义化版本规范](https://semver.org/lang/zh-CN/)。
+
+---
+
+## [0.7.3] - 2026-10-08
+
+### 第 4 批（P2 体验与可观测性）
+
+> 第 4 批：ETag 条件请求、可观测性、UI 分页、CSP。
+
+### Added
+
+- **ETag / 条件请求**：`GET /api/objects/head`、`GET /api/objects/download` 返回强 ETag（SHA-256）；
+  请求头 `If-None-Match` 命中返回 `304`，不再传输文件体。
+- **可观测性**（`observability.py`，无第三方依赖）：`X-Request-ID` 透传/生成、JSON 结构化访问日志、
+  `/metrics`（Prometheus 文本：HTTP 计数/耗时直方图、上传/下载/删除计数、token 数、磁盘用量）、
+  `/health/live`（存活）、`/health/ready`（depot 可写，否则 503）；新增 `metrics_enabled` 配置。
+- **网页 UI 分页**：文件列表默认 200 条/页，底部「加载更多」，配合后端 `limit/offset`。
+
+### Security
+
+- **CSP**：`index.html` 的内联 `<style>`/`<script>` 抽到 `/static/app.css`、`/static/app.js`，
+  所有内联事件处理器改为事件委托，`javascript:void(0)` 改为 `#`；应用页 `Content-Security-Policy`
+  为 `script-src 'self'`（无 `unsafe-inline`），`/docs`、`/redoc` 单独放行 `unsafe-inline`。
+
+### Tests
+
+- 新增 `tests/test_csp.py`（4 例）、`tests/test_observability.py`（5 例）；
+  `tests/test_api_consistency.py` 增加 UI 分页与 ETag 用例。
+
+---
+
+### 配置目录重构
+
+### Changed
+
+- **配置集中到 `src/artifactdepot/config/` 包**：原 `config.py` → `config/__init__.py`；
+  原 `resources/config.json` → `config/config.json`；原根目录 `config.production.json` →
+  `config/config.production.json`。删除旧路径 `resources/config.json`，所有脚本/文档硬切新路径
+  （`scripts/start.sh`、`deploy_container.sh` 的 `CONTAINER_CONFIG_PATH`、`check_ad_sync.sh`、Dockerfile、README/docs 已同步）。
+- **新增 `config/.env`**（字段名=值，如 `access_token=...`）承载隐私配置；优先级
+  `内置默认 < config.json < .env < 真实环境变量`；`.env` 空值视为未设置；`.env` 不进 git/镜像，
+  提供 `.env.example` 模板；可用 `ARTIFACT_DEPOT_ENV` 指定外部 `.env`。
+- **手动重载配置**：新增 `POST /api/config/reload`（仅管理员）与网页「Token 管理」页的
+  「重新加载配置」按钮；返回 `changed`（已生效）/ `needs_restart`（需重启：`host`/`port`/`depot_dir`/
+  `meta_dir`/`cors_origins`/`allowed_hosts`）/ `warnings`；语法错误时保留旧配置并提示。
+- **默认 `config.json` 进镜像**（不含密钥）；`.env` 仍排除；`.dockerignore` 同步调整。
+
+### Tests
+
+- 新增 `tests/test_config_reload.py`（6 例）：`.env` 优先级/点号嵌套、真实环境变量最高、
+  重载生效/需重启分类、坏 JSON 保留旧配置、`POST /api/config/reload` 仅管理员。
 
 ---
 

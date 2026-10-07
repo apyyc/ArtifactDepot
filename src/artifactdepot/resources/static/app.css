@@ -1,0 +1,38 @@
+
+  body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; margin: 0; background: #f5f7fa; color: #303133; }
+  header { background: #1f2937; color: #fff; padding: 12px 20px; display: flex; align-items: center; gap: 12px; }
+  header h1 { font-size: 18px; margin: 0; }
+  header small { color: #9ca3af; }
+  .tabs { display: flex; gap: 4px; max-width: 960px; margin: 12px auto 0; padding: 0 12px; }
+  .tabs button { border: 1px solid #dcdfe6; background: #fff; color: #606266; padding: 7px 18px; border-radius: 6px 6px 0 0; cursor: pointer; font-size: 14px; border-bottom: none; }
+  .tabs button.active { background: #fff; color: #409eff; font-weight: bold; box-shadow: 0 -2px 4px rgba(0,0,0,.05); }
+  main { max-width: 960px; margin: 0 auto 16px; padding: 0 12px; }
+  .card { background: #fff; border: 1px solid #e4e7ed; border-radius: 6px; padding: 14px; margin-bottom: 12px; }
+  .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 4px 0; }
+  input, select { padding: 6px 8px; border: 1px solid #dcdfe6; border-radius: 4px; font-size: 13px; }
+  button { padding: 6px 12px; border: 1px solid #409eff; background: #409eff; color: #fff; border-radius: 4px; cursor: pointer; font-size: 13px; }
+  button.ghost { background: #fff; color: #409eff; }
+  button.danger { background: #fff; color: #f56c6c; border-color: #f56c6c; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #ebeef5; }
+  th { background: #fafafa; }
+  a { color: #409eff; text-decoration: none; }
+  .dir { color: #e6a23c; font-weight: bold; cursor: pointer; }
+  .muted { color: #909399; font-size: 12px; }
+  #msg { position: fixed; top: 12px; right: 12px; background: #303133; color: #fff; padding: 8px 14px; border-radius: 4px; display: none; }
+  .breadcrumb { margin: 4px 0 8px; font-size: 13px; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; }
+  .bucket-chip { display: inline-block; margin: 4px 6px 0 0; padding: 5px 12px; border: 1px solid #409eff; border-radius: 14px; background: #ecf5ff; color: #409eff; font-size: 13px; text-decoration: none; }
+  .bucket-chip:hover { background: #409eff; color: #fff; }
+  .bucket-chip.selected { background: #409eff; color: #fff; border-color: #1f6feb; box-shadow: 0 0 0 2px rgba(64,158,255,.3); }
+  #dropOverlay { position: fixed; inset: 0; z-index: 9999; display: none; align-items: center; justify-content: center; background: rgba(64,158,255,.12); border: 3px dashed #409eff; font-size: 30px; font-weight: bold; color: #409eff; pointer-events: none; }
+  .up-item { display: flex; gap: 8px; align-items: center; margin-top: 6px; font-size: 13px; }
+  .up-item .nm { flex: 0 0 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .up-item progress { flex: 1; height: 12px; }
+  .up-item .st { flex: 0 0 130px; text-align: right; color: #888; }
+  .up-item .st.ok { color: #67c23a; }
+  .up-item .st.bad { color: #f56c6c; }
+  .doc-link { align-self: center; margin-left: 6px; padding: 5px 10px; border: 1px solid #dcdfe6; border-radius: 4px; color: #606266; font-size: 12px; text-decoration: none; }
+  .doc-link:hover { color: #409eff; border-color: #409eff; }
+  .modal-mask { position: fixed; inset: 0; background: rgba(0,0,0,.4); display: flex; align-items: center; justify-content: center; z-index: 1000; }
+  .modal { background: #fff; padding: 18px 22px; border-radius: 8px; min-width: 380px; box-shadow: 0 4px 20px rgba(0,0,0,.2); }

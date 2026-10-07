@@ -18,7 +18,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-export ARTIFACT_DEPOT_CONFIG="${CONFIG:-$DIR/src/artifactdepot/resources/config.json}"
+export ARTIFACT_DEPOT_CONFIG="${CONFIG:-$DIR/src/artifactdepot/config/config.json}"
 cd "$DIR/src"
 PY="$(find_uvicorn_python)" || exit 1
 echo "[ArtifactDepot] 启动于 0.0.0.0:${PORT}  reload=${RELOAD:-off}  python=${PY}"

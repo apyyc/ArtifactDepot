@@ -12,6 +12,7 @@
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import secrets
@@ -526,6 +527,26 @@ def head_object(bucket: str, key: str) -> dict:
     return {"exists": True, "is_dir": False, "bucket": bucket, "key": k,
             "size": st.st_size, "sha256": entry.get("sha256", ""),
             "mtime": _mtime_iso(st.st_mtime)}
+
+
+def object_etag(bucket: str, key: str) -> str:
+    """对象 ETag：优先用清单里的 SHA-256（强 ETag），否则回退 size-mtime。
+
+    文件不存在或 key 指向目录时返回 ""。
+    """
+    p = object_path(bucket, key)
+    if not p.is_file():
+        return ""
+    k = validate_key(key)
+    entry = _manifest_load(bucket).get(k, {}) or {}
+    sha = (entry.get("sha256") or "").strip()
+    if sha:
+        return f'"{sha}"'
+    try:
+        st = p.stat()
+    except OSError:
+        return ""
+    return f'"{st.st_size}-{int(st.st_mtime)}"'
 
 
 def list_buckets() -> list:
@@ -1101,15 +1122,19 @@ def audit(action: str, bucket: str, key: str, actor: str = "",
     if extra:
         rec.update(extra)
     p = _audit_path()
-    p.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(p, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
-    with os.fdopen(fd, "a", encoding="utf-8") as f:
-        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     try:
-        os.chmod(p, 0o600)
-    except OSError:
-        pass
-    _maybe_rotate_audit()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(p, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        try:
+            os.chmod(p, 0o600)
+        except OSError:
+            pass
+        _maybe_rotate_audit()
+    except OSError as e:
+        # 审计写入失败不应阻断业务（audit.log 属主不对 / 磁盘满等）
+        logging.getLogger("artifactdepot").warning("审计日志写入失败：%s", e)
 
 
 def _maybe_rotate_audit() -> None:

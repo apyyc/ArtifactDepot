@@ -121,10 +121,13 @@ def test_config_warnings_flag_weak_token(tmp_path, monkeypatch):
 # --------------------------------------------------------------------------
 
 def test_ui_has_no_inline_onclick_with_untrusted_data():
-    html = (ROOT / "src" / "artifactdepot" / "resources" / "index.html").read_text(encoding="utf-8")
+    base = ROOT / "src" / "artifactdepot" / "resources"
+    html = (base / "index.html").read_text(encoding="utf-8")
+    js = (base / "static" / "app.js").read_text(encoding="utf-8")
     assert not re.search(r'onclick="[^"]*esc\(', html), \
         "index.html 仍存在把 esc() 结果拼进内联 onclick 的 XSS 隐患"
-    assert "data-action" in html and "addEventListener('click'" in html
+    # CSP 重构后事件委托在 app.js
+    assert "data-action" in js and "addEventListener('click'" in js
 
 
 # --------------------------------------------------------------------------

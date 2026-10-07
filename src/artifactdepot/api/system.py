@@ -1,15 +1,19 @@
 """系统 API：健康检查、bucket 列表、权限目录、Token 注册表管理、审计查询、token 校验"""
 import hashlib
 
+import os
+
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import Response
 from pydantic import BaseModel
 from typing import List, Optional
 
 from artifactdepot import netutil, storage
 from artifactdepot.auth import (
-    Principal, extract_token, require_scope, resolve_principal,
+    Principal, extract_token, require_admin, require_scope, resolve_principal,
 )
-from artifactdepot.config import get_config
+from artifactdepot.config import get_config, reload_config
+from artifactdepot.observability import render_metrics
 from artifactdepot.permissions import (
     DEFAULT_ROLE, PERMISSION_CATALOG, PUBLIC_CATALOG, ROLE_PRESETS,
 )
@@ -94,6 +98,47 @@ async def auth_check(request: Request, token: str = Query("")):
 async def health():
     root = storage.get_root()
     return {"status": "ok", "depot_dir": str(root), "exists": root.exists()}
+
+
+@router.get("/health/live")
+async def health_live():
+    """liveness：进程活着就返回 200。"""
+    return {"status": "alive"}
+
+
+@router.get("/health/ready")
+async def health_ready():
+    """readiness：depot 目录存在且可写才返回 200，否则 503。"""
+    root = storage.get_root()
+    if not root.exists() or not os.access(root, os.W_OK):
+        raise HTTPException(503, detail="depot 目录不存在或不可写")
+    return {"status": "ready", "depot_dir": str(root)}
+
+
+@router.get("/metrics")
+async def metrics():
+    """Prometheus 文本格式指标；config.metrics_enabled=false 时 404。"""
+    if not bool(get_config().get("metrics_enabled", True)):
+        raise HTTPException(404, detail="metrics 未启用")
+    return Response(render_metrics(),
+                    media_type="text/plain; version=0.0.4; charset=utf-8")
+
+
+@router.post("/api/config/reload")
+async def config_reload(request: Request, actor: str = Depends(require_admin)):
+    """手动重新加载 config/config.json + config/.env（仅管理员共享 token）。
+
+    返回 data = {ok, error, changed, needs_restart, warnings}：
+    changed 已即时生效；needs_restart 值变了但需重启（保留旧值）。
+    """
+    result = reload_config()
+    storage.audit("config_reload", "", "", actor,
+                  request.client.host if request.client else "",
+                  extra={"changed": result.get("changed"),
+                         "needs_restart": result.get("needs_restart")})
+    if not result.get("ok"):
+        raise HTTPException(400, detail=result.get("error") or "配置重载失败")
+    return {"code": 0, "message": "success", "data": result}
 
 
 @router.get("/api/buckets")

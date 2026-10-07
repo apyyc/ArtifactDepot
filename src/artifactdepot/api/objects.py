@@ -9,7 +9,7 @@ import mimetypes
 import tempfile
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, Response, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
@@ -19,6 +19,7 @@ from artifactdepot.auth import (
     require_scope, resolve_principal,
 )
 from artifactdepot import netutil
+from artifactdepot.observability import DELETES, DOWNLOADS, UPLOADS
 from artifactdepot.config import get_config
 
 router = APIRouter(prefix="/api/objects", tags=["Objects"])
@@ -31,6 +32,23 @@ def _client_ip(request: Request) -> str:
 def _public_ip(request: Request) -> str:
     # 只采信可信代理的 X-Forwarded-For，忽略客户端自报的 public_ip 参数
     return netutil.resolved_public_ip(request)
+
+
+def _etag_matches(if_none_match: str, etag: str) -> bool:
+    """判断 If-None-Match 是否命中当前 ETag（支持 *、逗号列表、W/ 弱前缀）。"""
+    if not if_none_match or not etag:
+        return False
+    header = if_none_match.strip()
+    if header == "*":
+        return True
+    target = etag.strip().strip('"')
+    for part in header.split(","):
+        part = part.strip()
+        if part.startswith("W/"):
+            part = part[2:].strip()
+        if part.strip().strip('"') == target:
+            return True
+    return False
 
 
 def _read_requires_token() -> bool:
@@ -97,6 +115,7 @@ async def upload(
     storage.audit("upload", bucket, key, principal.actor, _client_ip(request),
                   size=result["size"], sha256=result["sha256"],
                   public_ip=_public_ip(request))
+    UPLOADS.inc()
     return {"code": 0, "message": "success", "data": result}
 
 
@@ -125,13 +144,18 @@ async def list_objects(request: Request, bucket: str, prefix: str = "",
 
 
 @router.get("/head")
-async def head(request: Request, bucket: str, key: str,
+async def head(request: Request, response: Response, bucket: str, key: str,
                actor: Principal = Depends(require_scope("object:head"))):
-    """对象元信息探测（S3 HeadObject 语义）：不存在返回 404；mtime 为 UTC ISO8601。"""
+    """对象元信息探测（S3 HeadObject 语义）：不存在 404；支持 ETag / If-None-Match(304)。"""
     ensure_scope(actor, "object:head", bucket=bucket, key=key)
     data = storage.head_object(bucket, key)
     if not data.get("exists"):
         raise HTTPException(404, detail=f"对象不存在：{bucket}/{key}")
+    etag = storage.object_etag(bucket, key)
+    if _etag_matches(request.headers.get("if-none-match", ""), etag):
+        return Response(status_code=304, headers={"ETag": etag})
+    if etag:
+        response.headers["ETag"] = etag
     return {"code": 0, "message": "success", "data": data}
 
 
@@ -175,11 +199,20 @@ async def download(
     if not p.is_file():
         raise HTTPException(404, detail=f"对象不存在：{bucket}/{key}")
 
+    # ETag / 条件请求：命中 If-None-Match 直接 304，不再传输文件体
+    etag = storage.object_etag(bucket, key)
+    if _etag_matches(request.headers.get("if-none-match", ""), etag):
+        storage.audit("download", bucket, key, actor=actor, ip=_client_ip(request),
+                      size=0, public_ip=_public_ip(request), extra={"not_modified": True})
+        return Response(status_code=304, headers={"ETag": etag})
+
     storage.audit("download", bucket, key,
                   actor=actor, ip=_client_ip(request),
                   size=p.stat().st_size, public_ip=_public_ip(request))
+    DOWNLOADS.inc()
     media = mimetypes.guess_type(p.name)[0] or "application/octet-stream"
-    return FileResponse(p, media_type=media, filename=p.name)
+    return FileResponse(p, media_type=media, filename=p.name,
+                        headers={"ETag": etag} if etag else {})
 
 
 @router.delete("")
@@ -189,6 +222,7 @@ async def delete(bucket: str, key: str,
     ensure_scope(actor, "object:delete", bucket=bucket, key=key)
     result = storage.delete_object(bucket, key)
     storage.audit("delete", bucket, key, actor.actor, _client_ip(request), public_ip=_public_ip(request))
+    DELETES.inc()
     return {"code": 0, "message": "success", "data": result}
 
 
@@ -373,6 +407,7 @@ async def complete_upload(
     storage.audit("upload", bucket, key, principal.actor, _client_ip(request),
                   size=result["size"], sha256=result["sha256"],
                   public_ip=_public_ip(request))
+    UPLOADS.inc()
     return {"code": 0, "message": "success", "data": result}
 
 

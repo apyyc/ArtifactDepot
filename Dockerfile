@@ -13,7 +13,7 @@ FROM docker.io/library/python:3.12-alpine
 
 LABEL org.opencontainers.image.title="ArtifactDepot-ObjectStorage"
 LABEL org.opencontainers.image.description="Object storage depot (FastAPI :8004)"
-LABEL org.opencontainers.image.version="0.7.2"
+LABEL org.opencontainers.image.version="0.7.3"
 
 # 安装 Supervisor + curl（健康检查用）+ tzdata（容器内统一中国时区）
 # 先把 Alpine apk 源换成清华镜像：官方源 dl-cdn.alpinelinux.org 的 DNS 返回 IPv6，
@@ -43,7 +43,7 @@ RUN addgroup -g 10001 artifactdepot \
 USER artifactdepot
 
 # 环境变量（数据目录挂载点）
-# 注意：ARTIFACT_DEPOT_DATAHUB_URL 不要在这里预设默认值——config.py 里环境变量优先级
+# 注意：ARTIFACT_DEPOT_DATAHUB_URL 不要在这里预设默认值——config/__init__.py 里环境变量优先级
 # 高于配置文件，镜像内烤死的 127.0.0.1 会把挂载 config.json 里的 datahub_url 盖掉
 # （症状：改了配置文件同步仍报 "All connection attempts failed"）。datahub_url 以
 # 容器内配置文件的字段为准；生产用 VOLUME_MAPS 挂载宿主机 config.json 显式填写。

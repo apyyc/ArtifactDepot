@@ -7,6 +7,6 @@
 depot/
 logs/
 *.sh
-config.production.json
-# 运行配置（含 access_token）绝不进镜像，生产用挂载/环境变量注入
-**/config.json
+test/
+# 隐私配置绝不进镜像；默认 config/config.json 会进镜像（不含密钥），密钥放 .env
+**/.env

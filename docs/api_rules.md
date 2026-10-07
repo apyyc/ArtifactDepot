@@ -1,6 +1,6 @@
 # ArtifactDepot 接口文档
 
-> 版本 0.7.2 · FastAPI 服务 · 默认端口 8004
+> 版本 0.7.3 · FastAPI 服务 · 默认端口 8004
 >
 > 0.7.1 变更：新增 `GET /api/docs`（公开、只读文档清单 + 内容，供查看原始 Markdown）；网页 UI 标签栏右侧提供 Swagger / ReDoc 入口（FastAPI 自动生成，可在线调试）；修复两处与文档语义不一致的问题：`scopes: []` 现在真正表示「无权限」（此前会被回退成角色预设），`require_read_token=true` 时资源范围外调用 `GET /api/objects/list` 返回 `403`（此前会忽略范围过滤、返回白名单外 bucket 的内容）。
 >
@@ -208,9 +208,11 @@ GET /api/objects/download
 | `expires` | string | 否 | 旧式 HMAC 过期时间戳 |
 | `sig` | string | 否 | 旧式 HMAC 签名 |
 | `token` | string | 否 | 访问令牌（非签名方式时必填）；也支持 `Authorization: Bearer` |
-| `public_ip` | string | 否 | 前端上报的公网 IP，记入审计 |
+| `public_ip` | string | 否 | 已废弃/忽略；审计公网 IP 由服务端按 `trusted_proxies` 解析 XFF |
 
 **响应**：文件流，支持 **Range（206）** 视频拖动，`Content-Type` 按扩展名推断。
+
+**ETag / 条件请求**：响应带 `ETag`（强 ETag = SHA-256）；请求头 `If-None-Match` 命中时返回 **304**，不传输文件体。
 
 > 对象不存在时返回 `404`；签名链接会先检查对象存在，再扣减次数，避免无效消费。
 
@@ -312,7 +314,7 @@ GET /api/objects/head
 
 **查询参数**：`bucket`（必填）、`key`（必填）。
 
-**说明**：轻量探测文件或目录是否存在。存在时返回 `data`：`{ "exists": true, "is_dir": false, "size": 123, "sha256": "...", "mtime": "2026-10-07T16:20:09Z" }`（`mtime` 统一为 UTC ISO8601，与 list 一致）。**不存在时返回 `404`**（S3 HeadObject 语义）。
+**说明**：轻量探测文件或目录是否存在。存在时返回 `data`：`{ "exists": true, "is_dir": false, "size": 123, "sha256": "...", "mtime": "2026-10-07T16:20:09Z" }`（`mtime` 统一为 UTC ISO8601，与 list 一致）。**不存在时返回 `404`**（S3 HeadObject 语义）。响应带 `ETag`，`If-None-Match` 命中返回 **304**。
 
 ### 2.8 生成签名下载链接（Presign / 共享链接）
 
@@ -433,6 +435,22 @@ GET /health
 
 返回 `{ "status": "ok", "depot_dir": "...", "exists": true }`。
 
+### 4.1.1 存活/就绪
+
+- `GET /health/live`：进程存活即 200 `{ "status": "alive" }`；
+- `GET /health/ready`：depot 目录存在且可写才 200 `{ "status": "ready" }`，否则 `503`；
+- `GET /metrics`：Prometheus 文本格式（`metrics_enabled=false` 时 404）。
+
+### 4.1.2 手动重新加载配置
+
+```
+POST /api/config/reload
+```
+
+**鉴权**：仅管理员共享 token。
+
+**说明**：重新读取 `config/config.json` 与 `config/.env`，返回 `{ok, error, changed, needs_restart, warnings}`；`changed` 已即时生效，`needs_restart` 需重启（保留旧值）；语法错误时 `ok=false` 且旧配置保留。
+
 ### 4.2 列出所有 bucket
 
 ```
@@ -457,7 +475,7 @@ POST /api/buckets
 { "bucket": "voicevideo" }
 ```
 
-**说明**：显式创建空 bucket（内部放 `.keep` 占位）。bucket 命名约束见 1.5；已存在时幂等返回 HTTP 200，`data = { "bucket": "...", "created": false }`，新建成功返回 `created: true`。可选 query `public_ip` 记入审计。
+**说明**：显式创建空 bucket（内部放 `.keep` 占位）。bucket 命名约束见 1.5；已存在时幂等返回 HTTP 200，`data = { "bucket": "...", "created": false }`，新建成功返回 `created: true`。
 
 ```bash
 curl -X POST "http://<IP>:8004/api/buckets?token=<token>" \
@@ -568,6 +586,7 @@ GET /api/docs/{name}?raw=1 # 直接返回 text/plain 原文
 | 方法 | 路径 | 权限点（scope） | 说明 |
 |---|---|---|---|
 | GET | `/health` | 公开 | 健康检查 |
+| POST | `/api/config/reload` | 仅管理员 | 手动重新加载配置 |
 | GET | `/api/auth/check` | 公开 | 校验 token |
 | GET | `/api/auth/permissions` | 公开 | 权限点目录 |
 | GET | `/api/docs` | 公开 | 文档清单 |
@@ -601,7 +620,10 @@ GET /api/docs/{name}?raw=1 # 直接返回 text/plain 原文
 
 ## 九、配置项与调用相关
 
-ArtifactDepot 配置优先级：内置默认 < `resources/config.json`（或 `ARTIFACT_DEPOT_CONFIG` 指定文件）< 环境变量。
+ArtifactDepot 配置优先级：内置默认 < `config/config.json`（或 `ARTIFACT_DEPOT_CONFIG` 指定文件）< `config/.env` < 真实环境变量。
+
+> 隐私项放 `config/.env`（字段名=值，如 `access_token=...`），不进 git/镜像；`.env` 空值视为未设置。
+> 手动重载：`POST /api/config/reload`（仅管理员），或网页「Token 管理」页的「重新加载配置」按钮。
 
 影响接口调用的关键配置：
 
@@ -635,6 +657,7 @@ ArtifactDepot 配置优先级：内置默认 < `resources/config.json`（或 `AR
 10. 分片上传有单分片（64MB）与会话总量上限（`max_upload_mb`，未配置时 200GB 兜底），防止 `/tmp` 被写满。
 11. Swagger UI / ReDoc 前端资源自托管于 `/static/`，不再依赖外部 CDN；`/docs`、`/redoc` 仅暴露 OpenAPI，不额外放行管理接口。
 12. 默认不加 CORS / TrustedHost 限制（内网部署）；跨源或域名访问请按 `cors_origins` / `allowed_hosts` 收紧。
+13. 网页 UI 脚本/样式已外置到 `/static/app.js`、`/static/app.css`，应用页 CSP 为 `script-src 'self'`（不允许内联脚本）；Swagger/ReDoc 因自带内联初始化脚本，单独放行 `'unsafe-inline'`。
 
 ## 十一、其他项目接入指南（bucket / 目录 / 文件 push-pull）
 

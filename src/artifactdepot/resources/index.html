@@ -5,45 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <meta name="referrer" content="no-referrer" />
 <title>制品仓 - ArtifactDepot</title>
-<style>
-  body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; margin: 0; background: #f5f7fa; color: #303133; }
-  header { background: #1f2937; color: #fff; padding: 12px 20px; display: flex; align-items: center; gap: 12px; }
-  header h1 { font-size: 18px; margin: 0; }
-  header small { color: #9ca3af; }
-  .tabs { display: flex; gap: 4px; max-width: 960px; margin: 12px auto 0; padding: 0 12px; }
-  .tabs button { border: 1px solid #dcdfe6; background: #fff; color: #606266; padding: 7px 18px; border-radius: 6px 6px 0 0; cursor: pointer; font-size: 14px; border-bottom: none; }
-  .tabs button.active { background: #fff; color: #409eff; font-weight: bold; box-shadow: 0 -2px 4px rgba(0,0,0,.05); }
-  main { max-width: 960px; margin: 0 auto 16px; padding: 0 12px; }
-  .card { background: #fff; border: 1px solid #e4e7ed; border-radius: 6px; padding: 14px; margin-bottom: 12px; }
-  .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 4px 0; }
-  input, select { padding: 6px 8px; border: 1px solid #dcdfe6; border-radius: 4px; font-size: 13px; }
-  button { padding: 6px 12px; border: 1px solid #409eff; background: #409eff; color: #fff; border-radius: 4px; cursor: pointer; font-size: 13px; }
-  button.ghost { background: #fff; color: #409eff; }
-  button.danger { background: #fff; color: #f56c6c; border-color: #f56c6c; }
-  table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #ebeef5; }
-  th { background: #fafafa; }
-  a { color: #409eff; text-decoration: none; }
-  .dir { color: #e6a23c; font-weight: bold; cursor: pointer; }
-  .muted { color: #909399; font-size: 12px; }
-  #msg { position: fixed; top: 12px; right: 12px; background: #303133; color: #fff; padding: 8px 14px; border-radius: 4px; display: none; }
-  .breadcrumb { margin: 4px 0 8px; font-size: 13px; }
-  .mono { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; }
-  .bucket-chip { display: inline-block; margin: 4px 6px 0 0; padding: 5px 12px; border: 1px solid #409eff; border-radius: 14px; background: #ecf5ff; color: #409eff; font-size: 13px; text-decoration: none; }
-  .bucket-chip:hover { background: #409eff; color: #fff; }
-  .bucket-chip.selected { background: #409eff; color: #fff; border-color: #1f6feb; box-shadow: 0 0 0 2px rgba(64,158,255,.3); }
-  #dropOverlay { position: fixed; inset: 0; z-index: 9999; display: none; align-items: center; justify-content: center; background: rgba(64,158,255,.12); border: 3px dashed #409eff; font-size: 30px; font-weight: bold; color: #409eff; pointer-events: none; }
-  .up-item { display: flex; gap: 8px; align-items: center; margin-top: 6px; font-size: 13px; }
-  .up-item .nm { flex: 0 0 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .up-item progress { flex: 1; height: 12px; }
-  .up-item .st { flex: 0 0 130px; text-align: right; color: #888; }
-  .up-item .st.ok { color: #67c23a; }
-  .up-item .st.bad { color: #f56c6c; }
-  .doc-link { align-self: center; margin-left: 6px; padding: 5px 10px; border: 1px solid #dcdfe6; border-radius: 4px; color: #606266; font-size: 12px; text-decoration: none; }
-  .doc-link:hover { color: #409eff; border-color: #409eff; }
-  .modal-mask { position: fixed; inset: 0; background: rgba(0,0,0,.4); display: flex; align-items: center; justify-content: center; z-index: 1000; }
-  .modal { background: #fff; padding: 18px 22px; border-radius: 8px; min-width: 380px; box-shadow: 0 4px 20px rgba(0,0,0,.2); }
-</style>
+<link rel="stylesheet" href="/static/app.css" />
 </head>
 <body>
 <header>
@@ -52,10 +14,10 @@
 </header>
 
 <div class="tabs">
-  <button class="active" data-t="browse" onclick="switchTab('browse')">浏览</button>
-  <button data-t="links" onclick="switchTab('links')">签名链接</button>
-  <button data-t="tokens" onclick="switchTab('tokens')">Token 管理</button>
-  <button data-t="audit" onclick="switchTab('audit')">审计</button>
+  <button class="active" data-t="browse" data-action="switch-tab" data-tab="browse">浏览</button>
+  <button data-t="links" data-action="switch-tab" data-tab="links">签名链接</button>
+  <button data-t="tokens" data-action="switch-tab" data-tab="tokens">Token 管理</button>
+  <button data-t="audit" data-action="switch-tab" data-tab="audit">审计</button>
   <span style="flex:1;"></span>
   <a class="doc-link" href="/docs" target="_blank" rel="noopener" title="FastAPI 自动生成的交互式 API 调试台">Swagger</a>
   <a class="doc-link" href="/redoc" target="_blank" rel="noopener" title="FastAPI ReDoc 只读文档">ReDoc</a>
@@ -68,8 +30,8 @@
       <div class="row">
         <label>Bucket（项目）:</label>
         <input id="bucket" placeholder="如 project_1" value="" />
-        <button onclick="openBucket()">进入</button>
-        <button class="ghost" onclick="listBuckets()">列出 bucket</button>
+        <button data-action="open-bucket">进入</button>
+        <button class="ghost" data-action="list-buckets">列出 bucket</button>
       </div>
       <div id="bucketList"></div>
       <div class="row" style="margin-top:8px;">
@@ -85,7 +47,7 @@
         <input type="file" id="upFile" multiple />
         <label>来源URL: <input id="upSource" placeholder="可选，如源视频链接" style="width:240px;" /></label>
         <label>并发数: <select id="upConcurrency"><option value="1">1</option><option value="2">2</option><option value="3" selected>3</option><option value="5">5</option></select></label>
-        <button id="upBtn" onclick="doUpload()">上传</button>
+        <button id="upBtn" data-action="do-upload">上传</button>
       </div>
       <div class="muted" style="margin-top:4px;">上传到：<span id="upTarget">（当前 bucket + 位置）</span>；token 在协作平台成员列表"查看我的Token"获取。<br />支持多选，或把文件<strong>拖拽到页面任意位置</strong>，松手自动上传（上传前先校验 token）。单个文件 &gt;8MB 时自动启用多线程分片上传。</div>
       <div id="upQueue"></div>
@@ -93,7 +55,7 @@
 
     <div class="card">
       <div class="breadcrumb">位置：<span id="crumb">（先选择 bucket）</span>
-        <button class="ghost" style="float:right;" onclick="openMkdirModal()">新建目录</button>
+        <button class="ghost" style="float:right;" data-action="open-mkdir">新建目录</button>
       </div>
       <table id="tbl">
         <thead><tr><th>名称</th><th>大小</th><th>时间</th><th>来源</th><th>上传者</th><th>操作</th></tr></thead>
@@ -108,7 +70,7 @@
       <div class="row">
         <label>令牌:</label>
         <input id="lkToken" placeholder="你的 api_token 或管理员令牌（可看全部链接；完整链接仅管理员/创建者可见）" style="width:380px;" />
-        <button onclick="loadLinks()">查询</button>
+        <button data-action="load-links">查询</button>
       </div>
       <table id="lkTbl">
         <thead><tr><th>创建者</th><th>文件</th><th>时效</th><th>剩余</th><th>创建时间</th><th>状态</th><th>链接</th><th>操作</th></tr></thead>
@@ -125,10 +87,12 @@
       <div class="row">
         <label>管理员令牌:</label>
         <input id="admToken" placeholder="共享 access_token" style="width:220px;" />
-        <button onclick="loadTokens()">查询</button>
-        <button class="ghost" onclick="syncTokens()">从 DataHub 同步</button>
-        <label style="margin-left:8px;"><input type="checkbox" id="tkReveal" onchange="loadTokens()"> 显示明文</label>
+        <button data-action="load-tokens">查询</button>
+        <button class="ghost" data-action="sync-tokens">从 DataHub 同步</button>
+        <button class="ghost" data-action="reload-config">重新加载配置</button>
+        <label style="margin-left:8px;"><input type="checkbox" id="tkReveal"> 显示明文</label>
         <span class="muted" id="syncInfo"></span>
+        <span class="muted" id="cfgReloadInfo"></span>
       </div>
       <table>
         <thead><tr><th>用户</th><th>Token</th><th>角色</th><th>权限点数</th><th>资源范围</th><th>过期</th><th>状态</th><th>操作</th></tr></thead>
@@ -143,7 +107,7 @@
         <label>用户名:</label>
         <input id="tkUser" placeholder="如 zhangsan / 处理端-8" style="width:180px;" />
         <label>角色预设:</label>
-        <select id="tkRole" onchange="applyRolePreset()" style="width:230px;"></select>
+        <select id="tkRole" style="width:230px;"></select>
         <label>过期:</label>
         <input id="tkExpires" placeholder="留空=永久；如 2026-12-31" style="width:160px;" />
         <label>说明:</label>
@@ -159,23 +123,23 @@
       </div>
 
       <div class="row" style="margin-top:8px;">
-        <button class="ghost" onclick="tkSelectAll(true)">全选</button>
-        <button class="ghost" onclick="tkSelectAll(false)">全不选</button>
-        <button class="ghost" onclick="tkSelectWrite(false)">仅勾选读</button>
-        <button class="ghost" onclick="tkSelectWrite(true)">仅勾选写</button>
+        <button class="ghost" data-action="select-all" data-on="true">全选</button>
+        <button class="ghost" data-action="select-all" data-on="false">全不选</button>
+        <button class="ghost" data-action="select-write" data-on="false">仅勾选读</button>
+        <button class="ghost" data-action="select-write" data-on="true">仅勾选写</button>
       </div>
 
       <div id="tkCatalog"></div>
 
       <div class="row" style="margin-top:12px;">
-        <button onclick="generateToken()">生成本轮 Token</button>
+        <button data-action="generate-token">生成本轮 Token</button>
         <span class="muted">Token 由服务端生成，仅生成后展示一次，请立即复制保存。</span>
       </div>
 
       <div class="row" id="tkResultRow" style="display:none; margin-top:8px;">
         <label>新 Token:</label>
-        <input id="tkResult" readonly class="mono" style="flex:1; font-size:12px;" onfocus="this.select()" />
-        <button class="ghost" onclick="copyTkResult()">复制</button>
+        <input id="tkResult" readonly class="mono select-on-focus" style="flex:1; font-size:12px;" />
+        <button class="ghost" data-action="copy-token">复制</button>
       </div>
     </div>
   </div>
@@ -191,7 +155,7 @@
         <input id="audKey" placeholder="key（可空）" style="width:180px;" />
         <input id="audActor" placeholder="操作者（可空）" style="width:120px;" />
         <input id="audSince" placeholder="起始时间（可空）" style="width:150px;" />
-        <button onclick="runAudit()">查询</button>
+        <button data-action="run-audit">查询</button>
       </div>
       <table>
         <thead><tr><th>时间</th><th>动作</th><th>Bucket</th><th>Key</th><th>操作者</th><th>IP</th><th title="仅可信代理 X-Forwarded-For 解析，未配置 trusted_proxies 时为空">代理IP</th><th>大小</th></tr></thead>
@@ -211,8 +175,8 @@
     <div class="modal">
       <div id="cfmMsg" style="margin-bottom:12px;"></div>
       <div class="row">
-        <button id="cfmOk" onclick="cfmResolve(true)">确定</button>
-        <button class="ghost" onclick="cfmResolve(false)">取消</button>
+        <button id="cfmOk" data-action="confirm" data-ok="true">确定</button>
+        <button class="ghost" data-action="confirm" data-ok="false">取消</button>
       </div>
     </div>
   </div>
@@ -225,8 +189,8 @@
         <input id="mkdirName" placeholder="目录名（可含 / 创建多级，如 任务1/交付物）" style="flex:1;" />
       </div>
       <div class="row" style="margin-top:12px;">
-        <button onclick="doMkdir()">创建</button>
-        <button class="ghost" onclick="closeMkdirModal()">取消</button>
+        <button data-action="do-mkdir">创建</button>
+        <button class="ghost" data-action="close-mkdir">取消</button>
       </div>
     </div>
   </div>
@@ -237,9 +201,9 @@
       <div class="muted" id="psTarget" style="margin-bottom:10px;"></div>
       <div class="row">
         <label>类型:</label>
-        <label><input type="radio" name="psType" value="time" checked onchange="psTypeChange()"> 按时效</label>
-        <label style="margin-left:6px;"><input type="radio" name="psType" value="count" onchange="psTypeChange()"> 按次数</label>
-        <label style="margin-left:6px;"><input type="radio" name="psType" value="permanent" onchange="psTypeChange()"> 永久</label>
+        <label><input type="radio" name="psType" value="time" checked> 按时效</label>
+        <label style="margin-left:6px;"><input type="radio" name="psType" value="count"> 按次数</label>
+        <label style="margin-left:6px;"><input type="radio" name="psType" value="permanent"> 永久</label>
       </div>
       <div class="row" id="psTimeRow" style="margin-top:8px;">
         <label>有效期:</label>
@@ -255,911 +219,16 @@
       <div class="muted" id="psPermanentHint" style="display:none; margin-top:8px;">永久链接：不设次数与时效，可随时由管理员或创建者作废。</div>
       <div class="row" id="psResultRow" style="margin-top:12px; display:none;">
         <label>链接:</label>
-        <input id="psResult" readonly style="flex:1; font-size:12px;" onfocus="this.select()" />
-        <button class="ghost" onclick="copyPsResult()">复制</button>
+        <input id="psResult" readonly class="select-on-focus" style="flex:1; font-size:12px;" />
+        <button class="ghost" data-action="copy-presign">复制</button>
       </div>
       <div class="row" style="margin-top:12px;">
-        <button id="psGenBtn" onclick="doPresign()">生成</button>
-        <button class="ghost" onclick="closePsModal()">关闭</button>
+        <button id="psGenBtn" data-action="do-presign">生成</button>
+        <button class="ghost" data-action="close-presign">关闭</button>
       </div>
     </div>
   </div>
 
-<script>
-const $ = (id) => document.getElementById(id)
-let state = { bucket: '', prefix: '' }
-// 公网 IP 由服务端按 config.trusted_proxies 解析 X-Forwarded-For，前端不再自报/调用第三方
-
-function toast(text, ok = true) {
-  const m = $('msg')
-  m.style.background = ok ? '#67c23a' : '#f56c6c'
-  m.textContent = text
-  m.style.display = 'block'
-  setTimeout(() => { m.style.display = 'none' }, 3000)
-}
-
-function switchTab(t) {
-  document.querySelectorAll('.tabs button').forEach(b => b.classList.toggle('active', b.dataset.t === t))
-  ;['browse', 'links', 'tokens', 'audit'].forEach(s => {
-    $('sec-' + s).style.display = s === t ? '' : 'none'
-  })
-}
-
-function authHeaders(token, extra) {
-  const h = Object.assign({}, extra || {})
-  if (token) h['Authorization'] = 'Bearer ' + token
-  return h
-}
-
-// token 优先走 Authorization 头，避免出现在 URL query（访问日志/历史泄露）
-async function api(url, opts = {}, token = '') {
-  opts = Object.assign({}, opts)
-  opts.headers = authHeaders(token, opts.headers)
-  const r = await fetch(url, opts)
-  let body = null
-  try { body = await r.json() } catch (e) { body = null }
-  if (!r.ok) throw new Error((body && body.detail) || ('HTTP ' + r.status))
-  return body
-}
-
-// 事件委托：不可信 key/id 只放 data-* 属性，避免拼进内联 onclick 造成 XSS
-document.addEventListener('click', (e) => {
-  const el = e.target && e.target.closest ? e.target.closest('[data-action]') : null
-  if (!el) return
-  e.preventDefault()
-  const a = el.dataset.action
-  if (a === 'enter-dir') enterDir(el.dataset.key)
-  else if (a === 'del-dir') delDir(el.dataset.key)
-  else if (a === 'presign') presign(el.dataset.key)
-  else if (a === 'del-file') delFile(el.dataset.key)
-  else if (a === 'revoke-link') revokeLink(el.dataset.id)
-  else if (a === 'remove-token') removeToken(el.dataset.token)
-})
-
-function esc(s) {
-  return String(s == null ? '' : s).replace(/[&<>"']/g, c => (
-    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
-  ))
-}
-
-// 时间显示：后端存 UTC（...Z）→ 转浏览器本地时间；旧数据无 Z 视为本地原样显示
-function fmtDuration(sec) {
-  sec = Math.max(0, Math.round(Number(sec) || 0))
-  if (sec < 60) return sec + ' 秒'
-  if (sec < 3600) return Math.round(sec / 60) + ' 分钟'
-  if (sec < 86400) return (Math.round(sec / 360) / 10) + ' 小时'
-  return (Math.round(sec / 8640) / 10) + ' 天'
-}
-
-function fmtTime(s) {
-  if (!s) return ''
-  if (typeof s === 'string' && /Z$/.test(s)) {
-    const d = new Date(s)
-    if (!isNaN(d)) {
-      const p = n => String(n).padStart(2, '0')
-      return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' +
-        p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds())
-    }
-  }
-  return s
-}
-
-function fmtSize(n) {
-  if (!n && n !== 0) return '-'
-  if (n < 1024) return n + ' B'
-  if (n < 1048576) return (n / 1024).toFixed(1) + ' KB'
-  if (n < 1073741824) return (n / 1048576).toFixed(1) + ' MB'
-  return (n / 1073741824).toFixed(2) + ' GB'
-}
-
-// ---- 浏览 ----
-
-function renderBuckets(arr, selected) {
-  const box = $('bucketList')
-  box.innerHTML = ''
-  if (!arr.length) { box.innerHTML = '<span class="muted">（暂无 bucket，可直接在输入框输入新名字进入）</span>'; return }
-  arr.forEach(b => {
-    const chip = document.createElement('a')
-    chip.href = 'javascript:void(0)'
-    chip.className = 'bucket-chip' + (b === selected ? ' selected' : '')
-    chip.textContent = b
-    chip.onclick = () => { $('bucket').value = b; openBucket() }
-    box.appendChild(chip)
-  })
-}
-
-async function listBuckets() {
-  try {
-    const body = await api('/api/buckets')
-    renderBuckets(body.data || [], state.bucket)
-  } catch (e) { toast(e.message, false) }
-}
-
-// 页面加载即列出 bucket（可点击选中）
-listBuckets()
-
-// URL 携带 token/bucket 进入（从协作平台跳转自动认证）
-// 从 query 读 token 填入输入框，并立即清除地址栏里的 token（防进历史/Referer 泄露）
-const urlParams = new URLSearchParams(location.search)
-const urlToken = urlParams.get('token')
-const urlBucket = urlParams.get('bucket')
-if (urlToken) {
-  $('upToken').value = urlToken   // 浏览/上传/下载通用令牌
-  $('lkToken').value = urlToken   // 签名链接页令牌
-  // 顺带校验一次，提示当前身份（无效 token 不打扰，让用户自行填写）
-  checkToken(urlToken).then(actor => { if (actor) toast('已识别身份：' + actor) })
-}
-history.replaceState({}, '', location.pathname + (urlBucket ? '?bucket=' + encodeURIComponent(urlBucket) : ''))
-if (urlBucket) {
-  $('bucket').value = urlBucket
-  openBucket()   // 自动进入目标 bucket
-}
-
-async function openBucket() {
-  const b = $('bucket').value.trim()
-  if (!b) { toast('请输入 bucket', false); return }
-  state.bucket = b; state.prefix = ''
-  await refresh()
-  // 刷新 bucket 列表并高亮当前选中的
-  try {
-    const body = await api('/api/buckets')
-    renderBuckets(body.data || [], state.bucket)
-  } catch (e) { /* 忽略 */ }
-}
-
-function enterDir(key) {
-  state.prefix = key.replace(/\/$/, '')
-  refresh()
-}
-
-function goUp() {
-  const parts = state.prefix.split('/').filter(Boolean)
-  parts.pop()
-  state.prefix = parts.join('/')
-  refresh()
-}
-
-async function refresh() {
-  const q = 'bucket=' + encodeURIComponent(state.bucket) + '&prefix=' + encodeURIComponent(state.prefix)
-  let items = []
-  try {
-    const body = await api('/api/objects/list?' + q)
-    items = body.data.items || []
-  } catch (e) { toast(e.message, false) }
-
-  const crumb = state.bucket + ' / ' + (state.prefix ? '/' + state.prefix + '/' : '/')
-  $('crumb').textContent = crumb
-  $('upTarget').textContent = state.bucket + ' / ' + (state.prefix ? state.prefix + '/' : '')
-
-  const tbody = document.querySelector('#tbl tbody')
-  tbody.innerHTML = ''
-  if (state.prefix) {
-    const tr = document.createElement('tr')
-    tr.innerHTML = '<td colspan="6"><a class="dir" href="javascript:void(0)" onclick="goUp()">.. 上一级</a></td>'
-    tbody.appendChild(tr)
-  }
-  for (const it of items) {
-    const tr = document.createElement('tr')
-    if (it.is_dir) {
-      tr.innerHTML = '<td><a class="dir" href="javascript:void(0)" data-action="enter-dir" data-key="' + esc(it.key) + '">' + esc(it.name) + '/</a></td>' +
-        '<td>' + fmtSize(it.size) + '</td>' +
-        '<td class="muted">' + esc(fmtTime(it.mtime)) + '</td>' +
-        '<td>-</td>' +
-        '<td>-</td>' +
-        '<td><a href="javascript:void(0)" data-action="del-dir" data-key="' + esc(it.key) + '" style="color:#f56c6c;">删除</a></td>'
-    } else {
-      const dl = '/api/objects/download?bucket=' + encodeURIComponent(state.bucket) + '&key=' + encodeURIComponent(it.key) + '&token=' + encodeURIComponent($('upToken').value.trim())
-      tr.innerHTML =
-        '<td>' + esc(it.name) + '</td>' +
-        '<td>' + fmtSize(it.size) + '</td>' +
-        '<td class="muted">' + esc(fmtTime(it.mtime)) + '</td>' +
-        '<td class="muted" title="' + esc(it.source_url) + '">' + esc((it.source_url || '').slice(0, 28)) + '</td>' +
-        '<td class="muted">' + esc(it.uploader || '-') + '</td>' +
-        '<td><a href="' + dl + '" referrerpolicy="no-referrer">下载</a> <a href="javascript:void(0)" data-action="presign" data-key="' + esc(it.key) + '">签名链接</a> <a href="javascript:void(0)" data-action="del-file" data-key="' + esc(it.key) + '" style="color:#f56c6c;">删除</a></td>'
-    }
-    tbody.appendChild(tr)
-  }
-}
-
-let psKey = ''
-let psCfg = { count_min: 1, count_max: 10, expire_min_seconds: 60, expire_max_seconds: 604800 }
-
-function psTypeChange() {
-  const t = document.querySelector('input[name="psType"]:checked').value
-  $('psTimeRow').style.display = t === 'time' ? 'flex' : 'none'
-  $('psCountRow').style.display = t === 'count' ? 'flex' : 'none'
-  $('psPermanentHint').style.display = t === 'permanent' ? 'block' : 'none'
-}
-
-async function presign(key) {
-  const token = $('upToken').value.trim()
-  if (!token) { toast('请先填写令牌', false); return }
-  psKey = key
-  $('psTarget').textContent = '文件：' + state.bucket + ' / ' + key
-  $('psResult').value = ''
-  $('psResultRow').style.display = 'none'
-  // 拉取次数/时效上下限（config.signed_links）
-  try {
-    const b = await api('/api/objects/signed-links/config')
-    psCfg = b.data || psCfg
-  } catch (e) { /* 用默认值 */ }
-  $('psCountHint').textContent = '（' + psCfg.count_min + '-' + psCfg.count_max + ' 次）'
-  $('psCount').value = psCfg.count_min
-  $('psCount').min = psCfg.count_min; $('psCount').max = psCfg.count_max
-  const hmin = Math.max(0.1, Math.round(psCfg.expire_min_seconds / 3600 * 10) / 10)
-  const hmax = Math.max(hmin, Math.round(psCfg.expire_max_seconds / 3600 * 10) / 10)
-  $('psHours').value = Math.min(1, hmax)
-  $('psHours').min = hmin; $('psHours').max = hmax
-  $('psTimeHint').textContent = '（' + hmin + '-' + hmax + ' 小时）'
-  // 默认按时效
-  document.querySelector('input[name="psType"][value="time"]').checked = true
-  psTypeChange()
-  $('presignModal').style.display = 'flex'
-}
-function closePsModal() { $('presignModal').style.display = 'none' }
-async function doPresign() {
-  const token = $('upToken').value.trim()
-  const type = document.querySelector('input[name="psType"]:checked').value
-  const body = { bucket: state.bucket, key: psKey, mode: type }
-  if (type === 'count') {
-    const c = parseInt($('psCount').value)
-    if (isNaN(c) || c < psCfg.count_min || c > psCfg.count_max) {
-      toast('次数需在 ' + psCfg.count_min + '-' + psCfg.count_max + ' 之间', false); return
-    }
-    body.count = c
-  } else if (type === 'time') {
-    const h = parseFloat($('psHours').value)
-    const secs = Math.round(h * 3600)
-    if (isNaN(secs) || secs < psCfg.expire_min_seconds || secs > psCfg.expire_max_seconds) {
-      toast('时效需在 ' + (psCfg.expire_min_seconds / 3600) + '-' + (psCfg.expire_max_seconds / 3600) + ' 小时之间', false); return
-    }
-    body.expires = secs
-  }
-  try {
-    const r = await api('/api/objects/presign', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }, token)
-    const u = window.location.origin + (r.data.url || '')
-    $('psResult').value = u
-    $('psResultRow').style.display = 'flex'
-    toast('链接已生成')
-    $('psResult').focus(); $('psResult').select()
-  } catch (e) { toast(e.message, false) }
-}
-async function copyPsResult() {
-  const v = $('psResult').value
-  if (!v) return
-  copyText(v, '链接已复制')
-}
-
-// ---- 新建目录 ----
-function openMkdirModal() {
-  if (!state.bucket) { toast('请先选择 bucket', false); return }
-  $('mkdirTarget').textContent = '位置：' + state.bucket + (state.prefix ? ' / ' + state.prefix + '/' : ' / ')
-  $('mkdirName').value = ''
-  $('mkdirModal').style.display = 'flex'
-  setTimeout(() => $('mkdirName').focus(), 50)
-}
-function closeMkdirModal() { $('mkdirModal').style.display = 'none' }
-async function doMkdir() {
-  const t = $('upToken').value.trim()
-  const name = $('mkdirName').value.trim()
-  if (!t) { toast('请先填写令牌', false); return }
-  if (!name) { toast('请输入目录名', false); return }
-  const key = state.prefix ? state.prefix + '/' + name : name
-  try {
-    await api('/api/objects/mkdir', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ bucket: state.bucket, key }) }, t)
-    toast('已创建目录：' + key)
-    closeMkdirModal()
-    await refresh()
-  } catch (e) { toast(e.message, false) }
-}
-
-// 自定义确认框（替代 confirm：部分环境浏览器原生弹窗被拦截）
-let _cfmResolve = null
-function confirmDialog(msg) {
-  $('cfmMsg').textContent = msg
-  $('confirmModal').style.display = 'flex'
-  return new Promise(res => { _cfmResolve = res })
-}
-function cfmResolve(v) {
-  $('confirmModal').style.display = 'none'
-  if (_cfmResolve) { _cfmResolve(v); _cfmResolve = null }
-}
-
-// ---- 签名链接管理 ----
-async function loadLinks() {
-  const t = $('lkToken').value.trim()
-  if (!t) { toast('请输入令牌', false); return }
-  try {
-    const body = await api('/api/objects/signed-links', {}, t)
-    const tb = document.querySelector('#lkTbl tbody')
-    tb.innerHTML = ''
-    const rows = (body.data || []).slice().sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''))
-    if (!rows.length) tb.innerHTML = '<tr><td colspan="8" class="muted">（无链接）</td></tr>'
-    for (const l of rows) {
-      const tr = document.createElement('tr')
-      let modeTxt
-      if (l.mode === 'count') modeTxt = '次数 ' + l.max_uses
-      else if (l.mode === 'time') {
-        const createdSec = Date.parse(l.created_at || '') / 1000
-        const secs = (l.expires && !isNaN(createdSec)) ? (l.expires - createdSec) : null
-        modeTxt = secs != null ? '时效 ' + fmtDuration(secs) : '时效'
-      } else modeTxt = '永久'
-      const remaining = l.mode === 'count' ? (l.remaining || 0) + ' 次' : '—'
-      let statusHtml
-      if (l.revoked) statusHtml = '<span style="color:#f56c6c;">已作废</span>'
-      else if (l.mode === 'count' && (l.remaining || 0) <= 0) statusHtml = '<span style="color:#909399;">已用完</span>'
-      else statusHtml = '<span style="color:#67c23a;">有效</span>'
-      const canRevoke = !l.revoked && !(l.mode === 'count' && (l.remaining || 0) <= 0)
-      const linkCell = l.url
-        ? '<a href="javascript:void(0)" data-url="' + esc(l.url) + '" onclick="copyLink(this)">复制链接</a>'
-        : '-'
-      tr.innerHTML =
-        '<td>' + esc(l.created_by) + '</td>' +
-        '<td class="mono">' + esc(l.bucket + '/' + l.key) + '</td>' +
-        '<td>' + esc(modeTxt) + '</td>' +
-        '<td>' + esc(remaining) + '</td>' +
-        '<td class="muted">' + esc(fmtTime(l.created_at)) + '</td>' +
-        '<td>' + statusHtml + '</td>' +
-        '<td>' + linkCell + '</td>' +
-        '<td>' + (canRevoke ? '<a href="javascript:void(0)" style="color:#f56c6c;" data-action="revoke-link" data-id="' + esc(l.id) + '">作废</a>' : '-') + '</td>'
-      tb.appendChild(tr)
-    }
-  } catch (e) { toast(e.message, false) }
-}
-function copyText(text, okMsg) {
-  if (navigator.clipboard && navigator.clipboard.writeText) {
-    navigator.clipboard.writeText(text)
-      .then(() => toast(okMsg))
-      .catch(() => copyFallback(text))
-  } else {
-    copyFallback(text)   // http 环境 clipboard API 不可用，用 execCommand 兜底
-  }
-}
-function copyFallback(text) {
-  const ta = document.createElement('textarea')
-  ta.value = text
-  ta.style.position = 'fixed'; ta.style.left = '-9999px'
-  document.body.appendChild(ta)
-  ta.select()
-  let ok = false
-  try { ok = document.execCommand('copy') } catch (e) { ok = false }
-  document.body.removeChild(ta)
-  toast(ok ? '已复制' : text, ok)
-}
-function copyLink(btn) {
-  const u = btn.dataset.url
-  if (!u) { toast('无链接', false); return }
-  copyText(window.location.origin + u, '链接已复制')
-}
-async function revokeLink(id) {
-  const t = $('lkToken').value.trim()
-  if (!t) { toast('请输入令牌', false); return }
-  const ok = await confirmDialog('确定作废该链接？作废后立即失效')
-  if (!ok) return
-  try {
-    await api('/api/objects/signed-links/' + encodeURIComponent(id) + '/revoke', { method: 'POST' }, t)
-    toast('已作废'); await loadLinks()
-  } catch (e) { toast(e.message, false) }
-}
-
-async function delFile(key) {
-  const t = $('upToken').value.trim()
-  if (!t) { toast('请先填写令牌（删除仅管理员令牌可用）', false); return }
-  const ok = await confirmDialog('确定删除 ' + key + ' ？删除不可恢复')
-  if (!ok) return
-  try {
-    await api('/api/objects?bucket=' + encodeURIComponent(state.bucket) + '&key=' + encodeURIComponent(key), { method: 'DELETE' }, t)
-    toast('已删除'); await refresh()
-  } catch (e) { toast(e.message, false) }
-}
-
-async function delDir(key) {
-  const t = $('upToken').value.trim()
-  if (!t) { toast('请先填写令牌（删除仅管理员令牌可用）', false); return }
-  const ok = await confirmDialog('确定删除目录 ' + key + ' ？\n仅空目录可删除：若内含文件/子目录会被拒绝，需先清空。')
-  if (!ok) return
-  try {
-    await api('/api/objects?bucket=' + encodeURIComponent(state.bucket) + '&key=' + encodeURIComponent(key), { method: 'DELETE' }, t)
-    toast('已删除'); await refresh()
-  } catch (e) { toast(e.message, false) }
-}
-
-// 上传（拖拽 / 多选 / 先审核 token / 并发 / 大文件分片）
-const upItems = []   // { file, pct, status }
-let upInFlight = 0
-const UP_CHUNK_SIZE = 8 * 1024 * 1024  // 8 MB
-
-function hasFiles(e) {
-  return e.dataTransfer && e.dataTransfer.types && Array.from(e.dataTransfer.types).includes('Files')
-}
-function showDropOverlay() { $('dropOverlay').style.display = 'flex' }
-function hideDropOverlay() { $('dropOverlay').style.display = 'none' }
-
-async function checkToken(tok) {
-  if (!tok) return null
-  try {
-    const b = await api('/api/auth/check', {}, tok)
-    return b.data && b.data.valid ? b.data.actor : null
-  } catch (e) { return null }
-}
-
-function enqueueFiles(fileList) {
-  const tok = $('upToken').value.trim()
-  if (!tok) { toast('请先填写你的 api_token', false); return }
-  const files = Array.from(fileList || [])
-  if (!files.length) return
-  for (const f of files) upItems.push({ file: f, pct: 0, status: '排队中' })
-  renderUpQueue()
-  processQueue()
-}
-
-function doUpload() {
-  enqueueFiles($('upFile').files)
-  $('upFile').value = ''   // 允许重复选同一文件
-}
-
-async function processQueue() {
-  const max = parseInt($('upConcurrency').value) || 3
-  while (upInFlight < max) {
-    const token = $('upToken').value.trim()
-    if (!token) break
-    const item = upItems.find(i => i.status === '排队中')
-    if (!item) break
-    const actor = await checkToken(token)
-    if (!actor) {
-      item.status = '失败：token 无效'
-      renderUpQueue()
-      toast('token 无效，跳过 ' + item.file.name, false)
-      continue
-    }
-    upInFlight++
-    item.status = '上传中'
-    const isBig = item.file.size > UP_CHUNK_SIZE
-    const runner = isBig ? uploadOneChunked(item, token) : uploadOne(item, token)
-    runner.then(ok => {
-      item.pct = ok ? 100 : 0
-      item.status = ok ? '成功' : '失败'
-      upInFlight--
-      renderUpQueue()
-      if (ok) refresh()
-      processQueue()
-    })
-  }
-}
-
-function uploadOne(item, token) {
-  return new Promise((resolve) => {
-    const file = item.file
-    const key = state.prefix ? state.prefix + '/' + file.name : file.name
-    const fd = new FormData()
-    fd.append('file', file)
-    fd.append('bucket', state.bucket)
-    fd.append('key', key)
-    fd.append('source_url', $('upSource').value.trim())
-    const xhr = new XMLHttpRequest()
-    xhr.open('POST', '/api/objects')
-    xhr.setRequestHeader('Authorization', 'Bearer ' + token)
-    xhr.timeout = 600000   // 10 分钟（大文件）
-    xhr.upload.onprogress = (e) => {
-      if (e.lengthComputable) {
-        item.pct = Math.round(e.loaded / e.total * 100)
-        item.status = '上传中 ' + fmtSize(e.loaded) + ' / ' + fmtSize(e.total)
-        renderUpQueue()
-      }
-    }
-    xhr.onload = () => {
-      let body = null
-      try { body = JSON.parse(xhr.responseText) } catch (e) { body = null }
-      resolve(xhr.status >= 200 && xhr.status < 300 && body && body.code === 0)
-    }
-    xhr.onerror = () => resolve(false)
-    xhr.ontimeout = () => resolve(false)
-    xhr.send(fd)
-  })
-}
-
-async function abortUpload(upload_id, token) {
-  try {
-    const fd = new FormData()
-    fd.append('upload_id', upload_id)
-    await api('/api/objects/abort', { method: 'POST', body: fd }, token)
-  } catch (e) { /* 忽略 */ }
-}
-
-async function uploadOneChunked(item, token) {
-  // 1. initiate
-  let upload_id, chunk_size
-  try {
-    const r = await api('/api/objects/initiate', { method: 'POST' }, token)
-    const d = r.data || {}
-    upload_id = d.upload_id
-    chunk_size = d.chunk_size || UP_CHUNK_SIZE
-    if (!upload_id) throw new Error('服务端未返回 upload_id')
-  } catch (e) {
-    item.status = '失败：' + e.message
-    return false
-  }
-  const file = item.file
-  const totalChunks = Math.max(1, Math.ceil(file.size / chunk_size))
-  const bucket = state.bucket
-  const key = state.prefix ? state.prefix + '/' + file.name : file.name
-  const source_url = $('upSource').value.trim()
-  const chunkProgress = new Array(totalChunks).fill(0)
-  function updatePct() {
-    const loaded = chunkProgress.reduce((a, b) => a + b, 0)
-    item.pct = Math.round(loaded / file.size * 100)
-    item.status = '上传中 ' + fmtSize(loaded) + ' / ' + fmtSize(file.size)
-    renderUpQueue()
-  }
-  function sendChunk(index) {
-    return new Promise((resolve) => {
-      const start = index * chunk_size
-      const end = Math.min(file.size, start + chunk_size)
-      const blob = file.slice(start, end)
-      const fd = new FormData()
-      fd.append('upload_id', upload_id)
-      fd.append('index', String(index))
-      fd.append('chunk', blob, 'chunk_' + index)
-      const xhr = new XMLHttpRequest()
-      xhr.open('POST', '/api/objects/chunk')
-      xhr.setRequestHeader('Authorization', 'Bearer ' + token)
-      xhr.timeout = 600000
-      xhr.upload.onprogress = (e) => {
-        if (e.lengthComputable) {
-          chunkProgress[index] = e.loaded
-          updatePct()
-        }
-      }
-      xhr.onload = () => {
-        let body = null
-        try { body = JSON.parse(xhr.responseText) } catch (e) { body = null }
-        if (xhr.status >= 200 && xhr.status < 300 && body && body.code === 0) {
-          chunkProgress[index] = (end - start)
-          updatePct()
-          resolve(true)
-        } else {
-          resolve(false)
-        }
-      }
-      xhr.onerror = () => resolve(false)
-      xhr.ontimeout = () => resolve(false)
-      xhr.send(fd)
-    })
-  }
-  // 2. 并行上传分片（4 路并发）
-  let aborted = false
-  const CHUNK_CONCURRENCY = 4
-  const workers = []
-  let nextIdx = 0
-  for (let w = 0; w < Math.min(CHUNK_CONCURRENCY, totalChunks); w++) {
-    workers.push(new Promise(async (resolve) => {
-      while (nextIdx < totalChunks) {
-        const idx = nextIdx++
-        const ok = await sendChunk(idx)
-        if (!ok) {
-          nextIdx = totalChunks
-          aborted = true
-          resolve(false)
-          return
-        }
-      }
-      resolve(true)
-    }))
-  }
-  try {
-    await Promise.all(workers)
-  } catch (e) {
-    aborted = true
-  }
-  if (aborted) {
-    await abortUpload(upload_id, token)
-    item.status = '失败：分片上传失败'
-    return false
-  }
-  // 3. complete
-  const fd = new FormData()
-  fd.append('upload_id', upload_id)
-  fd.append('bucket', bucket)
-  fd.append('key', key)
-  fd.append('total_chunks', String(totalChunks))
-  fd.append('source_url', source_url)
-    fd.append('overwrite', 'true')
-  try {
-    await api('/api/objects/complete', { method: 'POST', body: fd }, token)
-    return true
-  } catch (e) {
-    await abortUpload(upload_id, token)
-    item.status = '失败：合并失败 ' + e.message
-    return false
-  }
-}
-
-function renderUpQueue() {
-  const box = $('upQueue')
-  if (!upItems.length) { box.innerHTML = ''; return }
-  box.innerHTML = upItems.map(it =>
-    '<div class="up-item"><span class="nm" title="' + esc(it.file.name) + '">' + esc(it.file.name) + '</span>' +
-    '<progress value="' + it.pct + '" max="100"></progress>' +
-    '<span class="st' + (it.status === '成功' ? ' ok' : it.status.startsWith('失败') ? ' bad' : '') + '">' + esc(it.status) + '</span></div>'
-  ).join('')
-}
-
-// 整页拖放：拖入显示遮罩，松手自动上传
-let dragDepth = 0
-window.addEventListener('dragover', e => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy' })
-window.addEventListener('drop', e => e.preventDefault())
-document.addEventListener('dragenter', (e) => {
-  if (hasFiles(e)) { dragDepth++; showDropOverlay() }
-})
-document.addEventListener('dragleave', (e) => {
-  if (hasFiles(e)) { dragDepth--; if (dragDepth <= 0) { dragDepth = 0; hideDropOverlay() } }
-})
-document.addEventListener('drop', (e) => {
-  e.preventDefault()
-  dragDepth = 0; hideDropOverlay()
-  if (hasFiles(e)) enqueueFiles(e.dataTransfer.files)
-})
-
-// ---- Token 管理 ----
-
-let TKCATALOG = { permissions: [], public: [], roles: [], default_role: 'user' }
-
-async function loadTokenCatalog() {
-  try {
-    const b = await api('/api/auth/permissions')
-    TKCATALOG = b.data || TKCATALOG
-    renderTokenCatalog()
-  } catch (e) { /* 忽略：目录加载失败仍可手填 */ }
-}
-
-function scopeLabel(key) {
-  const p = (TKCATALOG.permissions || []).find(x => x.key === key)
-  return p ? p.label : key
-}
-
-function renderTokenCatalog() {
-  const box = $('tkCatalog')
-  if (!box) return
-  // 角色下拉
-  const sel = $('tkRole')
-  sel.innerHTML = ''
-  ;(TKCATALOG.roles || []).forEach(r => {
-    const o = document.createElement('option')
-    o.value = r.key
-    o.textContent = r.key + ' — ' + r.label
-    sel.appendChild(o)
-  })
-  sel.value = TKCATALOG.default_role || 'user'
-
-  // 逐接口勾选（按 group 分组）
-  const groups = {}
-  ;(TKCATALOG.permissions || []).forEach(p => {
-    ;(groups[p.group] = groups[p.group] || []).push(p)
-  })
-  let html = ''
-  Object.keys(groups).forEach(g => {
-    html += '<div style="margin-top:8px;"><strong style="font-size:13px;">' + esc(g) + '</strong>'
-    html += '<table style="margin-top:4px;"><thead><tr><th style="width:40px;">启用</th><th style="width:210px;">接口</th><th style="width:90px;">权限点</th><th>说明</th></tr></thead><tbody>'
-    groups[g].forEach(p => {
-      html += '<tr>' +
-        '<td><input type="checkbox" class="tkScope" value="' + esc(p.key) + '"' + (p.write ? '' : '') + '></td>' +
-        '<td class="mono">' + esc(p.method) + ' ' + esc(p.path) + '</td>' +
-        '<td class="mono">' + esc(p.key) + '</td>' +
-        '<td>' + esc(p.label) + '</td>' +
-        '</tr>'
-    })
-    html += '</tbody></table></div>'
-  })
-  if (TKCATALOG.public && TKCATALOG.public.length) {
-    html += '<div style="margin-top:8px;"><strong style="font-size:13px;">公开接口（无需 token，始终可用）</strong>' +
-      '<div class="muted mono" style="margin-top:4px;">' +
-      TKCATALOG.public.map(p => esc(p.method + ' ' + p.path)).join('　') + '</div></div>'
-  }
-  box.innerHTML = html
-  applyRolePreset()
-}
-
-function tkScopeChecks() {
-  return Array.from(document.querySelectorAll('.tkScope'))
-}
-
-function setChecked(boxes, on) {
-  boxes.forEach(b => { b.checked = !!on })
-}
-
-function tkSelectAll(on) {
-  const boxes = tkScopeChecks()
-  setChecked(boxes, on)
-}
-
-function tkSelectWrite(write) {
-  const boxes = tkScopeChecks()
-  boxes.forEach(b => {
-    const p = (TKCATALOG.permissions || []).find(x => x.key === b.value)
-    b.checked = !!(p && !!p.write === !!write)
-  })
-}
-
-function applyRolePreset() {
-  const role = $('tkRole').value
-  const preset = (TKCATALOG.roles || []).find(r => r.key === role)
-  if (!preset) return
-  const set = new Set(preset.scopes || [])
-  tkScopeChecks().forEach(b => { b.checked = set.has(b.value) })
-}
-
-function collectScopes() {
-  return tkScopeChecks().filter(b => b.checked).map(b => b.value)
-}
-
-function parseList(text) {
-  return (text || '').split(/[,，\s]+/).map(x => x.trim()).filter(Boolean)
-}
-
-function parsePrefixes(text) {
-  const out = {}
-  parseList(text).forEach(item => {
-    const i = item.indexOf(':')
-    if (i <= 0) return
-    const b = item.slice(0, i).trim()
-    const p = item.slice(i + 1).trim()
-    if (!b || !p) return
-    ;(out[b] = out[b] || []).push(p)
-  })
-  return out
-}
-
-async function generateToken() {
-  const t = $('admToken').value.trim()
-  if (!t) { toast('请先填写管理员令牌', false); return }
-  const user = $('tkUser').value.trim()
-  if (!user) { toast('请填写用户名', false); return }
-  const scopes = collectScopes()
-  const role = $('tkRole').value
-  if (!scopes.length && role !== 'custom') {
-    if (!confirm('尚未勾选任何接口，生成的 token 将没有任何权限。继续？')) return
-  }
-  try {
-    const body = await api('/api/tokens', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        user,
-        role,
-        scopes,
-        allow_buckets: parseList($('tkBuckets').value),
-        allow_prefixes: parsePrefixes($('tkPrefixes').value),
-        expires_at: $('tkExpires').value.trim(),
-        description: $('tkDesc').value.trim(),
-      }),
-    }, t)
-    const d = body.data || {}
-    $('tkResult').value = d.token || ''
-    $('tkResultRow').style.display = ''
-    toast('已生成 token（仅展示本次）')
-    await loadTokens()
-  } catch (e) { toast(e.message, false) }
-}
-
-function copyTkResult() {
-  const v = $('tkResult').value
-  if (!v) return
-  navigator.clipboard && navigator.clipboard.writeText(v).then(() => toast('已复制')).catch(() => {})
-}
-
-async function syncTokens() {
-  const t = $('admToken').value.trim()
-  if (!t) { toast('请输入管理员令牌', false); return }
-  try {
-    const body = await api('/api/tokens/sync', { method: 'POST' }, t)
-    const d = body.data || {}
-    const n = Object.keys(d.mapping || {}).length
-    if (d.ok) {
-      $('syncInfo').textContent = '已从 ' + (d.datahub_url || '?') + ' 同步 ' + n + ' 个 token'
-    } else {
-      $('syncInfo').textContent = '⚠️ 同步失败：' + (d.error || 'DataHub 不可达') + '（现有 ' + n + ' 个 token 保留）'
-      toast('同步失败：' + (d.error || 'DataHub 不可达'), false)
-    }
-    await loadTokens()
-  } catch (e) { toast(e.message, false) }
-}
-
-function fmtScopeRange(rec) {
-  const bs = (rec.allow_buckets || []).join(',')
-  const ps = Object.entries(rec.allow_prefixes || {}).map(([b, arr]) => b + ': ' + arr.join(' / ')).join('; ')
-  const parts = []
-  if (bs) parts.push('bucket=' + bs)
-  if (ps) parts.push('前缀=' + ps)
-  return parts.length ? parts.join('；') : '全部'
-}
-
-async function loadTokens() {
-  const t = $('admToken').value.trim()
-  if (!t) { toast('请输入管理员令牌', false); return }
-  const reveal = $('tkReveal') && $('tkReveal').checked
-  try {
-    const body = await api('/api/tokens' + (reveal ? '?reveal=true' : ''), {}, t)
-    const tb = document.querySelector('#tokensBody')
-    tb.innerHTML = ''
-    const map = body.data || {}
-    const rows = Object.values(map).sort((a, b) => String(a.user).localeCompare(String(b.user)))
-    if (!rows.length) { tb.innerHTML = '<tr><td colspan="8" class="muted">（暂无登记）</td></tr>'; return }
-    for (const rec of rows) {
-      const tr = document.createElement('tr')
-      const state = rec.expired ? '<span style="color:#f56c6c;">已过期</span>'
-        : (rec.enabled === false ? '<span style="color:#f56c6c;">已禁用</span>'
-          : '<span style="color:#67c23a;">有效</span>')
-      tr.innerHTML = '<td>' + esc(rec.user) + '</td>' +
-        '<td class="mono">' + esc(rec.token) + '</td>' +
-        '<td>' + esc(rec.role || '') + '</td>' +
-        '<td>' + (rec.scopes || []).length + '</td>' +
-        '<td class="muted">' + esc(fmtScopeRange(rec)) + '</td>' +
-        '<td>' + esc(rec.expires_at || '永久') + '</td>' +
-        '<td>' + state + '</td>' +
-        '<td><button class="danger" data-action="remove-token" data-token="' + esc(rec.token) + '">移除</button></td>'
-      tb.appendChild(tr)
-      const detail = document.createElement('tr')
-      detail.innerHTML = '<td colspan="8" class="muted mono" style="font-size:12px;">' +
-        esc((rec.scopes || []).join('  ')) + (rec.description ? '　|　' + esc(rec.description) : '') + '</td>'
-      tb.appendChild(detail)
-    }
-  } catch (e) { toast(e.message, false) }
-}
-
-async function removeToken(masked) {
-  const t = $('admToken').value.trim()
-  if (!t) { toast('请输入管理员令牌', false); return }
-  // 表格默认脱敏，必须知道明文；reveal 模式下才可直接移除
-  let value = masked
-  if (String(masked).includes('****')) {
-    value = prompt('请输入要移除的完整 token') || ''
-    if (!value) return
-  }
-  const ok = await confirmDialog('确定移除该 token？')
-  if (!ok) return
-  try {
-    await api('/api/tokens?value=' + encodeURIComponent(value), {
-      method: 'DELETE' }, t)
-    toast('已移除')
-    await loadTokens()
-  } catch (e) { toast(e.message, false) }
-}
-
-loadTokenCatalog()
-
-// ---- 审计 ----
-
-async function runAudit() {
-  const t = $('audToken').value.trim()
-  if (!t) { toast('请输入管理员令牌', false); return }
-  const q = new URLSearchParams()
-  ;['audBucket', 'audKey', 'audActor', 'audSince'].forEach(id => {
-    const v = $(id).value.trim()
-    if (v) q.set(id.replace('aud', '').toLowerCase(), v)
-  })
-  try {
-    const body = await api('/api/audit?' + q.toString(), {}, t)
-    const tb = document.querySelector('#auditBody')
-    tb.innerHTML = ''
-    const rows = (body.data || []).slice().reverse()
-    if (!rows.length) tb.innerHTML = '<tr><td colspan="8" class="muted">（无记录）</td></tr>'
-    for (const r of rows) {
-      const tr = document.createElement('tr')
-      tr.innerHTML =
-        '<td>' + esc(fmtTime(r.time)) + '</td>' +
-        '<td>' + esc(r.action) + '</td>' +
-        '<td>' + esc(r.bucket) + '</td>' +
-        '<td class="mono">' + esc(r.key) + '</td>' +
-        '<td>' + esc(r.actor) + '</td>' +
-        '<td class="mono">' + esc(r.ip) + '</td>' +
-        '<td class="mono">' + esc(r.public_ip || '') + '</td>' +
-        '<td>' + fmtSize(r.size) + '</td>'
-      tb.appendChild(tr)
-    }
-  } catch (e) { toast(e.message, false) }
-}
-</script>
+<script src="/static/app.js" defer></script>
 </body>
 </html>

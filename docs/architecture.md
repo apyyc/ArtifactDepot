@@ -1,6 +1,6 @@
 # ArtifactDepot 架构说明
 
-> 版本 **0.7.2**
+> 版本 **0.7.3**
 
 ## 定位
 
@@ -46,7 +46,6 @@ ArtifactDepot 合并写回 <meta_dir>/tokens.json（只增不删；DataHub 不�
 ```
 ArtifactDepot/
 ├── README.md / CHANGELOG.md
-├── config.production.json        # 生产可复制的配置模板
 ├── check_ad_sync.sh              # 生产诊断（仅 python3）
 ├── docs/
 │   ├── api_rules.md              # 对外接口文档（也由 /api/docs 提供原文）
@@ -56,7 +55,7 @@ ArtifactDepot/
 ├── deploy_container.sh           # 部署（host 网络默认 + --config/VOLUME_MAPS）
 └── src/artifactdepot/
     ├── main.py                 # FastAPI 入口 + lifespan（确保仓库根存在）
-    ├── config.py               # 配置加载（ARTIFACT_DEPOT_CONFIG env > resources/config.json > 默认；meta_dir）
+    ├── config/                 # 配置包：__init__.py（加载/手动重载）+ config.json + config.production.json + .env(.example)
     ├── storage.py              # 对象存储引擎：路径安全 / put/list/delete / manifest / 预签名 / 签名链接注册表 / token 注册表 / 审计 / DataHub 同步 / meta_dir
     ├── auth.py                 # 写操作 token 校验（query / Bearer）
     ├── api/
@@ -94,7 +93,7 @@ ArtifactDepot/
 ## 配置优先级
 
 ```
-内置默认 < resources/config.json（或 ARTIFACT_DEPOT_CONFIG 指定文件）< 环境变量
+内置默认 < config/config.json（或 ARTIFACT_DEPOT_CONFIG 指定文件）< config/.env < 环境变量
 ```
 
 - 支持环境变量：`ARTIFACT_DEPOT_DIR` / `ARTIFACT_DEPOT_META_DIR` / `ARTIFACT_DEPOT_DATAHUB_URL` /
@@ -135,6 +134,13 @@ ArtifactDepot/
 - 分片上传会话绑定创建者，`upload_id` 严格校验；单分片 ≤64MB，会话总量受 `max_upload_mb`（默认 200GB 兜底）约束。
 - 容器以非 root 用户 `artifactdepot(10001)` 运行；绑定宿主机目录时由 `deploy_container.sh` 以宿主 UID/GID + `--userns=keep-id` 运行，保证卷可写。
 
+## 可观测性
+
+- `X-Request-ID` 中间件透传/生成请求 ID，随响应头返回；结构化 JSON 访问日志含 request_id/method/route/status/duration_ms/client。
+- `/metrics` 输出 Prometheus 文本格式：HTTP 计数/耗时直方图、上传/下载/删除计数、token 数、磁盘用量；`metrics_enabled=false` 时 404。
+- `/health/live`（进程存活）、`/health/ready`（depot 目录可写，否则 503）。
+- 前端脚本/样式外置（`/static/app.js`、`/static/app.css`），事件委托 + 严格 CSP（`script-src 'self'`）；Swagger/ReDoc 单独放行 `unsafe-inline`。
+
 ## 安全要点
 
 - 路径穿越防护：bucket 名校验 + key 拒绝绝对路径/`..`/空段/反斜杠/点前缀，解析后校验落在仓库根内。
@@ -146,13 +152,13 @@ ArtifactDepot/
 ## 部署
 
 - **build → save → 拷贝 → load → deploy**：
-  - 开发机 `./build_image.sh`（构建 + 自动导出 `artifactdepot-0.7.2.tar`）
+  - 开发机 `./build_image.sh`（构建 + 自动导出 `artifactdepot-0.7.3.tar`）
   - 拷贝 tar 到生产机 → `podman load -i` → `./deploy_container.sh --token <你的管理员token>`
 - **host 网络默认**：容器共享宿主网络，`datahub_url` 用 `127.0.0.1:8002` 直连同机 DataHub；
   `--port-map` 可改回端口映射（不推荐，rootless 桥接常不通）。
 - **config.json 挂载**：`deploy_container.sh` 自动探测 `~/SERVER/artifactdepot/config/config.json`，
-  也可用 `--config <宿主机路径>` 显式挂到容器内 `resources/config.json`，生产配置显式可改、无需重建镜像。
-- 数据卷默认 `~/SERVER/artifactdepot/artifactdepot_0.7.2/warehouse` → 容器 `/data/depot`；
+  也可用 `--config <宿主机路径>` 显式挂到容器内 `config/config.json`，生产配置显式可改、无需重建镜像。
+- 数据卷默认 `~/SERVER/artifactdepot/artifactdepot_0.7.3/warehouse` → 容器 `/data/depot`；
   若该路径不可写，脚本自动回退到 `~/.local/share/artifactdepot/...`。
 - **自启**：Podman 走 `systemd --user`；Docker 走 `--restart=always`。
 - 排障：`bash check_ad_sync.sh` 逐段定位 token 同步链路。

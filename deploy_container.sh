@@ -22,7 +22,7 @@
 #   - 默认自动探测 ${HOME}/SERVER/artifactdepot/config/config.json
 #     或 ${HOME}/SERVER/artifactdepot/<image>_<tag>/config/config.json
 #   - 也可用 --config <宿主机配置路径> 显式挂载到容器内 config.json
-#   - 未找到配置时使用镜像内 resources/config.json
+#   - 未找到配置时使用镜像内 config/config.json
 #
 # 用法：
 #   ./deploy_container.sh                            # 默认 host 网络 + 自启
@@ -47,13 +47,13 @@ set -euo pipefail
 
 # ---------- 可配置参数（按需修改） ----------
 IMAGE_NAME="artifactdepot"           # 镜像名
-IMAGE_TAG="0.7.2"                    # 镜像版本标签
+IMAGE_TAG="0.7.3"                    # 镜像版本标签
 FULL_IMAGE="localhost/${IMAGE_NAME}:${IMAGE_TAG}"
 CONTAINER_NAME="artifactdepot"       # 容器名
 HOST_PORT="8004"                     # 宿主机映射端口（仅 --port-map 使用）
 CONTAINER_PORT="8004"                # 容器内端口
 CONTAINER_DATA_PATH="/data/depot"  # 容器内数据目录（由 Dockerfile VOLUME 固定）
-CONTAINER_CONFIG_PATH="/app/artifactdepot/src/artifactdepot/resources/config.json"
+CONTAINER_CONFIG_PATH="/app/artifactdepot/src/artifactdepot/config/config.json"
 
 # 宿主机默认数据目录（按版本隔离）。默认不可写时自动回退到用户数据目录。
 DATA_BASE="${HOME}/SERVER/artifactdepot"
@@ -97,7 +97,7 @@ usage() {
 
 选项:
   --data-dir <路径>      宿主机数据目录（挂载到容器 /data/depot）
-  --config <路径>        宿主机 config.json（挂载到容器 resources/config.json）
+  --config <路径>        宿主机 config.json（挂载到容器 config/config.json）
   --meta-dir <路径>      容器内 meta_dir；不传则不注入 ARTIFACT_DEPOT_META_DIR
   --token <值>           注入 ARTIFACT_DEPOT_ACCESS_TOKEN
   --datahub-url <地址>   注入 ARTIFACT_DEPOT_DATAHUB_URL
@@ -340,7 +340,7 @@ for m in "${VOLUME_MAPS[@]}"; do
   echo "   📄 附加卷: $m"
 done
 if [ ${#VOLUME_MAPS[@]} -eq 0 ]; then
-  echo "   ℹ️  未配置外部 config.json，使用镜像内 resources/config.json"
+  echo "   ℹ️  未配置外部 config.json，使用镜像内 config/config.json"
 fi
 
 if [ -n "$ARTIFACT_DEPOT_TOKEN" ]; then

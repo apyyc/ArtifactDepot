@@ -106,3 +106,33 @@ def test_mask_token_unique_and_masked():
     a = _mask_token("aaaa1111bbbb2222")
     b = _mask_token("aaaa3333bbbb4444")
     assert a != b and "****" in a and "aaaa1111bbbb2222" not in a
+
+
+def test_ui_pagination_markers():
+    base = ROOT / "src" / "artifactdepot" / "resources"
+    html = (base / "index.html").read_text(encoding="utf-8")
+    js = (base / "static" / "app.js").read_text(encoding="utf-8")
+    # CSP 重构后 JS 在 app.js
+    assert 'data-action="load-more"' in js
+    assert "async function loadPage()" in js
+    assert 'onclick="goUp()"' not in html
+
+
+def test_etag_and_conditional_requests(client):
+    _put(client, "e.txt", b"hello")
+    h = client.get("/api/objects/head", params={"token": ADMIN, "bucket": "b", "key": "e.txt"})
+    etag = h.headers["etag"]
+    assert etag.startswith('"') and etag.endswith('"')
+    # If-None-Match 命中 -> 304
+    h304 = client.get("/api/objects/head", params={"token": ADMIN, "bucket": "b", "key": "e.txt"},
+                      headers={"If-None-Match": etag})
+    assert h304.status_code == 304
+    d = client.get("/api/objects/download", params={"token": ADMIN, "bucket": "b", "key": "e.txt"})
+    assert d.status_code == 200 and d.headers["etag"] == etag
+    d304 = client.get("/api/objects/download", params={"token": ADMIN, "bucket": "b", "key": "e.txt"},
+                      headers={"If-None-Match": etag})
+    assert d304.status_code == 304
+    # 内容变化 -> ETag 变化
+    _put(client, "e.txt", b"world")
+    h2 = client.get("/api/objects/head", params={"token": ADMIN, "bucket": "b", "key": "e.txt"})
+    assert h2.headers["etag"] != etag

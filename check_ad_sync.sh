@@ -11,7 +11,7 @@
 #   1. 容器状态
 #   2. /data/depot 挂载与全部 bind mount
 #   3. ARTIFACT_DEPOT_DIR / ARTIFACT_DEPOT_META_DIR / ARTIFACT_DEPOT_DATAHUB_URL 环境变量
-#   4. 容器内 resources/config.json 的 depot_dir / meta_dir / datahub_url
+#   4. 容器内 config/config.json 的 depot_dir / meta_dir / datahub_url
 #   5. 容器内访问 DataHub users.json
 #   6. 宿主机访问 DataHub users.json
 #   7. 应用 /health
@@ -168,13 +168,13 @@ else:
     info("ARTIFACT_DEPOT_DATAHUB_URL 未注入（datahub_url 以 config.json 为准）")
 
 # --- 4. 容器内 config.json -------------------------------------------------
-config_path = "/app/artifactdepot/src/artifactdepot/resources/config.json"
+config_path = "/app/artifactdepot/src/artifactdepot/config/config.json"
 cp = run([tool, "exec", container, "cat", config_path])
 config = {}
 if cp.returncode == 0:
     try:
         config = json.loads(cp.stdout)
-        ok("读取容器内 resources/config.json 成功")
+        ok("读取容器内 config/config.json 成功")
     except Exception as exc:
         fail(f"解析容器内 config.json 失败: {exc}")
 else:
