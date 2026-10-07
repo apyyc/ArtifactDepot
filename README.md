@@ -197,6 +197,23 @@ cd ArtifactDepot
 
 ---
 
+## 测试与验收
+
+```bash
+cd ArtifactDepot
+# 全量回归
+ARTIFACT_DEPOT_CONFIG=$(mktemp) PYTHONPATH=src python3 -m pytest tests -q
+# 第 4 批 + 配置重构的接口级业务验收
+ARTIFACT_DEPOT_CONFIG=$(mktemp) PYTHONPATH=src python3 -m pytest tests/test_acceptance_batch4.py -q
+```
+
+- `tests/conftest.py` 隔离仓库里的真实 `config/.env`，避免测试读到真实密钥。
+- `tests/test_acceptance_batch4.py` 按业务语义验证：ETag/304、Range、分页边界、
+  可观测性（`/metrics`、`/health/live|ready`、`X-Request-ID`）、CSP、配置重载
+  （changed/needs_restart/坏 JSON 保留旧配置）、权限/越权、路径穿越、联动与数据一致性。
+
+---
+
 ## 配置说明
 
 配置文件：`src/artifactdepot/config/config.json`（非敏感项，会进镜像）；**隐私项放 `src/artifactdepot/config/.env`**（字段名=值，如 `access_token=...`，不进 git/镜像）。可用 `ARTIFACT_DEPOT_CONFIG` 指定外部 config.json、`ARTIFACT_DEPOT_ENV` 指定外部 .env。

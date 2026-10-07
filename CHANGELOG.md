@@ -7,6 +7,18 @@ ArtifactDepot v0.7.3 — 所有对本项目的重要更改都将记录在此文�
 
 ---
 
+## [Unreleased]
+
+### Tests
+
+- 新增 `tests/test_acceptance_batch4.py`（32 例）与 `tests/conftest.py`（隔离真实 `.env`）：
+  对第 4 批 + 配置目录重构做**接口级业务验收**，覆盖 `/health/live`、`/health/ready`、
+  `/metrics`、`/api/config/reload`、`/api/objects/{head,download,list}`、`/`、`/static/app.js|css`、
+  `/docs`、`/redoc`；含 ETag/304、Range、分页边界、CSP、权限/越权、路径穿越、
+  跨接口联动与数据一致性。
+
+---
+
 ## [0.7.3] - 2026-10-08
 
 ### 第 4 批（P2 体验与可观测性）
