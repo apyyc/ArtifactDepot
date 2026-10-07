@@ -1,14 +1,19 @@
 # ============================================================
 # ArtifactDepot 单容器镜像：对象存储仓库站点（FastAPI，8004）
 #
-# 注意：Podman 默认 OCI 格式会忽略 HEALTHCHECK；请用 ./build_image.sh
-#       构建（脚本会自动追加 --format docker），或手动 podman build --format docker。
+# 注意：
+#   - Podman 默认 OCI 格式会忽略 HEALTHCHECK；请用 ./build_image.sh 构建
+#     （脚本会自动追加 --format docker），或手动 podman build --format docker。
+#   - Python 依赖锁定在 requirements.txt；基础镜像钉到 python:3.12-alpine。
+#     生产建议进一步钉 digest（FROM ...@sha256:...），避免上游 tag 漂移。
+#   - 容器以非 root 用户 artifactdepot(10001) 运行；绑定宿主机目录时由
+#     deploy_container.sh 传 --user/--userns=keep-id 保证卷可写。
 # ============================================================
 FROM docker.io/library/python:3.12-alpine
 
 LABEL org.opencontainers.image.title="ArtifactDepot-ObjectStorage"
 LABEL org.opencontainers.image.description="Object storage depot (FastAPI :8004)"
-LABEL org.opencontainers.image.version="0.7.1"
+LABEL org.opencontainers.image.version="0.7.2"
 
 # 安装 Supervisor + curl（健康检查用）+ tzdata（容器内统一中国时区）
 # 先把 Alpine apk 源换成清华镜像：官方源 dl-cdn.alpinelinux.org 的 DNS 返回 IPv6，
@@ -17,26 +22,25 @@ ENV TZ=Asia/Shanghai
 RUN sed -i 's#https://dl-cdn.alpinelinux.org#https://mirrors.tuna.tsinghua.edu.cn#g' /etc/apk/repositories \
     && apk add --no-cache supervisor curl tzdata
 
-# Python 依赖（不锁版本，pip 自动适配 Alpine musl 可用 wheel）
-# 使用清华 PyPI 镜像避免官方源连接超时；可改回官方源或换其他镜像
+# Python 依赖：版本锁定在 requirements.txt，构建可复现
+COPY requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple \
-    fastapi \
-    uvicorn \
-    httpx \
-    python-multipart
+        -r /tmp/requirements.txt \
+    && rm -f /tmp/requirements.txt
 
 # 复制源码 + 文档（前端「API 文档」入口读 docs/*.md、README/CHANGELOG）
 WORKDIR /app/artifactdepot
 COPY src/ /app/artifactdepot/src/
 COPY docs/ /app/artifactdepot/docs/
 COPY README.md CHANGELOG.md /app/artifactdepot/
-
-# 预留非 root 用户。注意：当前 supervisor 仍以 root 启动；
-# 如需真正切换到非 root，必须同时处理 /data/depot 卷权限。
-RUN adduser -D -u 10001 artifactdepot
-
-# Supervisor 配置
 COPY docker/supervisord.conf /etc/supervisor.d/artifactdepot.ini
+
+# 非 root 运行：创建 artifactdepot(10001)，把代码与数据目录归属它
+RUN addgroup -g 10001 artifactdepot \
+    && adduser -D -u 10001 -G artifactdepot artifactdepot \
+    && mkdir -p /data/depot \
+    && chown -R artifactdepot:artifactdepot /app /data/depot
+USER artifactdepot
 
 # 环境变量（数据目录挂载点）
 # 注意：ARTIFACT_DEPOT_DATAHUB_URL 不要在这里预设默认值——config.py 里环境变量优先级

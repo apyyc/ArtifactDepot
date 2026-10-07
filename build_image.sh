@@ -30,8 +30,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONF_FILE="$SCRIPT_DIR/build_image.conf"
 
 if [[ ! -f "$CONF_FILE" ]]; then
-  echo "â æªæ¾å°æå»ºé
-ç½®æä»¶: $CONF_FILE" >&2
+  echo "❌ 未找到构建配置文件: $CONF_FILE" >&2
   exit 1
 fi
 
@@ -44,11 +43,11 @@ log() {
 }
 
 warn() {
-  printf 'â ï¸  %s\n' "$*" >&2
+  printf '⚠️  %s\n' "$*" >&2
 }
 
 die() {
-  printf 'â %s\n' "$*" >&2
+  printf '❌ %s\n' "$*" >&2
   exit 1
 }
 
@@ -175,17 +174,17 @@ image_tag() {
   case "$mode" in
     dynamic)
       local t="${CLI_TAG:-$DEFAULT_TAG}"
-      [[ -n "$t" ]] || die "éå [$id] æ¯ dynamic tagï¼ä½æªæä¾ --tag ä¸ DEFAULT_TAG ä¸ºç©º"
+      [[ -n "$t" ]] || die "镜像 [$id] 是 dynamic tag，但未提供 --tag 且 DEFAULT_TAG 为空"
       printf '%s' "$t"
       ;;
     fixed)
       local v
       v="$(image_field IMAGE_TAG_VALUE "$id")"
-      [[ -n "$v" ]] || die "éå [$id] æ¯ fixed tagï¼ä½ IMAGE_TAG_VALUE ä¸ºç©º"
+      [[ -n "$v" ]] || die "镜像 [$id] 是 fixed tag，但 IMAGE_TAG_VALUE 为空"
       printf '%s' "$v"
       ;;
     *)
-      die "éå [$id] ç IMAGE_TAG_MODE æ æ: $modeï¼åªæ¯æ dynamic / fixedï¼"
+      die "镜像 [$id] 的 IMAGE_TAG_MODE 无效: $mode（只支持 dynamic / fixed）"
       ;;
   esac
 }
@@ -196,7 +195,7 @@ image_full_ref() {
   name="$(image_field IMAGE_NAME "$id")"
   tag="$(image_tag "$id")"
 
-  [[ -n "$name" ]] || die "éå [$id] ç¼ºå° IMAGE_NAME"
+  [[ -n "$name" ]] || die "镜像 [$id] 缺少 IMAGE_NAME"
 
   if [[ -n "$REGISTRY" ]]; then
     printf '%s/%s:%s' "$REGISTRY" "$name" "$tag"
@@ -227,35 +226,33 @@ SELECTED_IMAGES=()
 
 usage() {
   cat <<'EOF'
-ç¨æ³:
-  ./build_image.sh                        # æå»ºå
-¨é¨é»è®¤å¯ç¨éå
-  ./build_image.sh --image <id>           # åªæå»ºæå®éå
+用法:
+  ./build_image.sh                        # 构建全部默认启用的镜像
+  ./build_image.sh --image <id>           # 只构建指定镜像
   ./build_image.sh --image <id> --image <id>
-  ./build_image.sh --tag <version>        # è¦ç dynamic tag
-  ./build_image.sh --no-cache             # ç¦ç¨æå»ºç¼å­
-  ./build_image.sh --no-save              # åªæå»ºï¼ä¸å¯¼åº tar
-  ./build_image.sh --save <dir>           # æå®å¯¼åºç®å½
-  ./build_image.sh --images               # åªååºé
-ç½®éçéå
+  ./build_image.sh --tag <version>        # 覆盖 dynamic tag
+  ./build_image.sh --no-cache             # 禁用构建缓存
+  ./build_image.sh --no-save              # 只构建，不导出 tar
+  ./build_image.sh --save <dir>           # 指定导出目录
+  ./build_image.sh --images               # 只列出配置里的镜像
   ./build_image.sh -h | --help
 
-è¯´æ:
-  - --save ä¸å¾è¡¨ç¤ºå¯¼åºç®å½ï¼ä¸æ¯åä¸ª tar æä»¶ã
-  - é»è®¤å¯¼åºç®å½ç± build_image.conf ç SAVE_DIR å³å®ã
-  - é»è®¤ä¼æå»º IMAGE_ENABLED_BY_DEFAULT=true çéåã
+说明:
+  - --save 一律表示导出目录，不是单个 tar 文件。
+  - 默认导出目录由 build_image.conf 的 SAVE_DIR 决定。
+  - 默认会构建 IMAGE_ENABLED_BY_DEFAULT=true 的镜像。
 EOF
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --image)
-      [[ $# -ge 2 ]] || die "--image éè¦ä¸ä¸ªéå id"
+      [[ $# -ge 2 ]] || die "--image 需要一个镜像 id"
       SELECTED_IMAGES+=("$2")
       shift 2
       ;;
     --tag)
-      [[ $# -ge 2 ]] || die "--tag éè¦ä¸ä¸ªçæ¬å·"
+      [[ $# -ge 2 ]] || die "--tag 需要一个版本号"
       CLI_TAG="$2"
       shift 2
       ;;
@@ -268,7 +265,7 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     --save)
-      [[ $# -ge 2 ]] || die "--save éè¦ä¸ä¸ªç®å½"
+      [[ $# -ge 2 ]] || die "--save 需要一个目录"
       SAVE_DIR_OVERRIDE="$2"
       DO_SAVE=true
       shift 2
@@ -282,7 +279,7 @@ while [[ $# -gt 0 ]]; do
       exit 0
       ;;
     *)
-      die "æªç¥åæ°: $1ï¼-h æ¥çå¸®å©ï¼"
+      die "未知参数: $1（-h 查看帮助）"
       ;;
   esac
 done
@@ -294,14 +291,13 @@ fi
 
 # ---------- 项目根目录 ----------
 ROOT_DIR="$(resolve_path "$PROJECT_ROOT")"
-[[ -d "$ROOT_DIR" ]] || die "é¡¹ç®ç®å½ä¸å­å¨: $ROOT_DIR"
+[[ -d "$ROOT_DIR" ]] || die "项目目录不存在: $ROOT_DIR"
 
 # ---------- 基本校验 ----------
-[[ ${#IMAGE_IDS[@]} -gt 0 ]] || die "build_image.conf æªé
-ç½®ä»»ä½ IMAGE_IDS"
+[[ ${#IMAGE_IDS[@]} -gt 0 ]] || die "build_image.conf 未配置任何 IMAGE_IDS"
 
 if [[ "$LIST_IMAGES" == true ]]; then
-  log "éååè¡¨ï¼$PROJECT_IDï¼:"
+  log "镜像列表（$PROJECT_ID）:"
   for id in "${IMAGE_IDS[@]}"; do
     label="$(image_field IMAGE_LABEL "$id")"
     dockerfile="$(image_field IMAGE_DOCKERFILE "$id")"
@@ -336,7 +332,7 @@ if [[ ${#SELECTED_IMAGES[@]} -eq 0 ]]; then
   done
 fi
 
-[[ ${#SELECTED_IMAGES[@]} -gt 0 ]] || die "æ²¡æå¯æå»ºçéå"
+[[ ${#SELECTED_IMAGES[@]} -gt 0 ]] || die "没有可构建的镜像"
 
 # 校验选择的镜像是否都存在
 for id in "${SELECTED_IMAGES[@]}"; do
@@ -344,8 +340,7 @@ for id in "${SELECTED_IMAGES[@]}"; do
   for known in "${IMAGE_IDS[@]}"; do
     [[ "$id" == "$known" ]] && { found=true; break; }
   done
-  [[ "$found" == true ]] || die "éå [$id] ä¸å¨ IMAGE_IDS é
-ç½®é"
+  [[ "$found" == true ]] || die "镜像 [$id] 不在 IMAGE_IDS 配置里"
 done
 
 # ---------- 检测容器工具 ----------
@@ -360,16 +355,14 @@ detect_tool() {
   return 1
 }
 
-TOOL="$(detect_tool)" || die "æªæ¾å°å¯ç¨çå®¹å¨å·¥å
-·ï¼TOOL_PREFERENCE: ${TOOL_PREFERENCE[*]}ï¼"
+TOOL="$(detect_tool)" || die "未找到可用的容器工具（TOOL_PREFERENCE: ${TOOL_PREFERENCE[*]}）"
 
-log "é¡¹ç®: ${PROJECT_TITLE:-$PROJECT_ID}"
-log "æ ¹ç®å½: $ROOT_DIR"
-log "å®¹å¨å·¥å
-·: $TOOL"
-log "æå»ºéå:"
+log "项目: ${PROJECT_TITLE:-$PROJECT_ID}"
+log "根目录: $ROOT_DIR"
+log "容器工具: $TOOL"
+log "构建镜像:"
 for id in "${SELECTED_IMAGES[@]}"; do
-  log "  - $id â $(image_full_ref "$id")"
+  log "  - $id → $(image_full_ref "$id")"
 done
 
 # ---------- 构建上下文校验 ----------
@@ -382,7 +375,7 @@ validate_context() {
   context="${context:-.}"
 
   if is_true "$VALIDATE_DOCKERFILE"; then
-    [[ -f "$ROOT_DIR/$dockerfile" ]] || die "éå [$id] æ¾ä¸å° Dockerfile: $ROOT_DIR/$dockerfile"
+    [[ -f "$ROOT_DIR/$dockerfile" ]] || die "镜像 [$id] 找不到 Dockerfile: $ROOT_DIR/$dockerfile"
   fi
 
   if is_true "$VALIDATE_REQUIRED_PATHS"; then
@@ -392,16 +385,16 @@ validate_context() {
     done
     if [[ -n "$missing" ]]; then
       if [[ "$CONTEXT_MISSING_POLICY" == "warn" ]]; then
-        warn "éå [$id] ç¼ºå°æå»ºä¸ä¸æ:$missing"
+        warn "镜像 [$id] 缺少构建上下文:$missing"
       else
-        die "éå [$id] ç¼ºå°æå»ºä¸ä¸æ:$missing"
+        die "镜像 [$id] 缺少构建上下文:$missing"
       fi
     fi
   fi
 
   for p in $(image_field IMAGE_OPTIONAL_PATHS "$id"); do
     path="$ROOT_DIR/$p"
-    [[ -e "$path" ]] || warn "éå [$id] ç¼ºå°å¯éä¸ä¸æ: $p"
+    [[ -e "$path" ]] || warn "镜像 [$id] 缺少可选上下文: $p"
   done
 }
 
@@ -422,7 +415,7 @@ build_proxy_env_args() {
     keep)
       ;;
     *)
-      die "éå [$id] ç proxy mode æ æ: $modeï¼åªæ¯æ keep / stripï¼"
+      die "镜像 [$id] 的 proxy mode 无效: $mode（只支持 keep / strip）"
       ;;
   esac
 }
@@ -472,7 +465,7 @@ build_extra_args() {
 # ---------- 执行命令 ----------
 run_cmd() {
   if is_true "$SHOW_COMMANDS" || [[ "$LOG_LEVEL" == "verbose" ]]; then
-    log "â¤ $*"
+    log "➤ $*"
   fi
   "$@"
 }
@@ -480,7 +473,7 @@ run_cmd() {
 run_hook() {
   local id="$1" phase="$2" cmd="$3"
   [[ -n "$cmd" ]] || return 0
-  log "â¤ [$id] $phase hook"
+  log "➤ [$id] $phase hook"
   (
     cd "$ROOT_DIR"
     bash -c "$cmd"
@@ -494,12 +487,12 @@ save_image() {
   local enabled
   enabled="$(image_field IMAGE_SAVE_ENABLED "$id")"
   if [[ -n "$enabled" ]] && ! is_true "$enabled"; then
-    log "â­ï¸  è·³è¿å¯¼åº [$id]"
+    log "⏭️  跳过导出 [$id]"
     return 0
   fi
 
   if [[ "$DO_SAVE" == false ]]; then
-    log "â­ï¸  è·³è¿å¯¼åºï¼--no-saveï¼"
+    log "⏭️  跳过导出（--no-save）"
     return 0
   fi
 
@@ -533,12 +526,12 @@ save_image() {
     if is_true "$SAVE_OVERWRITE"; then
       rm -f "$out"
     else
-      warn "å·²å­å¨ä¸ä¸è¦çï¼è·³è¿å¯¼åº: $out"
+      warn "已存在且不覆盖，跳过导出: $out"
       return 0
     fi
   fi
 
-  log "ð¦ å¯¼åºéå: $full_ref â $out"
+  log "📦 导出镜像: $full_ref → $out"
   run_cmd "$TOOL" save -o "$out" "$full_ref"
   SAVED_TARS+=("$out")
 }
@@ -555,9 +548,9 @@ build_one() {
   context="${context:-.}"
 
   log ""
-  log "ââââââââââââââââââââââââââââââââââââââââ"
-  log "éå [$id] â $full_ref"
-  log "ââââââââââââââââââââââââââââââââââââââââ"
+  log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  log "镜像 [$id] → $full_ref"
+  log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
   validate_context "$id"
 
@@ -601,15 +594,14 @@ for id in "${SELECTED_IMAGES[@]}"; do
 done
 
 log ""
-log "â
-æå»ºå®æ"
+log "✅ 构建完成"
 for ref in "${BUILT_IMAGES[@]}"; do
   log "  - $ref"
 done
 
 if [[ ${#SAVED_TARS[@]} -gt 0 ]]; then
   log ""
-  log "å¯¼åºæä»¶:"
+  log "导出文件:"
   for tar in "${SAVED_TARS[@]}"; do
     log "  - $tar"
   done

@@ -1,9 +1,11 @@
 """系统 API：健康检查、bucket 列表、权限目录、Token 注册表管理、审计查询、token 校验"""
+import hashlib
+
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 from typing import List, Optional
 
-from artifactdepot import storage
+from artifactdepot import netutil, storage
 from artifactdepot.auth import (
     Principal, extract_token, require_scope, resolve_principal,
 )
@@ -16,11 +18,13 @@ router = APIRouter(tags=["System"])
 
 
 def _mask_token(token: str) -> str:
+    """脱敏 token；带短哈希后缀，避免不同 token 脱敏后同名导致返回 dict 覆盖。"""
     if not token:
         return ""
+    suffix = hashlib.sha256(token.encode("utf-8")).hexdigest()[:6]
     if len(token) <= 8:
-        return token[:2] + "****"
-    return token[:4] + "****" + token[-4:]
+        return token[:2] + "****" + suffix
+    return token[:4] + "****" + token[-4:] + "-" + suffix
 
 
 def _public_catalog():
@@ -116,7 +120,7 @@ async def create_bucket(body: CreateBucketRequest, request: Request,
     result = storage.create_bucket(body.bucket)
     storage.audit("create_bucket", result["bucket"], "", actor.actor,
                   request.client.host if request.client else "",
-                  public_ip=(request.query_params.get("public_ip") or "").strip())
+                  public_ip=netutil.resolved_public_ip(request))
     return {"code": 0, "message": "success", "data": result}
 
 
@@ -199,54 +203,55 @@ class TokenUpdate(BaseModel):
 async def update_token_entry(value: str, body: TokenUpdate, request: Request,
                              actor: Principal = Depends(require_scope("token:write"))):
     """更新已有 token 的权限（不传则沿用原值）"""
-    raw = storage._read_tokens_raw()
-    if value not in raw:
-        raise HTTPException(404, detail="token 不存在")
-    rec = storage._normalize_token_record(raw[value], value)
-    if body.user is not None and body.user.strip():
-        rec["user"] = body.user.strip()
-    if body.role is not None and body.role.strip():
-        rec["role"] = body.role.strip()
-        if body.scopes is None:
-            from artifactdepot.permissions import role_scopes
-            preset = role_scopes(rec["role"])
-            if preset is None:
-                raise HTTPException(400, detail=f"未知角色：{rec['role']}")
-            rec["scopes"] = preset
-    if body.scopes is not None:
-        from artifactdepot.permissions import is_valid_scope
-        clean = []
-        for sc in body.scopes:
-            sc = str(sc).strip()
-            if not sc:
-                continue
-            if not is_valid_scope(sc):
-                raise HTTPException(400, detail=f"未知权限点：{sc}")
-            if sc not in clean:
-                clean.append(sc)
-        rec["scopes"] = clean
-    if body.allow_buckets is not None:
-        rec["allow_buckets"] = [str(b).strip() for b in body.allow_buckets if str(b).strip()]
-    if body.allow_prefixes is not None:
-        clean_prefixes = {}
-        for b, prefixes in body.allow_prefixes.items():
-            b = str(b).strip()
-            if not b:
-                continue
-            if isinstance(prefixes, str):
-                prefixes = [prefixes]
-            if not isinstance(prefixes, list):
-                raise HTTPException(400, detail=f"allow_prefixes[{b}] 必须是数组")
-            clean_prefixes[b] = [str(x).strip().strip("/") for x in prefixes if str(x).strip()]
-        rec["allow_prefixes"] = clean_prefixes
-    if body.expires_at is not None:
-        rec["expires_at"] = body.expires_at.strip()
-    if body.description is not None:
-        rec["description"] = body.description.strip()
-    if body.enabled is not None:
-        rec["enabled"] = bool(body.enabled)
-    raw[value] = rec
-    storage._save_tokens(raw)
+    with storage.state_lock():
+        raw = storage._read_tokens_raw()
+        if value not in raw:
+            raise HTTPException(404, detail="token 不存在")
+        rec = storage._normalize_token_record(raw[value], value)
+        if body.user is not None and body.user.strip():
+            rec["user"] = body.user.strip()
+        if body.role is not None and body.role.strip():
+            rec["role"] = body.role.strip()
+            if body.scopes is None:
+                from artifactdepot.permissions import role_scopes
+                preset = role_scopes(rec["role"])
+                if preset is None:
+                    raise HTTPException(400, detail=f"未知角色：{rec['role']}")
+                rec["scopes"] = preset
+        if body.scopes is not None:
+            from artifactdepot.permissions import is_valid_scope
+            clean = []
+            for sc in body.scopes:
+                sc = str(sc).strip()
+                if not sc:
+                    continue
+                if not is_valid_scope(sc):
+                    raise HTTPException(400, detail=f"未知权限点：{sc}")
+                if sc not in clean:
+                    clean.append(sc)
+            rec["scopes"] = clean
+        if body.allow_buckets is not None:
+            rec["allow_buckets"] = [str(b).strip() for b in body.allow_buckets if str(b).strip()]
+        if body.allow_prefixes is not None:
+            clean_prefixes = {}
+            for b, prefixes in body.allow_prefixes.items():
+                b = str(b).strip()
+                if not b:
+                    continue
+                if isinstance(prefixes, str):
+                    prefixes = [prefixes]
+                if not isinstance(prefixes, list):
+                    raise HTTPException(400, detail=f"allow_prefixes[{b}] 必须是数组")
+                clean_prefixes[b] = [str(x).strip().strip("/") for x in prefixes if str(x).strip()]
+            rec["allow_prefixes"] = clean_prefixes
+        if body.expires_at is not None:
+            rec["expires_at"] = body.expires_at.strip()
+        if body.description is not None:
+            rec["description"] = body.description.strip()
+        if body.enabled is not None:
+            rec["enabled"] = bool(body.enabled)
+        raw[value] = rec
+        storage._save_tokens(raw)
     return {"code": 0, "message": "success", "data": _record_public(value, rec, False)}
 
 

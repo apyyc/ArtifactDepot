@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements.txt pytest
+      - name: Run tests
+        run: PYTHONPATH=src python -m pytest tests -q
+      - name: Bash syntax check
+        run: |
+          bash -n build_image.sh
+          bash -n deploy_container.sh
+          bash -n check_ad_sync.sh
+          bash -n dev_start_headless.sh
+          bash -n scripts/start.sh
+          bash -n dev_common.sh

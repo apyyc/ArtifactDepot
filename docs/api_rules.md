@@ -1,6 +1,6 @@
 # ArtifactDepot 接口文档
 
-> 版本 0.7.1 · FastAPI 服务 · 默认端口 8004
+> 版本 0.7.2 · FastAPI 服务 · 默认端口 8004
 >
 > 0.7.1 变更：新增 `GET /api/docs`（公开、只读文档清单 + 内容，供查看原始 Markdown）；网页 UI 标签栏右侧提供 Swagger / ReDoc 入口（FastAPI 自动生成，可在线调试）；修复两处与文档语义不一致的问题：`scopes: []` 现在真正表示「无权限」（此前会被回退成角色预设），`require_read_token=true` 时资源范围外调用 `GET /api/objects/list` 返回 `403`（此前会忽略范围过滤、返回白名单外 bucket 的内容）。
 >
@@ -49,12 +49,12 @@ http://<主机IP>:8004
 | 管理员 / 工具 | 配置 `access_token`（共享令牌） | `系统/工具` |
 | 用户 | `tokens.json` 注册表（可经 DataHub `users.json` 惰性同步） | 用户名 |
 
-token 的传递方式（两种等价，二选一）：
+token 的传递方式（**推荐请求头**）：
 
-1. **URL query**：`?token=<令牌>`
-2. **请求头**：`Authorization: Bearer <令牌>`
+1. **请求头（推荐）**：`Authorization: Bearer <令牌>`——不落 URL、不进浏览器历史/Referer/访问日志。
+2. **URL query（兼容）**：`?token=<令牌>`——服务端访问日志会把 `token` / `tk` / `sig` 等参数值脱敏为 `***`，但仍建议优先用请求头。
 
-> 注意：上传接口（`POST /api/objects`）额外支持把 token 作为 **multipart 表单字段** `token=` 传递（见 2.1）。
+> 注意：上传接口（`POST /api/objects`）额外支持把 token 作为 **multipart 表单字段** `token=` 传递（见 2.1，兼容旧客户端）。
 
 token 校验规则：
 
@@ -168,8 +168,12 @@ GET /api/objects/list
 |---|---|---|---|
 | `bucket` | string | 是 | 目标 bucket |
 | `prefix` | string | 否 | 限定前缀，列出该目录下的直接子项 |
+| `limit` | int | 否 | >0 时按 `offset` 分页，最多返回 limit 项（0=不限，上限 10000） |
+| `offset` | int | 否 | 分页起始偏移（默认 0，仅 `limit>0` 时生效） |
 
-**成功响应**（200）的 `data.items` 元素：
+**成功响应**（200）的 `data`：`{ "bucket", "prefix", "items", "total", "offset", "limit", "truncated" }`。
+
+`data.items` 元素：
 
 - 目录：`{ "name", "key"（末尾带 /）, "is_dir": true, "size", "mtime" }`；空目录的 `mtime` 为目录自身 mtime。
 - 文件：`{ "name", "key", "is_dir": false, "size", "mtime", "sha256", "source_url", "uploader" }`。
@@ -308,7 +312,7 @@ GET /api/objects/head
 
 **查询参数**：`bucket`（必填）、`key`（必填）。
 
-**说明**：轻量探测文件或目录是否存在，返回 `data`：`{ "exists": true, "is_dir": false, "size": 123, "sha256": "...", "mtime": 1690000000 }`。用于 push 前判断覆盖、pull 前判断目标存在；不存在时 HTTP 仍为 200，以 `exists:false` 表达（区别于下载接口的 404）。
+**说明**：轻量探测文件或目录是否存在。存在时返回 `data`：`{ "exists": true, "is_dir": false, "size": 123, "sha256": "...", "mtime": "2026-10-07T16:20:09Z" }`（`mtime` 统一为 UTC ISO8601，与 list 一致）。**不存在时返回 `404`**（S3 HeadObject 语义）。
 
 ### 2.8 生成签名下载链接（Presign / 共享链接）
 
@@ -542,7 +546,7 @@ GET /
 
 单页控制台：目录浏览 + 上传（拖拽/分片）+ 下载 + 新建目录 + 签名链接管理 + Token 管理 + 审计。
 
-- 标签栏右侧提供 **Swagger**（`/docs`）/ **ReDoc**（`/redoc`）入口，由 FastAPI 依据实际路由自动生成，可直接在线调试；
+- 标签栏右侧提供 **Swagger**（`/docs`）/ **ReDoc**（`/redoc`）入口，由 FastAPI 依据实际路由自动生成；前端资源（`/static/swagger-ui-bundle.js` 等）**自托管**，内网/离线可用；
 - 两者依赖外网 CDN 加载前端资源，内网/离线环境可改用公开只读接口 `GET /api/docs` 查看原始 Markdown。
 
 ### 7.1 文档接口（0.7.1 新增，公开）
@@ -608,6 +612,11 @@ ArtifactDepot 配置优先级：内置默认 < `resources/config.json`（或 `AR
 | `max_upload_mb` | 0（不限） | 单文件上传上限 |
 | `datahub_url` | `http://127.0.0.1:8002/api/data` | 用户 token 权威源 |
 | `ui_enabled` | true | 是否启用网页 UI |
+| `trusted_proxies` | `[]` | 可信反代 IP/CIDR；非空才从 XFF 解析审计 public_ip |
+| `audit_max_mb` | 50 | 审计日志单文件上限（MB），超过轮转 |
+| `audit_backups` | 5 | 审计日志保留历史文件数 |
+| `cors_origins` | `[]` | CORS 来源白名单；空=不启用 |
+| `allowed_hosts` | `["*"]` | TrustedHost 白名单 |
 | `signed_links.*` | 见 config | 签名链接次数/时效上下限 |
 
 ---
@@ -615,9 +624,17 @@ ArtifactDepot 配置优先级：内置默认 < `resources/config.json`（或 `AR
 ## 十、安全注意事项
 
 1. 读接口（list/buckets）为「内网开放」设计，切勿直接暴露公网，建议前置 Nginx 鉴权或防火墙/VPN 隔离。
-2. 管理员 `access_token` 与用户 token 属敏感凭据，不得写入 git / 文档 / 日志。
+2. 管理员 `access_token` 与用户 token 属敏感凭据，不得写入 git / 文档 / 日志；**推荐用 `Authorization: Bearer` 传递**，避免 `?token=` 落访问日志/浏览器历史。服务端已对 access log 中的 `token`/`tk`/`sig` 脱敏。
 3. key/bucket 有路径穿越防护，但调用方仍应避免传不可信输入。
 4. 删除接口需要权限点 `object:delete`（管理员共享 token 默认拥有全部），且目录仅空可删。
+5. `access_token` 默认空（无管理员）；启动时会对空/弱 token 告警，设 `ARTIFACT_DEPOT_STRICT_CONFIG=1` 可直接拒绝启动。生产请用 >=16 位随机串。
+6. 分片上传的 `upload_id` 由服务端生成并严格校验字符集，会话绑定创建者；客户端不得自行构造/猜测 `upload_id`。
+7. 网页 UI 使用事件委托（`data-*` 属性）渲染文件名等不可信数据，不再把用户输入拼进内联 `onclick`。
+8. 审计的 `public_ip` 只在 `config.trusted_proxies` 命中直连代理时才由 `X-Forwarded-For` 解析；未配置时为空，客户端自报的 `public_ip` 参数一律忽略。
+9. 状态文件（`tokens.json`/`signed_links.json`/`.warehouse.json`）采用「临时文件 + `os.replace`」原子写，并用进程内锁 + `fcntl.flock` 串行化读-改-写；按次数签名链接不会并发超用。
+10. 分片上传有单分片（64MB）与会话总量上限（`max_upload_mb`，未配置时 200GB 兜底），防止 `/tmp` 被写满。
+11. Swagger UI / ReDoc 前端资源自托管于 `/static/`，不再依赖外部 CDN；`/docs`、`/redoc` 仅暴露 OpenAPI，不额外放行管理接口。
+12. 默认不加 CORS / TrustedHost 限制（内网部署）；跨源或域名访问请按 `cors_origins` / `allowed_hosts` 收紧。
 
 ## 十一、其他项目接入指南（bucket / 目录 / 文件 push-pull）
 

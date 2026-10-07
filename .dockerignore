@@ -8,3 +8,5 @@ depot/
 logs/
 *.sh
 config.production.json
+# 运行配置（含 access_token）绝不进镜像，生产用挂载/环境变量注入
+**/config.json

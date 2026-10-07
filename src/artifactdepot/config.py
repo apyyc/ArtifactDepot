@@ -15,9 +15,14 @@ DEFAULT = {
     "datahub_url": "http://127.0.0.1:8002/api/data",  # 从 DataHub users.json 拉取用户 token
     "host": "0.0.0.0",                        # 监听地址
     "port": 8004,                             # 服务端口
-    "access_token": "change-me",              # 写操作访问令牌（管理员/工具；生产必须修改）
+    "access_token": "",                       # 管理员/工具共享令牌；为空=无管理员（生产必须显式配置）
     "max_upload_mb": 0,                       # 单文件上传上限（0 = 不限）
     "ui_enabled": True,                       # 是否启用网页 UI
+    "trusted_proxies": [],                    # 可信反向代理 IP/CIDR 列表；非空时才采信 X-Forwarded-For
+    "audit_max_mb": 50,                       # 审计日志单文件上限（MB），超过自动轮转
+    "audit_backups": 5,                       # 审计日志保留的历史文件数
+    "cors_origins": [],                       # CORS 允许来源白名单；空=不加 CORS 中间件
+    "allowed_hosts": ["*"],                   # TrustedHost 白名单；["*"]=不限制
     "require_read_token": False,              # 读接口（buckets/list）是否也要求 token（默认 false 保持内网公开）
     "signed_links": {                         # 签名链接上下限（count=次数，expire=时效秒数）
         "count_min": 1,
@@ -25,6 +30,12 @@ DEFAULT = {
         "expire_min_seconds": 60,             # 最短时效（1 分钟）
         "expire_max_seconds": 604800,         # 最长时效（7 天）
     },
+}
+
+# 明显过弱 / 示例性的 access_token（启动时告警）
+WEAK_ACCESS_TOKENS = {
+    "change-me", "changeme", "y", "yes", "admin", "administrator",
+    "password", "passwd", "123456", "12345678", "token", "test", "secret",
 }
 
 _CONFIG = None
@@ -98,3 +109,28 @@ def get_config() -> dict:
     if _CONFIG is None:
         _CONFIG = load_config()
     return _CONFIG
+
+
+def config_warnings(cfg: dict | None = None) -> list:
+    """启动时配置体检：返回需要提醒的问题列表（不抛异常）。"""
+    cfg = cfg if cfg is not None else get_config()
+    out = []
+    tok = str(cfg.get("access_token", "") or "").strip()
+    if not tok:
+        out.append("access_token 为空：管理/写接口将返回 401；"
+                   "请用 --token / ARTIFACT_DEPOT_ACCESS_TOKEN / config.json 显式配置")
+    elif tok.lower() in WEAK_ACCESS_TOKENS or len(tok) < 12:
+        out.append(f"access_token 过弱（长度 {len(tok)}）：生产环境请改用 >=16 位随机串")
+    try:
+        sl = cfg.get("signed_links") or {}
+        cmin = int(sl.get("count_min", 1) or 1)
+        cmax = int(sl.get("count_max", 10) or 10)
+        emin = int(sl.get("expire_min_seconds", 60) or 60)
+        emax = int(sl.get("expire_max_seconds", 604800) or 604800)
+        if cmin < 1 or cmax < cmin:
+            out.append("signed_links.count_min/count_max 配置不合法")
+        if emin < 1 or emax < emin:
+            out.append("signed_links.expire_min_seconds/expire_max_seconds 配置不合法")
+    except (TypeError, ValueError):
+        out.append("signed_links 配置项不是整数")
+    return out

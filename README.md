@@ -1,6 +1,6 @@
 # ArtifactDepot — 对象存储仓库站点
 
-> 版本 0.7.1，端口 8004，独立服务
+> 版本 0.7.2，端口 8004，独立服务
 
 **一句话**：按行业标准（对象存储 / S3 模型）设计的文件仓库站点，收存处理产物（视频 / 文件），提供上传、列表、Range 下载、删除、新建目录、签名链接与审计，并带网页界面。业务 JSON 数据在 DataHub，**本服务不承担业务逻辑**。
 
@@ -38,7 +38,7 @@
 | Token 同步 | 从 DataHub `users.json` 拉取用户 token（collab 权威源，本地副本，只增不删；DataHub 不可达时明确提示） |
 | 状态文件可迁移 | `meta_dir` 配置项把 `tokens.json` / `signed_links.json` / `audit.log` 移出仓库根，与业务文件隔离、便于备份 |
 | 生产部署 | 脚本**构建完自动导出 tar**（`--no-save` 跳过）；部署默认 **host 网络**（容器内 `127.0.0.1` = 宿主机，同机连 DataHub 最稳）；Podman 走 systemd user 自启，Docker 走 `--restart=always`；`--config` / `VOLUME_MAPS` 可挂载外部 config.json |
-| 网页 UI | bucket 点击选中 + 高亮、整页拖拽、新建目录、签名链接管理、Token 管理、审计；标签栏右侧提供 **Swagger / ReDoc** 入口（在线调试）；自定义确认框（不依赖浏览器原生弹窗） |
+| 网页 UI | bucket 点击选中 + 高亮、整页拖拽、新建目录、签名链接管理、Token 管理、审计；标签栏右侧提供 **Swagger / ReDoc** 入口（静态资源自托管，内网/离线可用）；自定义确认框（不依赖浏览器原生弹窗） |
 | 跳转免填 | 支持 URL 携带 token/bucket 直接进入：`/?token=<api_token>[&bucket=<bucket>]` 自动填充令牌并进入目标 bucket，落地即清除地址栏 token（协作平台「任务数据」跳转自动认证） |
 
 ---
@@ -78,28 +78,28 @@
 
 ```bash
 cd ArtifactDepot
-./build_image.sh                     # 构建 localhost/artifactdepot:0.7.1 + 自动导出 artifactdepot-0.7.1.tar
+./build_image.sh                     # 构建 localhost/artifactdepot:0.7.2 + 自动导出 artifactdepot-0.7.2.tar
 ```
 
 2. 把 tar 拷到生产机
 
 ```bash
-scp artifactdepot-0.7.1.tar apyyc@<生产机>:~/SERVER/artifactdepot/
+scp artifactdepot-0.7.2.tar apyyc@<生产机>:~/SERVER/artifactdepot/
 ```
 
 3. 生产机导入并部署
 
 ```bash
 cd ~/SERVER/artifactdepot
-podman load -i artifactdepot-0.7.1.tar
+podman load -i artifactdepot-0.7.2.tar
 cd ArtifactDepot
-./deploy_container.sh --token y      # 默认 host 网络；datahub_url 用挂载的 config.json
+./deploy_container.sh --token <你的管理员token>   # 默认 host 网络；datahub_url 用挂载的 config.json
 ```
 
-> 升级到新版本时数据卷默认指到 `~/SERVER/artifactdepot/artifactdepot_0.7.1/warehouse`（新目录，空）。
+> 升级到新版本时数据卷默认指到 `~/SERVER/artifactdepot/artifactdepot_0.7.2/warehouse`（新目录，空）。
 > 若想沿用上一版数据，用 `--data-dir ~/SERVER/artifactdepot/<上一版目录>/warehouse` 指过去，
 > 或把旧数据目录内容拷贝/移动到新目录（`tokens.json` 可让同步从 DataHub 重新生成）。
-> 若 `~/SERVER` 不可写，脚本会自动回退到 `${XDG_DATA_HOME:-~/.local/share}/artifactdepot/artifactdepot_0.7.1/warehouse`。
+> 若 `~/SERVER` 不可写，脚本会自动回退到 `${XDG_DATA_HOME:-~/.local/share}/artifactdepot/artifactdepot_0.7.2/warehouse`。
 
 ---
 
@@ -118,14 +118,14 @@ cd ArtifactDepot
 ### 本地安装依赖
 
 ```bash
-pip install fastapi uvicorn httpx python-multipart
+pip install -r requirements.txt
 ```
 
 ### 构建镜像（自动导出 tar）
 
 ```bash
 cd ArtifactDepot
-./build_image.sh                      # 构建 + 自动导出 artifactdepot-0.7.1.tar
+./build_image.sh                      # 构建 + 自动导出 artifactdepot-0.7.2.tar
 ```
 
 常用参数：
@@ -135,7 +135,7 @@ cd ArtifactDepot
 | `--no-save` | 只构建，不导出 tar |
 | `--save /path/to/out.tar` | 指定导出路径（默认同目录 `artifactdepot-<tag>.tar`） |
 | `--no-cache` | 不用构建缓存（依赖层有改动时用） |
-| `--tag <版本>` | 自定义版本标签（默认 0.7.1） |
+| `--tag <版本>` | 自定义版本标签（默认 0.7.2） |
 | `--load /path/to/in.tar` | 不构建，直接导入已有 tar |
 | `--list` | 只列出本地镜像 |
 
@@ -145,9 +145,9 @@ cd ArtifactDepot
 
 ```bash
 # 导出（等价于 build_image.sh 的自动步骤）
-podman save -o artifactdepot-0.7.1.tar localhost/artifactdepot:0.7.1
+podman save -o artifactdepot-0.7.2.tar localhost/artifactdepot:0.7.2
 # 目标机导入
-podman load -i artifactdepot-0.7.1.tar
+podman load -i artifactdepot-0.7.2.tar
 ```
 
 ---
@@ -171,15 +171,16 @@ cd ArtifactDepot
 ### 容器部署（带自启）
 
 ```bash
-./deploy_container.sh --token y
+./deploy_container.sh --token <你的管理员token>
 ```
 
 - **默认 host 网络**：容器共享宿主网络，不再映射端口；容器内 `127.0.0.1` 就是宿主机，同机连 DataHub（`http://127.0.0.1:8002/api/data`）最稳。用 `--port-map` 才改为端口映射（rootless 桥接下容器连宿主发布端口常不通）
 - **自启**：Podman 默认生成 `systemd --user` 服务；Docker 没有 `podman generate systemd`，脚本自动改用 `--restart=always`
-- `--token y` / 环境变量 `ARTIFACT_DEPOT_ACCESS_TOKEN`：注入共享令牌（不传且 config.json 也无 access_token 时写入/管理接口 401）
+- **非 root**：镜像以 `artifactdepot(10001)` 运行；绑定数据卷时 `deploy_container.sh` 自动以宿主当前 UID/GID 运行（Podman 另加 `--userns=keep-id`），保证挂载目录可写
+- `--token <你的管理员token>` / 环境变量 `ARTIFACT_DEPOT_ACCESS_TOKEN`：注入共享令牌（不传且 config.json 也无 access_token 时，管理/写接口返回 401）
 - `--datahub-url <地址>` / 环境变量 `ARTIFACT_DEPOT_DATAHUB_URL`：**显式**注入 DataHub 地址；**不传则不注入**，以容器内配置文件的 `datahub_url` 为准
-- 数据卷默认 `~/SERVER/artifactdepot/artifactdepot_0.7.1/warehouse` 挂到容器 `/data/depot`（`--data-dir` 指定；默认目录不可写时自动回退到 `~/.local/share/artifactdepot/...`）
-- **配置挂载**：脚本自动探测 `~/SERVER/artifactdepot/config/config.json` 或 `~/SERVER/artifactdepot/artifactdepot_0.7.1/config/config.json`；也可用 `--config <宿主机路径>` 显式挂载
+- 数据卷默认 `~/SERVER/artifactdepot/artifactdepot_0.7.2/warehouse` 挂到容器 `/data/depot`（`--data-dir` 指定；默认目录不可写时自动回退到 `~/.local/share/artifactdepot/...`）
+- **配置挂载**：脚本自动探测 `~/SERVER/artifactdepot/config/config.json` 或 `~/SERVER/artifactdepot/artifactdepot_0.7.2/config/config.json`；也可用 `--config <宿主机路径>` 显式挂载
 - **meta_dir**：默认不注入 `ARTIFACT_DEPOT_META_DIR`，完全以 config.json 的 `meta_dir` 为准；需要显式覆盖时用 `--meta-dir <容器内路径>`
 
 ### 首次使用流程
@@ -207,9 +208,14 @@ cd ArtifactDepot
   "datahub_url": "http://127.0.0.1:8002/api/data",
   "host": "0.0.0.0",
   "port": 8004,
-  "access_token": "y",
+  "access_token": "",
   "max_upload_mb": 0,
   "ui_enabled": true,
+  "trusted_proxies": [],
+  "audit_max_mb": 50,
+  "audit_backups": 5,
+  "cors_origins": [],
+  "allowed_hosts": ["*"],
   "signed_links": {
     "count_min": 1,
     "count_max": 10,
@@ -226,9 +232,14 @@ cd ArtifactDepot
 | `datahub_url` | `http://127.0.0.1:8002/api/data` | 从哪个 DataHub 拉取用户 token（collab 权威源）。**同机 host 网络**部署就用 `127.0.0.1:8002`；跨机用 `http://<IP>:8002/api/data` |
 | `host` | `0.0.0.0` | 监听地址 |
 | `port` | `8004` | 服务端口 |
-| `access_token` | `change-me` | **管理员/工具共享令牌**：识别为「系统/工具」，可执行全部操作；管理接口（Token/审计）也用它。生产必改 |
+| `access_token` | `（空）` | **管理员/工具共享令牌**：识别为「系统/工具」，可执行全部操作；管理接口（Token/审计）也用它。**默认空 = 无管理员**（管理/写接口 401）；生产必须通过 `--token` / `ARTIFACT_DEPOT_ACCESS_TOKEN` / config.json 显式配置。启动时 `config_warnings()` 会对空/弱 token 告警，设 `ARTIFACT_DEPOT_STRICT_CONFIG=1` 可直接拒绝启动 |
 | `max_upload_mb` | `0` | 单文件上传上限（MB）。`0` = 不限 |
 | `ui_enabled` | `true` | 是否启用网页 UI（`false` 时 `GET /` 返回 403，API 照常） |
+| `trusted_proxies` | `[]` | 可信反向代理 IP/CIDR 列表。非空且直连方在列表内时，才从 `X-Forwarded-For` 解析审计 `public_ip`；否则留空（不再采信客户端自报的 `public_ip`） |
+| `audit_max_mb` | `50` | 审计日志单文件上限（MB），超过自动轮转；`0` = 不轮转 |
+| `audit_backups` | `5` | 审计日志保留的历史文件数（`audit.log.1` … `.N`） |
+| `cors_origins` | `[]` | CORS 允许来源白名单；空 = 不启用 CORS 中间件 |
+| `allowed_hosts` | `["*"]` | TrustedHost 白名单；`["*"]` = 不限制 |
 | `require_read_token` | `false` | 读接口（`/api/buckets`、`/api/objects/list`）是否要求 `bucket:list` / `object:list` 权限；默认 false 保持内网公开 |
 | `signed_links.count_min` | `1` | 签名链接**次数**下限（按次数类型） |
 | `signed_links.count_max` | `10` | 签名链接**次数**上限 |
@@ -274,9 +285,10 @@ cp config.production.json ~/SERVER/artifactdepot/config/config.json
   "datahub_url": "http://127.0.0.1:8002/api/data",
   "host": "0.0.0.0",
   "port": 8004,
-  "access_token": "change-me",
+  "access_token": "",
   "max_upload_mb": 0,
   "ui_enabled": true,
+  "trusted_proxies": [],
   "signed_links": {
     "count_min": 1,
     "count_max": 10,
@@ -380,7 +392,7 @@ ArtifactDepot/
 > 接口文档在网页 UI 标签栏右侧的 **Swagger**（`/docs`，可直接在线调试）与 **ReDoc**（`/redoc`）查看；
 > 若需原始 Markdown，可用公开只读接口 `GET /api/docs`（清单）与 `GET /api/docs/{name}`（`?raw=1` 返回纯文本）。
 
-传递方式：`?token=` 查询参数，或 `Authorization: Bearer <token>`，或 multipart 表单 `token` 字段。
+传递方式：**推荐 `Authorization: Bearer <token>`**（不落 URL、不进访问日志）；也兼容 `?token=` 查询参数与 multipart 表单 `token` 字段。服务端访问日志会把 `token`/`tk`/`sig` 等参数脱敏为 `***`。
 
 ### 对象接口（S3 风格）
 
@@ -486,7 +498,7 @@ ArtifactDepot/
 #### 审计查询 — `GET /api/audit`（权限点 `audit:read`）
 Query：`bucket`/`key`/`actor`/`since`(YYYY-MM-DD 起)/`limit`(默认 500)。返回审计记录（操作类型 / 操作者 / **双 IP** / UTC 时间 / size / sha256）。
 
-### 文档接口（0.7.1）
+### 文档接口（0.7.1 新增）
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
@@ -525,17 +537,17 @@ curl -o out.mp4 "$BASE/api/objects/download?bucket=音视门carryVdeio&key=任�
 
 # 签名链接 —— 按时效
 curl -X POST -H "Content-Type: application/json" -H "Authorization: Bearer $USER" \
-  -d '{"bucket":"音视门carryVdeio","key":"artifactdepot_0.7.1.tar","mode":"time","expires":3600}' \
+  -d '{"bucket":"音视门carryVdeio","key":"artifactdepot_0.7.2.tar","mode":"time","expires":3600}' \
   "$BASE/api/objects/presign"
 
 # 签名链接 —— 按次数（3 次）
 curl -X POST -H "Content-Type: application/json" -H "Authorization: Bearer $USER" \
-  -d '{"bucket":"音视门carryVdeio","key":"artifactdepot_0.7.1.tar","mode":"count","count":3}' \
+  -d '{"bucket":"音视门carryVdeio","key":"artifactdepot_0.7.2.tar","mode":"count","count":3}' \
   "$BASE/api/objects/presign"
 
 # 签名链接 —— 永久
 curl -X POST -H "Content-Type: application/json" -H "Authorization: Bearer $USER" \
-  -d '{"bucket":"音视门carryVdeio","key":"artifactdepot_0.7.1.tar","mode":"permanent"}' \
+  -d '{"bucket":"音视门carryVdeio","key":"artifactdepot_0.7.2.tar","mode":"permanent"}' \
   "$BASE/api/objects/presign"
 
 # 删除（需 object:delete；目录仅空可删）
@@ -584,7 +596,7 @@ curl -X POST -H "Authorization: Bearer $ADMIN" "$BASE/api/tokens/sync"
 | **容器访问不到宿主 8002** | rootless pasta 网桥下容器连宿主发布端口常不通；`deploy_container.sh` 默认 host 网络即解决，容器内用 `127.0.0.1:8002` 直连 |
 | **tokens.json 生成位置不对** | 0.5.0 起可用 `meta_dir` 指定状态文件目录；改 `config.py`/`storage.py` 后**需重建镜像**再部署（运行中镜像不带新代码，只改配置不生效） |
 | 访问 `:8002` 连接被重置 | collab 容器默认只映射 8003；用多端口部署把 8002 也 `-p` 出来，并确认 DataHub 绑 `0.0.0.0` |
-| 点 Swagger / ReDoc 打不开或样式为空 | Swagger UI / ReDoc 依赖外部 CDN（jsdelivr）加载前端资源，内网/离线环境会白屏；此时改用公开只读接口 `GET /api/docs`（清单）与 `GET /api/docs/{name}?raw=1`（Markdown 原文） |
+| 点 Swagger / ReDoc 打不开或样式为空 | 0.7.2 起 Swagger UI / ReDoc 静态资源已自托管在 `/static/`，内网/离线可用；若仍异常请确认镜像包含 `src/artifactdepot/resources/static/`。也可用公开只读接口 `GET /api/docs`（清单）与 `GET /api/docs/{name}?raw=1`（Markdown 原文） |
 | 大文件上传「没反应」 | 看进度条；uvicorn 访问日志在**请求完成后**才打印，传输期间终端安静是正常的 |
 | 启动报 `No module named uvicorn` | `python3` 解析到无 uvicorn 的 `/usr/bin/python3`；`scripts/start.sh` 已自动探测 |
 | 容器里服务反复退出 | 缺 `python-multipart`（上传必需）；确认镜像构建时已安装 |

@@ -1,9 +1,106 @@
 # Changelog
 
-ArtifactDepot v0.7.1 — 所有对本项目的重要更改都将记录在此文件中。
+ArtifactDepot v0.7.2 — 所有对本项目的重要更改都将记录在此文件中。
 
 本日志格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本号遵循 [语义化版本规范](https://semver.org/lang/zh-CN/)。
+
+---
+
+## [0.7.2] - 2026-10-08
+
+### 第 1 批（P0 安全加固）
+
+> 第 1 批安全加固（P0）：修复路径穿越、存储型 XSS、弱默认 token、token 进访问日志。
+
+### Security
+
+- **修复分片上传 `upload_id` 路径穿越（严重）**：`storage.py` 此前直接用客户端传入的 `upload_id`
+  拼接会话路径，`upload_id="/"` / `"../x"` 可让 `abort` 对任意目录执行 `shutil.rmtree`。
+  现严格校验 `^[A-Za-z0-9_-]{16,64}$` 并二次确认解析结果落在会话根内；同时给会话绑定创建者
+  （`chunk`/`complete`/`abort` 校验归属），并限制 `total_chunks` 上限。
+- **修复网页 UI 存储型 XSS**：文件名/key 等不可信数据此前被 `esc()` 后拼进内联
+  `onclick="fn('...')"`，`&#39;` 会被 HTML 解码回 `'` 从而注入 JS。现改为 `data-*` 属性 +
+  事件委托，彻底移除内联 `onclick` 拼接。
+- **清除弱默认 token**：`resources/config.json` / `config.production.json` / 内置默认的
+  `access_token` 由 `"y"` / `"change-me"` 改为空（= 无管理员）；`.dockerignore` 排除
+  `**/config.json`，避免把运行配置烤进镜像。启动时 `config_warnings()` 对空/弱 token 告警，
+  `ARTIFACT_DEPOT_STRICT_CONFIG=1` 可直接拒绝启动。
+- **token 不再走 URL query（前端）**：网页 UI 所有 API 调用改用 `Authorization: Bearer`，
+  下载直链加 `referrerpolicy="no-referrer"`；新增 `logging_utils` 对 uvicorn access log 的
+  `token`/`tk`/`sig` 等 query 参数脱敏。
+
+### Fixed
+
+- `access_token` 为空时，鉴权请求由 500 改为 401/403（fail-closed），不再抛
+  “服务端未配置 access_token”。
+
+### Tests
+
+- 新增 `tests/test_security_hardening.py`（8 例）：路径穿越、会话归属、空 token、
+  UI XSS 静态检查、日志脱敏、Bearer 头鉴权。
+
+---
+
+### 第 2 批（P1 可靠性）
+
+> 第 2 批：状态文件原子写+并发锁、分片配额、审计 IP 可信化、容器非 root、依赖锁定。
+
+### Security
+
+- **审计 `public_ip` 不再采信客户端**：改为仅当直连方命中 `config.trusted_proxies`（IP/CIDR）时，
+  才从 `X-Forwarded-For` 解析；否则留空。前端移除第三方 `api.ipify.org`/`api.seeip.org` 探测。
+- **容器非 root 运行**：`Dockerfile` 创建 `artifactdepot(10001)` 并 `USER artifactdepot`；
+  `supervisord.conf` 移除 `user=root`；`deploy_container.sh` 绑定卷时以宿主 UID/GID 运行，
+  rootless podman 加 `--userns=keep-id`，保证卷可写。
+- **依赖锁定**：新增 `requirements.txt`（fastapi/uvicorn/httpx/python-multipart 精确版本），
+  `Dockerfile` 改为 `pip install -r`，构建可复现。
+
+### Changed
+
+- **状态文件原子写 + 并发锁**：`tokens.json` / `signed_links.json` / `.warehouse.json` 改为
+  临时文件 + `fsync` + `os.replace` 原子替换；`storage.state_lock()`（进程内 `threading.RLock`
+  + 跨进程 `fcntl.flock`）串行化读-改-写，修复并发丢更新、半截 JSON、按次数签名链接超用。
+- **分片上传配额**：单分片 ≤64MB；会话总量受 `max_upload_mb` 限制，未配置时 200GB 兜底；
+  `store_chunk` 在锁内校验并维护 `received_bytes`（覆盖同 index 不重复计数）。
+- **路径包含判断**：`bucket_dir` / `object_path` / `list_objects` / `rename_object` 由
+  `str.startswith` 改为 `Path.is_relative_to`，避免前缀碰撞 / symlink 边界绕过。
+- `_write_session_meta` 改为原子写；`audit.log` 以 0600 创建；`tokens.json`/`signed_links.json` 权限 0600。
+
+### Tests
+
+- 新增 `tests/test_reliability_hardening.py`（8 例）：并发 add_token / 并发消费按次数链接、
+  状态文件 0600、单分片/会话配额、覆盖不重复计数、`trusted_proxies` XFF 解析、客户端 `public_ip` 被忽略。
+
+---
+
+### 第 3 批（P2/P3 体验与工程化）
+
+> 第 3 批：API 一致性、列表分页、审计轮转、UI 时长修正、构建脚本乱码、自托管文档、CI。
+
+### Changed
+
+- **`GET /api/objects/head` 对齐 S3**：不存在返回 `404`（此前 200 + `exists:false`）；`mtime` 统一为 UTC ISO8601（此前为 epoch 整数）。
+- **`GET /api/objects/list` 支持分页**：新增 `limit` / `offset`，返回 `total` / `truncated`；`limit=0` 保持全量，向后兼容。
+- **目录递归统计**改用 `os.walk` 剪枝隐藏目录，不再把 `.git` 等隐藏目录内容算进大小/时间；文件 `stat` 竞态跳过而不是 500。
+- **审计日志轮转**：新增 `audit_max_mb`（默认 50）/ `audit_backups`（默认 5）；`query_audit` 读取轮转文件并用 `deque` 限制内存。
+- **网页 UI 签名链接时长**不再硬编码「一小时」，按 `created_at`/`expires` 显示实际时效（秒/分钟/小时/天）。
+- **`_mask_token` 加短哈希后缀**，避免不同 token 脱敏后同名导致返回字典覆盖。
+- **Swagger / ReDoc 静态资源自托管**（`/static/swagger-ui-bundle.js`、`redoc.standalone.js`），内网/离线不再白屏。
+- **新增 CORS / TrustedHost / 安全响应头**：`cors_origins`（默认空=不启用）、`allowed_hosts`（默认 `["*"]`）；响应加 `X-Content-Type-Options`/`X-Frame-Options`/`Referrer-Policy`/`Permissions-Policy`。
+
+### Fixed
+
+- **`build_image.sh` 全文件乱码修复**：此前 355 处中文/emoji 为双重编码（UTF-8→Latin-1），现全部恢复为正确中文，`--help` 输出正常。
+- 删除与当前项目无关的残留脚本 `rsync.sh`（指向旧 `data_warehouse` 路径）。
+
+### Added
+
+- **CI**：`.github/workflows/ci.yml`，push/PR 跑 `pytest` + 全部 shell `bash -n`。
+
+### Tests
+
+- 新增 `tests/test_api_consistency.py`（5 例）：head 404/ISO、list 分页、隐藏目录统计、审计轮转、`_mask_token` 唯一性。
 
 ---
 

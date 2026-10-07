@@ -59,9 +59,8 @@ def check_admin_token(token: str) -> bool:
     编码为 UTF-8 字节再比较：`hmac.compare_digest` 不接受非 ASCII 字符串，
     直接比较带中文/特殊符号的 token 会抛 TypeError → 500；转字节后非 ASCII 也安全。"""
     expected = get_config().get("access_token", "")
-    if not expected:
-        raise HTTPException(500, detail="服务端未配置 access_token，请先修改 resources/config.json")
-    if not token:
+    if not expected or not token:
+        # 未配置管理员 token 时按“无管理员”处理（fail-closed，返回 401/403 而非 500）
         return False
     return hmac.compare_digest(token.encode("utf-8"), expected.encode("utf-8"))
 

@@ -47,7 +47,7 @@ set -euo pipefail
 
 # ---------- 可配置参数（按需修改） ----------
 IMAGE_NAME="artifactdepot"           # 镜像名
-IMAGE_TAG="0.7.1"                    # 镜像版本标签
+IMAGE_TAG="0.7.2"                    # 镜像版本标签
 FULL_IMAGE="localhost/${IMAGE_NAME}:${IMAGE_TAG}"
 CONTAINER_NAME="artifactdepot"       # 容器名
 HOST_PORT="8004"                     # 宿主机映射端口（仅 --port-map 使用）
@@ -373,10 +373,25 @@ if [ "$AUTO_RESTART" = true ]; then
   RESTART_ARGS+=(--restart=always)
 fi
 
+# 非 root 运行 + 绑定卷权限：
+#   镜像内固定 USER=artifactdepot(10001)；绑定宿主机目录时改以宿主当前 UID/GID 运行，
+#   保证卷可写。rootless podman 再加 keep-id 把容器 UID 映射回宿主同一 UID。
+USER_ARGS=()
+if [ "$VOLUME_ENABLED" = true ]; then
+  USER_ARGS+=(--user "$(id -u):$(id -g)")
+  if [ "$IS_PODMAN" = true ]; then
+    USER_ARGS+=(--userns=keep-id)
+  fi
+  echo "   👤 运行身份: $(id -u):$(id -g)$([ "$IS_PODMAN" = true ] && echo ' (userns=keep-id)')"
+else
+  echo "   👤 运行身份: 镜像内 artifactdepot(10001)"
+fi
+
 CONTAINER_ID="$("$TOOL" run -d \
   --name "$CONTAINER_NAME" \
   "${RESTART_ARGS[@]}" \
   "${NETWORK_ARGS[@]}" \
+  "${USER_ARGS[@]}" \
   "${PORT_ARGS[@]}" \
   "${ENV_ARGS[@]}" \
   "${VOLUME_ARGS[@]}" \

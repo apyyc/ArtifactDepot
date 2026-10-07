@@ -3,6 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="referrer" content="no-referrer" />
 <title>制品仓 - ArtifactDepot</title>
 <style>
   body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; margin: 0; background: #f5f7fa; color: #303133; }
@@ -193,7 +194,7 @@
         <button onclick="runAudit()">查询</button>
       </div>
       <table>
-        <thead><tr><th>时间</th><th>动作</th><th>Bucket</th><th>Key</th><th>操作者</th><th>IP</th><th>公网IP</th><th>大小</th></tr></thead>
+        <thead><tr><th>时间</th><th>动作</th><th>Bucket</th><th>Key</th><th>操作者</th><th>IP</th><th title="仅可信代理 X-Forwarded-For 解析，未配置 trusted_proxies 时为空">代理IP</th><th>大小</th></tr></thead>
         <tbody id="auditBody"></tbody>
       </table>
       <div class="muted" style="margin-top:4px;">动作为 upload / download / delete / presign。</div>
@@ -267,21 +268,7 @@
 <script>
 const $ = (id) => document.getElementById(id)
 let state = { bucket: '', prefix: '' }
-let myPublicIp = ''
-
-// 尽力获取浏览器公网 IP（用于审计双 IP；失败则留空）
-async function fetchPublicIp() {
-  for (const u of ['https://api.ipify.org?format=json', 'https://api.seeip.org/jsonip']) {
-    try {
-      const r = await fetch(u)
-      if (!r.ok) continue
-      const j = await r.json()
-      const ip = j.ip || j.query || ''
-      if (ip) { myPublicIp = ip; break }
-    } catch (e) { /* 尝试下一个 */ }
-  }
-}
-fetchPublicIp()
+// 公网 IP 由服务端按 config.trusted_proxies 解析 X-Forwarded-For，前端不再自报/调用第三方
 
 function toast(text, ok = true) {
   const m = $('msg')
@@ -298,13 +285,36 @@ function switchTab(t) {
   })
 }
 
-async function api(url, opts) {
+function authHeaders(token, extra) {
+  const h = Object.assign({}, extra || {})
+  if (token) h['Authorization'] = 'Bearer ' + token
+  return h
+}
+
+// token 优先走 Authorization 头，避免出现在 URL query（访问日志/历史泄露）
+async function api(url, opts = {}, token = '') {
+  opts = Object.assign({}, opts)
+  opts.headers = authHeaders(token, opts.headers)
   const r = await fetch(url, opts)
   let body = null
   try { body = await r.json() } catch (e) { body = null }
   if (!r.ok) throw new Error((body && body.detail) || ('HTTP ' + r.status))
   return body
 }
+
+// 事件委托：不可信 key/id 只放 data-* 属性，避免拼进内联 onclick 造成 XSS
+document.addEventListener('click', (e) => {
+  const el = e.target && e.target.closest ? e.target.closest('[data-action]') : null
+  if (!el) return
+  e.preventDefault()
+  const a = el.dataset.action
+  if (a === 'enter-dir') enterDir(el.dataset.key)
+  else if (a === 'del-dir') delDir(el.dataset.key)
+  else if (a === 'presign') presign(el.dataset.key)
+  else if (a === 'del-file') delFile(el.dataset.key)
+  else if (a === 'revoke-link') revokeLink(el.dataset.id)
+  else if (a === 'remove-token') removeToken(el.dataset.token)
+})
 
 function esc(s) {
   return String(s == null ? '' : s).replace(/[&<>"']/g, c => (
@@ -313,6 +323,14 @@ function esc(s) {
 }
 
 // 时间显示：后端存 UTC（...Z）→ 转浏览器本地时间；旧数据无 Z 视为本地原样显示
+function fmtDuration(sec) {
+  sec = Math.max(0, Math.round(Number(sec) || 0))
+  if (sec < 60) return sec + ' 秒'
+  if (sec < 3600) return Math.round(sec / 60) + ' 分钟'
+  if (sec < 86400) return (Math.round(sec / 360) / 10) + ' 小时'
+  return (Math.round(sec / 8640) / 10) + ' 天'
+}
+
 function fmtTime(s) {
   if (!s) return ''
   if (typeof s === 'string' && /Z$/.test(s)) {
@@ -423,21 +441,21 @@ async function refresh() {
   for (const it of items) {
     const tr = document.createElement('tr')
     if (it.is_dir) {
-      tr.innerHTML = '<td><a class="dir" href="javascript:void(0)" onclick="enterDir(\'' + esc(it.key) + '\')">' + esc(it.name) + '/</a></td>' +
+      tr.innerHTML = '<td><a class="dir" href="javascript:void(0)" data-action="enter-dir" data-key="' + esc(it.key) + '">' + esc(it.name) + '/</a></td>' +
         '<td>' + fmtSize(it.size) + '</td>' +
         '<td class="muted">' + esc(fmtTime(it.mtime)) + '</td>' +
         '<td>-</td>' +
         '<td>-</td>' +
-        '<td><a href="javascript:void(0)" onclick="delDir(\'' + esc(it.key) + '\')" style="color:#f56c6c;">删除</a></td>'
+        '<td><a href="javascript:void(0)" data-action="del-dir" data-key="' + esc(it.key) + '" style="color:#f56c6c;">删除</a></td>'
     } else {
-      const dl = '/api/objects/download?bucket=' + encodeURIComponent(state.bucket) + '&key=' + encodeURIComponent(it.key) + '&token=' + encodeURIComponent($('upToken').value.trim()) + '&public_ip=' + encodeURIComponent(myPublicIp)
+      const dl = '/api/objects/download?bucket=' + encodeURIComponent(state.bucket) + '&key=' + encodeURIComponent(it.key) + '&token=' + encodeURIComponent($('upToken').value.trim())
       tr.innerHTML =
         '<td>' + esc(it.name) + '</td>' +
         '<td>' + fmtSize(it.size) + '</td>' +
         '<td class="muted">' + esc(fmtTime(it.mtime)) + '</td>' +
         '<td class="muted" title="' + esc(it.source_url) + '">' + esc((it.source_url || '').slice(0, 28)) + '</td>' +
         '<td class="muted">' + esc(it.uploader || '-') + '</td>' +
-        '<td><a href="' + dl + '">下载</a> <a href="javascript:void(0)" onclick="presign(\'' + esc(it.key) + '\')">签名链接</a> <a href="javascript:void(0)" onclick="delFile(\'' + esc(it.key) + '\')" style="color:#f56c6c;">删除</a></td>'
+        '<td><a href="' + dl + '" referrerpolicy="no-referrer">下载</a> <a href="javascript:void(0)" data-action="presign" data-key="' + esc(it.key) + '">签名链接</a> <a href="javascript:void(0)" data-action="del-file" data-key="' + esc(it.key) + '" style="color:#f56c6c;">删除</a></td>'
     }
     tbody.appendChild(tr)
   }
@@ -498,8 +516,8 @@ async function doPresign() {
     body.expires = secs
   }
   try {
-    const r = await api('/api/objects/presign?token=' + encodeURIComponent(token) + '&public_ip=' + encodeURIComponent(myPublicIp), {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+    const r = await api('/api/objects/presign', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }, token)
     const u = window.location.origin + (r.data.url || '')
     $('psResult').value = u
     $('psResultRow').style.display = 'flex'
@@ -529,9 +547,9 @@ async function doMkdir() {
   if (!name) { toast('请输入目录名', false); return }
   const key = state.prefix ? state.prefix + '/' + name : name
   try {
-    await api('/api/objects/mkdir?token=' + encodeURIComponent(t) + '&public_ip=' + encodeURIComponent(myPublicIp), {
+    await api('/api/objects/mkdir', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ bucket: state.bucket, key }) })
+      body: JSON.stringify({ bucket: state.bucket, key }) }, t)
     toast('已创建目录：' + key)
     closeMkdirModal()
     await refresh()
@@ -555,14 +573,20 @@ async function loadLinks() {
   const t = $('lkToken').value.trim()
   if (!t) { toast('请输入令牌', false); return }
   try {
-    const body = await api('/api/objects/signed-links?token=' + encodeURIComponent(t))
+    const body = await api('/api/objects/signed-links', {}, t)
     const tb = document.querySelector('#lkTbl tbody')
     tb.innerHTML = ''
     const rows = (body.data || []).slice().sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''))
     if (!rows.length) tb.innerHTML = '<tr><td colspan="8" class="muted">（无链接）</td></tr>'
     for (const l of rows) {
       const tr = document.createElement('tr')
-      const modeTxt = l.mode === 'count' ? '次数' + l.max_uses : l.mode === 'time' ? '一小时' : '永久'
+      let modeTxt
+      if (l.mode === 'count') modeTxt = '次数 ' + l.max_uses
+      else if (l.mode === 'time') {
+        const createdSec = Date.parse(l.created_at || '') / 1000
+        const secs = (l.expires && !isNaN(createdSec)) ? (l.expires - createdSec) : null
+        modeTxt = secs != null ? '时效 ' + fmtDuration(secs) : '时效'
+      } else modeTxt = '永久'
       const remaining = l.mode === 'count' ? (l.remaining || 0) + ' 次' : '—'
       let statusHtml
       if (l.revoked) statusHtml = '<span style="color:#f56c6c;">已作废</span>'
@@ -580,7 +604,7 @@ async function loadLinks() {
         '<td class="muted">' + esc(fmtTime(l.created_at)) + '</td>' +
         '<td>' + statusHtml + '</td>' +
         '<td>' + linkCell + '</td>' +
-        '<td>' + (canRevoke ? '<a href="javascript:void(0)" style="color:#f56c6c;" onclick="revokeLink(\'' + esc(l.id) + '\')">作废</a>' : '-') + '</td>'
+        '<td>' + (canRevoke ? '<a href="javascript:void(0)" style="color:#f56c6c;" data-action="revoke-link" data-id="' + esc(l.id) + '">作废</a>' : '-') + '</td>'
       tb.appendChild(tr)
     }
   } catch (e) { toast(e.message, false) }
@@ -616,7 +640,7 @@ async function revokeLink(id) {
   const ok = await confirmDialog('确定作废该链接？作废后立即失效')
   if (!ok) return
   try {
-    await api('/api/objects/signed-links/' + encodeURIComponent(id) + '/revoke?token=' + encodeURIComponent(t) + '&public_ip=' + encodeURIComponent(myPublicIp), { method: 'POST' })
+    await api('/api/objects/signed-links/' + encodeURIComponent(id) + '/revoke', { method: 'POST' }, t)
     toast('已作废'); await loadLinks()
   } catch (e) { toast(e.message, false) }
 }
@@ -627,7 +651,7 @@ async function delFile(key) {
   const ok = await confirmDialog('确定删除 ' + key + ' ？删除不可恢复')
   if (!ok) return
   try {
-    await api('/api/objects?bucket=' + encodeURIComponent(state.bucket) + '&key=' + encodeURIComponent(key) + '&token=' + encodeURIComponent(t) + '&public_ip=' + encodeURIComponent(myPublicIp), { method: 'DELETE' })
+    await api('/api/objects?bucket=' + encodeURIComponent(state.bucket) + '&key=' + encodeURIComponent(key), { method: 'DELETE' }, t)
     toast('已删除'); await refresh()
   } catch (e) { toast(e.message, false) }
 }
@@ -638,7 +662,7 @@ async function delDir(key) {
   const ok = await confirmDialog('确定删除目录 ' + key + ' ？\n仅空目录可删除：若内含文件/子目录会被拒绝，需先清空。')
   if (!ok) return
   try {
-    await api('/api/objects?bucket=' + encodeURIComponent(state.bucket) + '&key=' + encodeURIComponent(key) + '&token=' + encodeURIComponent(t) + '&public_ip=' + encodeURIComponent(myPublicIp), { method: 'DELETE' })
+    await api('/api/objects?bucket=' + encodeURIComponent(state.bucket) + '&key=' + encodeURIComponent(key), { method: 'DELETE' }, t)
     toast('已删除'); await refresh()
   } catch (e) { toast(e.message, false) }
 }
@@ -657,7 +681,7 @@ function hideDropOverlay() { $('dropOverlay').style.display = 'none' }
 async function checkToken(tok) {
   if (!tok) return null
   try {
-    const b = await api('/api/auth/check?token=' + encodeURIComponent(tok))
+    const b = await api('/api/auth/check', {}, tok)
     return b.data && b.data.valid ? b.data.actor : null
   } catch (e) { return null }
 }
@@ -714,11 +738,10 @@ function uploadOne(item, token) {
     fd.append('file', file)
     fd.append('bucket', state.bucket)
     fd.append('key', key)
-    fd.append('token', token)
     fd.append('source_url', $('upSource').value.trim())
-    fd.append('public_ip', myPublicIp)
     const xhr = new XMLHttpRequest()
     xhr.open('POST', '/api/objects')
+    xhr.setRequestHeader('Authorization', 'Bearer ' + token)
     xhr.timeout = 600000   // 10 分钟（大文件）
     xhr.upload.onprogress = (e) => {
       if (e.lengthComputable) {
@@ -742,7 +765,7 @@ async function abortUpload(upload_id, token) {
   try {
     const fd = new FormData()
     fd.append('upload_id', upload_id)
-    await api('/api/objects/abort?token=' + encodeURIComponent(token), { method: 'POST', body: fd })
+    await api('/api/objects/abort', { method: 'POST', body: fd }, token)
   } catch (e) { /* 忽略 */ }
 }
 
@@ -750,7 +773,7 @@ async function uploadOneChunked(item, token) {
   // 1. initiate
   let upload_id, chunk_size
   try {
-    const r = await api('/api/objects/initiate?token=' + encodeURIComponent(token), { method: 'POST' })
+    const r = await api('/api/objects/initiate', { method: 'POST' }, token)
     const d = r.data || {}
     upload_id = d.upload_id
     chunk_size = d.chunk_size || UP_CHUNK_SIZE
@@ -781,7 +804,8 @@ async function uploadOneChunked(item, token) {
       fd.append('index', String(index))
       fd.append('chunk', blob, 'chunk_' + index)
       const xhr = new XMLHttpRequest()
-      xhr.open('POST', '/api/objects/chunk?token=' + encodeURIComponent(token))
+      xhr.open('POST', '/api/objects/chunk')
+      xhr.setRequestHeader('Authorization', 'Bearer ' + token)
       xhr.timeout = 600000
       xhr.upload.onprogress = (e) => {
         if (e.lengthComputable) {
@@ -842,10 +866,9 @@ async function uploadOneChunked(item, token) {
   fd.append('key', key)
   fd.append('total_chunks', String(totalChunks))
   fd.append('source_url', source_url)
-  fd.append('public_ip', myPublicIp)
-  fd.append('overwrite', 'true')
+    fd.append('overwrite', 'true')
   try {
-    await api('/api/objects/complete?token=' + encodeURIComponent(token), { method: 'POST', body: fd })
+    await api('/api/objects/complete', { method: 'POST', body: fd }, token)
     return true
   } catch (e) {
     await abortUpload(upload_id, token)
@@ -1000,7 +1023,7 @@ async function generateToken() {
     if (!confirm('尚未勾选任何接口，生成的 token 将没有任何权限。继续？')) return
   }
   try {
-    const body = await api('/api/tokens?token=' + encodeURIComponent(t), {
+    const body = await api('/api/tokens', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         user,
@@ -1011,7 +1034,7 @@ async function generateToken() {
         expires_at: $('tkExpires').value.trim(),
         description: $('tkDesc').value.trim(),
       }),
-    })
+    }, t)
     const d = body.data || {}
     $('tkResult').value = d.token || ''
     $('tkResultRow').style.display = ''
@@ -1030,7 +1053,7 @@ async function syncTokens() {
   const t = $('admToken').value.trim()
   if (!t) { toast('请输入管理员令牌', false); return }
   try {
-    const body = await api('/api/tokens/sync?token=' + encodeURIComponent(t), { method: 'POST' })
+    const body = await api('/api/tokens/sync', { method: 'POST' }, t)
     const d = body.data || {}
     const n = Object.keys(d.mapping || {}).length
     if (d.ok) {
@@ -1057,7 +1080,7 @@ async function loadTokens() {
   if (!t) { toast('请输入管理员令牌', false); return }
   const reveal = $('tkReveal') && $('tkReveal').checked
   try {
-    const body = await api('/api/tokens?token=' + encodeURIComponent(t) + (reveal ? '&reveal=true' : ''))
+    const body = await api('/api/tokens' + (reveal ? '?reveal=true' : ''), {}, t)
     const tb = document.querySelector('#tokensBody')
     tb.innerHTML = ''
     const map = body.data || {}
@@ -1075,7 +1098,7 @@ async function loadTokens() {
         '<td class="muted">' + esc(fmtScopeRange(rec)) + '</td>' +
         '<td>' + esc(rec.expires_at || '永久') + '</td>' +
         '<td>' + state + '</td>' +
-        '<td><button class="danger" onclick="removeToken(\'' + esc(rec.token) + '\')">移除</button></td>'
+        '<td><button class="danger" data-action="remove-token" data-token="' + esc(rec.token) + '">移除</button></td>'
       tb.appendChild(tr)
       const detail = document.createElement('tr')
       detail.innerHTML = '<td colspan="8" class="muted mono" style="font-size:12px;">' +
@@ -1097,8 +1120,8 @@ async function removeToken(masked) {
   const ok = await confirmDialog('确定移除该 token？')
   if (!ok) return
   try {
-    await api('/api/tokens?token=' + encodeURIComponent(t) + '&value=' + encodeURIComponent(value), {
-      method: 'DELETE' })
+    await api('/api/tokens?value=' + encodeURIComponent(value), {
+      method: 'DELETE' }, t)
     toast('已移除')
     await loadTokens()
   } catch (e) { toast(e.message, false) }
@@ -1111,13 +1134,13 @@ loadTokenCatalog()
 async function runAudit() {
   const t = $('audToken').value.trim()
   if (!t) { toast('请输入管理员令牌', false); return }
-  const q = new URLSearchParams({ token: t })
+  const q = new URLSearchParams()
   ;['audBucket', 'audKey', 'audActor', 'audSince'].forEach(id => {
     const v = $(id).value.trim()
     if (v) q.set(id.replace('aud', '').toLowerCase(), v)
   })
   try {
-    const body = await api('/api/audit?' + q.toString())
+    const body = await api('/api/audit?' + q.toString(), {}, t)
     const tb = document.querySelector('#auditBody')
     tb.innerHTML = ''
     const rows = (body.data || []).slice().reverse()

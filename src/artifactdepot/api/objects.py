@@ -18,17 +18,19 @@ from artifactdepot.auth import (
     Principal, ensure_scope, extract_form_token, extract_token, require_principal,
     require_scope, resolve_principal,
 )
+from artifactdepot import netutil
 from artifactdepot.config import get_config
 
 router = APIRouter(prefix="/api/objects", tags=["Objects"])
 
 
 def _client_ip(request: Request) -> str:
-    return request.client.host if request.client else ""
+    return netutil.client_ip(request)
 
 
 def _public_ip(request: Request) -> str:
-    return (request.query_params.get("public_ip") or "").strip()
+    # 只采信可信代理的 X-Forwarded-For，忽略客户端自报的 public_ip 参数
+    return netutil.resolved_public_ip(request)
 
 
 def _read_requires_token() -> bool:
@@ -94,12 +96,15 @@ async def upload(
 
     storage.audit("upload", bucket, key, principal.actor, _client_ip(request),
                   size=result["size"], sha256=result["sha256"],
-                  public_ip=public_ip or _public_ip(request))
+                  public_ip=_public_ip(request))
     return {"code": 0, "message": "success", "data": result}
 
 
 @router.get("/list")
-async def list_objects(request: Request, bucket: str, prefix: str = ""):
+async def list_objects(request: Request, bucket: str, prefix: str = "",
+                       limit: int = Query(0, ge=0, le=10000,
+                                          description="0=不限；>0 时按 offset 分页"),
+                       offset: int = Query(0, ge=0)):
     """列对象（ListObjects）。默认公开；require_read_token=true 时需 object:list。
 
     带资源范围的 token：在允许范围内正常列出；范围外按匿名处理（公开模式下不阻断、
@@ -114,17 +119,20 @@ async def list_objects(request: Request, bucket: str, prefix: str = ""):
                 raise HTTPException(
                     403, detail="权限不足：token 的资源范围不允许该 bucket / 路径")
             principal = None
-    items = storage.list_objects(bucket, prefix)
+    result = storage.list_objects(bucket, prefix, limit=limit, offset=offset)
     return {"code": 0, "message": "success",
-            "data": {"bucket": bucket, "prefix": prefix, "items": items}}
+            "data": {"bucket": bucket, "prefix": prefix, **result}}
 
 
 @router.get("/head")
 async def head(request: Request, bucket: str, key: str,
                actor: Principal = Depends(require_scope("object:head"))):
-    """对象元信息探测：轻量判断文件/目录是否存在；不存在时 HTTP 仍为 200，exists=false"""
+    """对象元信息探测（S3 HeadObject 语义）：不存在返回 404；mtime 为 UTC ISO8601。"""
     ensure_scope(actor, "object:head", bucket=bucket, key=key)
-    return {"code": 0, "message": "success", "data": storage.head_object(bucket, key)}
+    data = storage.head_object(bucket, key)
+    if not data.get("exists"):
+        raise HTTPException(404, detail=f"对象不存在：{bucket}/{key}")
+    return {"code": 0, "message": "success", "data": data}
 
 
 @router.get("/download")
@@ -309,7 +317,7 @@ CHUNK_SIZE = 8 * 1024 * 1024
 async def initiate_upload(request: Request,
                           actor: Principal = Depends(require_scope("upload:initiate"))):
     """创建分片上传会话，返回 upload_id 与 chunk_size"""
-    upload_id = storage.create_chunk_session()
+    upload_id = storage.create_chunk_session(owner=actor.actor)
     return {"code": 0, "message": "success",
             "data": {"upload_id": upload_id, "chunk_size": CHUNK_SIZE}}
 
@@ -333,7 +341,8 @@ async def upload_chunk(
             tmp.write(part)
         tmp_path = Path(tmp.name)
     try:
-        result = storage.store_chunk(upload_id, index, tmp_path)
+        result = storage.store_chunk(upload_id, index, tmp_path,
+                                      actor=principal.actor, is_admin=principal.is_admin)
     finally:
         tmp_path.unlink(missing_ok=True)
     return {"code": 0, "message": "success", "data": result}
@@ -359,10 +368,11 @@ async def complete_upload(
     result = storage.finalize_chunk_upload(
         upload_id, bucket, key, total_chunks,
         source_url, uploader=principal.actor, overwrite=overwrite,
+        actor=principal.actor, is_admin=principal.is_admin,
     )
     storage.audit("upload", bucket, key, principal.actor, _client_ip(request),
                   size=result["size"], sha256=result["sha256"],
-                  public_ip=public_ip or _public_ip(request))
+                  public_ip=_public_ip(request))
     return {"code": 0, "message": "success", "data": result}
 
 
@@ -377,5 +387,6 @@ async def abort_upload(
     principal = await resolve_principal(tok)
     ensure_scope(principal, "upload:abort")
     storage.touch_token(tok)
-    result = storage.abort_chunk_session(upload_id)
+    result = storage.abort_chunk_session(
+        upload_id, actor=principal.actor, is_admin=principal.is_admin)
     return {"code": 0, "message": "success", "data": result}

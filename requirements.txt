@@ -1,0 +1,6 @@
+# ArtifactDepot 运行依赖（精确锁定，保证可复现构建）
+# 升级时请同步更新本文件并跑一遍 tests/。
+fastapi==0.139.0
+uvicorn==0.51.0
+httpx==0.28.1
+python-multipart==0.0.32

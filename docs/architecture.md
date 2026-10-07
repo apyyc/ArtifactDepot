@@ -1,6 +1,6 @@
 # ArtifactDepot 架构说明
 
-> 版本 **0.7.1**
+> 版本 **0.7.2**
 
 ## 定位
 
@@ -128,6 +128,13 @@ ArtifactDepot/
 - 旧 token 自动兼容为 `role=user`（历史全量非管理权限）；
 - 读接口（list/buckets）默认内网公开，`require_read_token=true` 时改为必须 `bucket:list` / `object:list`。
 
+## 可靠性要点
+
+- 状态文件（`tokens.json` / `signed_links.json` / `.warehouse.json`）统一原子写（临时文件 + `fsync` + `os.replace`），
+  并用 `storage.state_lock()`（进程内 `threading` 锁 + 跨进程 `fcntl.flock`）串行化读-改-写，避免并发丢更新 / 半截 JSON。
+- 分片上传会话绑定创建者，`upload_id` 严格校验；单分片 ≤64MB，会话总量受 `max_upload_mb`（默认 200GB 兜底）约束。
+- 容器以非 root 用户 `artifactdepot(10001)` 运行；绑定宿主机目录时由 `deploy_container.sh` 以宿主 UID/GID + `--userns=keep-id` 运行，保证卷可写。
+
 ## 安全要点
 
 - 路径穿越防护：bucket 名校验 + key 拒绝绝对路径/`..`/空段/反斜杠/点前缀，解析后校验落在仓库根内。
@@ -139,13 +146,13 @@ ArtifactDepot/
 ## 部署
 
 - **build → save → 拷贝 → load → deploy**：
-  - 开发机 `./build_image.sh`（构建 + 自动导出 `artifactdepot-0.7.1.tar`）
-  - 拷贝 tar 到生产机 → `podman load -i` → `./deploy_container.sh --token y`
+  - 开发机 `./build_image.sh`（构建 + 自动导出 `artifactdepot-0.7.2.tar`）
+  - 拷贝 tar 到生产机 → `podman load -i` → `./deploy_container.sh --token <你的管理员token>`
 - **host 网络默认**：容器共享宿主网络，`datahub_url` 用 `127.0.0.1:8002` 直连同机 DataHub；
   `--port-map` 可改回端口映射（不推荐，rootless 桥接常不通）。
 - **config.json 挂载**：`deploy_container.sh` 自动探测 `~/SERVER/artifactdepot/config/config.json`，
   也可用 `--config <宿主机路径>` 显式挂到容器内 `resources/config.json`，生产配置显式可改、无需重建镜像。
-- 数据卷默认 `~/SERVER/artifactdepot/artifactdepot_0.7.1/warehouse` → 容器 `/data/depot`；
+- 数据卷默认 `~/SERVER/artifactdepot/artifactdepot_0.7.2/warehouse` → 容器 `/data/depot`；
   若该路径不可写，脚本自动回退到 `~/.local/share/artifactdepot/...`。
 - **自启**：Podman 走 `systemd --user`；Docker 走 `--restart=always`。
 - 排障：`bash check_ad_sync.sh` 逐段定位 token 同步链路。

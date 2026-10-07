@@ -12,14 +12,23 @@
 import hashlib
 import hmac
 import json
+import os
 import re
 import secrets
 import shutil
 import tempfile
+import threading
 import time
+from collections import deque
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import unquote
+
+try:
+    import fcntl  # POSIX 文件锁（跨进程）
+except ImportError:  # pragma: no cover - 非 POSIX 平台
+    fcntl = None
 
 import httpx
 
@@ -72,6 +81,75 @@ def _meta_path(name: str) -> Path:
     return base / name
 
 
+# ---------------------------------------------------------------------------
+# 状态文件原子写 + 并发锁
+#
+# tokens.json / signed_links.json / .warehouse.json 都是「读-改-写」，
+# 并发请求或进程崩溃会造成丢更新 / 半截文件。这里统一：
+#   1. 写临时文件 + fsync + os.replace 原子替换；
+#   2. 进程内 threading 锁 + 跨进程 fcntl.flock 串行化 RMW。
+# 锁文件放在 meta_dir 下，状态文件本身仍走原子替换。
+# ---------------------------------------------------------------------------
+
+_STATE_MUTEX = threading.RLock()
+_STATE_TLS = threading.local()
+
+
+def _atomic_write_text(path: Path, text: str, mode: int = 0o600) -> None:
+    """原子写文本：临时文件 + fsync + os.replace；失败清理临时文件。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+@contextmanager
+def state_lock():
+    """串行化状态文件读-改-写。
+
+    - 进程内：threading.RLock（可重入，避免同线程嵌套死锁）；
+    - 跨进程：fcntl.flock(meta_dir/.state.lock)（仅 POSIX）。
+    嵌套调用会复用外层锁，不会重复 flock。
+    """
+    depth = getattr(_STATE_TLS, "depth", 0)
+    if depth:
+        _STATE_TLS.depth = depth + 1
+        try:
+            yield
+        finally:
+            _STATE_TLS.depth -= 1
+        return
+    with _STATE_MUTEX:
+        _STATE_TLS.depth = 1
+        lock_file = None
+        try:
+            if fcntl is not None:
+                lock_path = _meta_path(".state.lock")
+                lock_path.parent.mkdir(parents=True, exist_ok=True)
+                lock_file = open(lock_path, "a+")
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            yield
+        finally:
+            try:
+                if lock_file is not None:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            finally:
+                if lock_file is not None:
+                    lock_file.close()
+                _STATE_TLS.depth = 0
+
+
 def validate_bucket(bucket: str) -> str:
     """校验 bucket 名：允许中文等 Unicode，但拒绝路径分隔符/穿越/隐藏/控制字符"""
     if not bucket:
@@ -107,7 +185,7 @@ def bucket_dir(bucket: str) -> Path:
     validate_bucket(bucket)
     root = get_root().resolve()
     d = (root / bucket).resolve()
-    if not str(d).startswith(str(root)):
+    if not d.is_relative_to(root):
         raise HTTPException(400, detail="bucket 路径越界")
     return d
 
@@ -120,7 +198,7 @@ def object_path(bucket: str, key: str) -> Path:
         raise HTTPException(400, detail="key 不能为空")
     root = get_root().resolve()
     p = (bucket_dir(bucket) / k).resolve()
-    if not str(p).startswith(str(root)):
+    if not p.is_relative_to(root):
         raise HTTPException(400, detail="key 越界")
     return p
 
@@ -145,9 +223,8 @@ def _manifest_load(bucket: str) -> dict:
 
 
 def _manifest_save(bucket: str, manifest: dict) -> None:
-    p = _manifest_path(bucket)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    _atomic_write_text(_manifest_path(bucket),
+                       json.dumps(manifest, ensure_ascii=False, indent=2), mode=0o644)
 
 
 # ---------------------------------------------------------------------------
@@ -181,57 +258,72 @@ def put_object(bucket: str, key: str, src_path: Path, source_url: str = "",
         "source_url": source_url or "",
         "uploader": uploader or "",
     }
-    manifest = _manifest_load(bucket)
-    manifest[k] = meta
-    _manifest_save(bucket, manifest)
+    with state_lock():
+        manifest = _manifest_load(bucket)
+        manifest[k] = meta
+        _manifest_save(bucket, manifest)
     return {"bucket": bucket, "key": k, "size": size, "sha256": sha256}
 
 
-def _dir_recursive_info(d: Path) -> dict:
-    """递归统计目录的大小与最新修改时间（跳过隐藏文件，如 .keep 占位）。
+def _mtime_iso(ts: float) -> str:
+    """epoch 秒 -> UTC ISO8601（统一列表/探测接口的时间格式）。"""
+    try:
+        return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except (OSError, OverflowError, ValueError):
+        return ""
 
-    大小 = 所有文件（含嵌套子目录 + 当前目录）的总字节数；
-    时间 = 所有文件里最新的 mtime（从最底层到最外层统一取最大）。
+
+def _dir_recursive_info(d: Path) -> dict:
+    """递归统计目录的大小与最新修改时间（跳过隐藏文件与隐藏目录内的内容）。
+
+    大小 = 所有可见文件（含嵌套子目录 + 当前目录）的总字节数；
+    时间 = 所有可见文件里最新的 mtime（从最底层到最外层统一取最大）。
+    用 os.walk 剪枝隐藏目录，避免把 .git/.cache 等算进去、也少扫一遍。
     """
     total_size = 0
     latest = 0.0
-    for p in d.rglob("*"):
-        if not p.is_file() or p.name.startswith("."):
-            continue
-        try:
-            st = p.stat()
-        except OSError:
-            continue
-        total_size += st.st_size
-        if st.st_mtime > latest:
-            latest = st.st_mtime
+    for root, dirs, files in os.walk(d):
+        dirs[:] = [x for x in dirs if not x.startswith(".")]
+        for name in files:
+            if name.startswith("."):
+                continue
+            try:
+                st = (Path(root) / name).stat()
+            except OSError:
+                continue
+            total_size += st.st_size
+            if st.st_mtime > latest:
+                latest = st.st_mtime
     if latest:
-        mtime = datetime.fromtimestamp(latest, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        mtime = _mtime_iso(latest)
     else:
         # 空目录没有文件可统计，退回目录自身 mtime，而不是返回当前时间
         try:
-            mtime = datetime.fromtimestamp(d.stat().st_mtime, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            mtime = _mtime_iso(d.stat().st_mtime)
         except OSError:
             mtime = _utc_now_iso()
     return {"size": total_size, "mtime": mtime}
 
 
-def list_objects(bucket: str, prefix: str = "") -> list:
-    """列对象：prefix 限定时列出该目录下的直接子项；文件系统扫描为准"""
+def list_objects(bucket: str, prefix: str = "",
+                 limit: int = 0, offset: int = 0) -> dict:
+    """列对象：prefix 限定时列出该目录下的直接子项；文件系统扫描为准。
+
+    返回 {"items", "total", "offset", "limit", "truncated"}。
+    limit>0 时按当前排序做 offset 分页（目录在前、名称排序），兼容旧调用（limit=0 全量）。
+    """
     validate_bucket(bucket)
     base = bucket_dir(bucket)
     if not base.exists():
-        return []
+        return {"items": [], "total": 0, "offset": 0, "limit": 0, "truncated": False}
     pdir = base
     rel_prefix = validate_key(prefix)
     if rel_prefix:
         pdir = (base / rel_prefix).resolve()
-        if not str(pdir).startswith(str(base)):
+        if not pdir.is_relative_to(base):
             raise HTTPException(400, detail="prefix 越界")
-        if not pdir.exists():
-            return []
-        if pdir.is_file():
-            return []   # prefix 指向文件而非目录
+        if not pdir.exists() or pdir.is_file():
+            return {"items": [], "total": 0, "offset": 0, "limit": 0, "truncated": False}
 
     manifest = _manifest_load(bucket)
     items = []
@@ -244,27 +336,33 @@ def list_objects(bucket: str, prefix: str = "") -> list:
             items.append({"name": child.name, "key": rel + "/", "is_dir": True,
                           "size": info["size"], "mtime": info["mtime"]})
         else:
+            try:
+                st = child.stat()
+            except OSError:
+                continue   # 并发删除/改名，跳过而不是 500
             meta = manifest.get(rel, {}) or {}
             mtime = _ensure_utc_z(meta.get("mtime", ""))
             if not mtime:
                 # 手工放入、没有清单记录的文件：回退到文件系统 mtime
-                try:
-                    mtime = datetime.fromtimestamp(
-                        child.stat().st_mtime, timezone.utc
-                    ).strftime("%Y-%m-%dT%H:%M:%SZ")
-                except OSError:
-                    mtime = ""
+                mtime = _mtime_iso(st.st_mtime)
             items.append({
                 "name": child.name,
                 "key": rel,
                 "is_dir": False,
-                "size": child.stat().st_size,
+                "size": st.st_size,
                 "mtime": mtime,
                 "sha256": meta.get("sha256", ""),
                 "source_url": meta.get("source_url", ""),
                 "uploader": meta.get("uploader", ""),
             })
-    return items
+    total = len(items)
+    truncated = False
+    if limit and limit > 0:
+        page = items[offset:offset + limit] if offset > 0 else items[:limit]
+        truncated = (offset + len(page)) < total
+        items = page
+    return {"items": items, "total": total, "offset": offset, "limit": limit,
+            "truncated": truncated}
 
 
 def mkdir(bucket: str, key: str) -> dict:
@@ -310,9 +408,10 @@ def delete_object(bucket: str, key: str) -> dict:
         except OSError:
             raise HTTPException(400, detail="目录删除失败（可能仍有内容）")
     else:
-        manifest = _manifest_load(bucket)
-        manifest.pop(k, None)
-        _manifest_save(bucket, manifest)
+        with state_lock():
+            manifest = _manifest_load(bucket)
+            manifest.pop(k, None)
+            _manifest_save(bucket, manifest)
         p.unlink()
     return {"deleted": f"{bucket}/{k}"}
 
@@ -349,7 +448,7 @@ def rename_object(bucket: str, key: str, new_key: str, overwrite: bool = False) 
 
     base = bucket_dir(bucket)
     dst = (base / nk).resolve()
-    if not str(dst).startswith(str(base)):
+    if not dst.is_relative_to(base):
         raise HTTPException(400, detail="new_key 越界")
 
     if src.is_file():
@@ -389,22 +488,23 @@ def rename_object(bucket: str, key: str, new_key: str, overwrite: bool = False) 
         raise
 
     # 清单记录 key 前缀整体替换
-    manifest = _manifest_load(bucket)
-    new_manifest = {}
-    prefix = k + "/"
-    for mk, mv in manifest.items():
-        if mk == k:
-            new_manifest[nk] = mv
-        elif mk.startswith(prefix):
-            new_manifest[f"{nk}/{mk[len(prefix):]}"] = mv
-        else:
-            new_manifest[mk] = mv
-    _manifest_save(bucket, new_manifest)
+    with state_lock():
+        manifest = _manifest_load(bucket)
+        new_manifest = {}
+        prefix = k + "/"
+        for mk, mv in manifest.items():
+            if mk == k:
+                new_manifest[nk] = mv
+            elif mk.startswith(prefix):
+                new_manifest[f"{nk}/{mk[len(prefix):]}"] = mv
+            else:
+                new_manifest[mk] = mv
+        _manifest_save(bucket, new_manifest)
     return {"bucket": bucket, "from_key": k, "to_key": nk, "moved_objects": len(moves)}
 
 
 def head_object(bucket: str, key: str) -> dict:
-    """轻量探测文件或目录是否存在；不存在时 exists=false（HTTP 仍为 200）"""
+    """轻量探测文件或目录是否存在；mtime 统一为 UTC ISO8601（与 list 一致）。"""
     validate_bucket(bucket)
     k = validate_key(key)
     p = object_path(bucket, key)
@@ -412,12 +512,20 @@ def head_object(bucket: str, key: str) -> dict:
         return {"exists": False, "bucket": bucket, "key": k}
     if p.is_dir():
         info = _dir_recursive_info(p)
+        try:
+            mtime = _mtime_iso(p.stat().st_mtime)
+        except OSError:
+            mtime = ""
         return {"exists": True, "is_dir": True, "bucket": bucket, "key": k + "/",
-                "size": info.get("size", 0), "mtime": int(p.stat().st_mtime)}
+                "size": info.get("size", 0), "mtime": mtime}
+    try:
+        st = p.stat()
+    except OSError:
+        raise HTTPException(404, detail=f"对象不存在：{bucket}/{key}")
     entry = _manifest_load(bucket).get(k, {}) or {}
     return {"exists": True, "is_dir": False, "bucket": bucket, "key": k,
-            "size": p.stat().st_size, "sha256": entry.get("sha256", ""),
-            "mtime": int(p.stat().st_mtime)}
+            "size": st.st_size, "sha256": entry.get("sha256", ""),
+            "mtime": _mtime_iso(st.st_mtime)}
 
 
 def list_buckets() -> list:
@@ -503,10 +611,8 @@ def load_signed_links() -> list:
 
 
 def save_signed_links(links: list) -> None:
-    p = _signed_links_path()
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(
-        json.dumps(links, ensure_ascii=False, indent=2), encoding="utf-8")
+    _atomic_write_text(_signed_links_path(),
+                       json.dumps(links, ensure_ascii=False, indent=2), mode=0o600)
 
 
 def create_signed_link(bucket: str, key: str, mode: str = "time",
@@ -555,9 +661,10 @@ def create_signed_link(bucket: str, key: str, mode: str = "time",
         "created_at": _utc_now_iso(),
         "revoked": False,
     }
-    links = load_signed_links()
-    links.append(entry)
-    save_signed_links(links)
+    with state_lock():
+        links = load_signed_links()
+        links.append(entry)
+        save_signed_links(links)
     return entry
 
 
@@ -569,35 +676,40 @@ def get_signed_link(link_id: str):
 
 
 def consume_signed_link(link_id: str, secret: str, bucket: str, key: str):
-    """校验并消费一个链接（count 模式递减剩余次数）。返回 (ok, actor, error)"""
-    links = load_signed_links()
-    for e in links:
-        if e.get("id") == link_id:
-            if e.get("revoked"):
-                return False, "", "链接已作废"
-            if e.get("token") != secret:
-                return False, "", "链接无效"
-            if e.get("bucket") != bucket or e.get("key") != key:
-                return False, "", "链接与文件不符"
-            if e.get("mode") == "time" and time.time() > (e.get("expires") or 0):
-                return False, "", "链接已过期"
-            if e.get("mode") == "count":
-                if (e.get("remaining") or 0) <= 0:
-                    return False, "", "链接次数已用完"
-                e["remaining"] = e["remaining"] - 1
-                save_signed_links(links)
-            return True, e.get("created_by") or "", ""
-    return False, "", "链接不存在"
+    """校验并消费一个链接（count 模式递减剩余次数）。返回 (ok, actor, error)
+
+    整段读-改-写在 state_lock 内完成，避免并发下载把按次数链接用超。
+    """
+    with state_lock():
+        links = load_signed_links()
+        for e in links:
+            if e.get("id") == link_id:
+                if e.get("revoked"):
+                    return False, "", "链接已作废"
+                if not hmac.compare_digest(str(e.get("token") or ""), str(secret or "")):
+                    return False, "", "链接无效"
+                if e.get("bucket") != bucket or e.get("key") != key:
+                    return False, "", "链接与文件不符"
+                if e.get("mode") == "time" and time.time() > (e.get("expires") or 0):
+                    return False, "", "链接已过期"
+                if e.get("mode") == "count":
+                    if (e.get("remaining") or 0) <= 0:
+                        return False, "", "链接次数已用完"
+                    e["remaining"] = e["remaining"] - 1
+                    save_signed_links(links)
+                return True, e.get("created_by") or "", ""
+        return False, "", "链接不存在"
 
 
 def revoke_signed_link(link_id: str) -> bool:
-    links = load_signed_links()
-    for e in links:
-        if e.get("id") == link_id:
-            e["revoked"] = True
-            save_signed_links(links)
-            return True
-    return False
+    with state_lock():
+        links = load_signed_links()
+        for e in links:
+            if e.get("id") == link_id:
+                e["revoked"] = True
+                save_signed_links(links)
+                return True
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -704,7 +816,7 @@ def _save_tokens(mapping: dict) -> None:
         normalized[tok] = _normalize_token_record(val, tok) if not isinstance(val, str) \
             else _default_token_record(val, "user")
     payload = {"_version": 2, "tokens": normalized}
-    p.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    _atomic_write_text(p, json.dumps(payload, ensure_ascii=False, indent=2), mode=0o600)
 
 
 def _parse_ts(ts: str):
@@ -755,16 +867,17 @@ def touch_token(token: str) -> None:
     if not token:
         return
     try:
-        raw = _read_tokens_raw()
-        if token not in raw:
-            return
-        rec = _normalize_token_record(raw[token], token)
-        last = _parse_ts(rec.get("last_used_at", ""))
-        if last is not None and (datetime.now(timezone.utc) - last).total_seconds() < 300:
-            return
-        rec["last_used_at"] = _utc_now_iso()
-        raw[token] = rec
-        _save_tokens(raw)
+        with state_lock():
+            raw = _read_tokens_raw()
+            if token not in raw:
+                return
+            rec = _normalize_token_record(raw[token], token)
+            last = _parse_ts(rec.get("last_used_at", ""))
+            if last is not None and (datetime.now(timezone.utc) - last).total_seconds() < 300:
+                return
+            rec["last_used_at"] = _utc_now_iso()
+            raw[token] = rec
+            _save_tokens(raw)
     except Exception:
         pass
 
@@ -788,15 +901,17 @@ def add_token(token: str, user: str, role: str = "", scopes=None,
     if not user:
         raise HTTPException(400, detail="user 不能为空")
 
-    raw0 = _read_tokens_raw()
-    if keep_existing_permissions and token in raw0:
-        rec = _normalize_token_record(raw0[token], token)
-        rec["user"] = user
-        raw0[token] = rec
-        _save_tokens(raw0)
-        out = dict(rec)
-        out["token"] = token
-        return out
+    if keep_existing_permissions:
+        with state_lock():
+            raw0 = _read_tokens_raw()
+            if token in raw0:
+                rec = _normalize_token_record(raw0[token], token)
+                rec["user"] = user
+                raw0[token] = rec
+                _save_tokens(raw0)
+                out = dict(rec)
+                out["token"] = token
+                return out
 
     role = (role or "user").strip() or "user"
     if role != "custom" and _role_preset_scopes(role) is None:
@@ -845,20 +960,21 @@ def add_token(token: str, user: str, role: str = "", scopes=None,
             raise HTTPException(400, detail=f"allow_prefixes[{b}] 必须是数组")
         clean_prefixes[b] = [str(x).strip().strip("/") for x in prefixes if str(x).strip()]
 
-    raw = _read_tokens_raw()
-    existing = _normalize_token_record(raw.get(token, {}), token) if token in raw else None
-    rec = _default_token_record(user, role)
-    rec["scopes"] = clean_scopes
-    rec["allow_buckets"] = allow_buckets
-    rec["allow_prefixes"] = clean_prefixes
-    rec["expires_at"] = (expires_at or "").strip()
-    rec["description"] = (description or "").strip()
-    rec["created_by"] = (created_by or "").strip() or "系统/工具"
-    if existing:
-        rec["created_at"] = existing.get("created_at") or rec["created_at"]
-        rec["last_used_at"] = existing.get("last_used_at") or ""
-    raw[token] = rec
-    _save_tokens(raw)
+    with state_lock():
+        raw = _read_tokens_raw()
+        existing = _normalize_token_record(raw.get(token, {}), token) if token in raw else None
+        rec = _default_token_record(user, role)
+        rec["scopes"] = clean_scopes
+        rec["allow_buckets"] = allow_buckets
+        rec["allow_prefixes"] = clean_prefixes
+        rec["expires_at"] = (expires_at or "").strip()
+        rec["description"] = (description or "").strip()
+        rec["created_by"] = (created_by or "").strip() or "系统/工具"
+        if existing:
+            rec["created_at"] = existing.get("created_at") or rec["created_at"]
+            rec["last_used_at"] = existing.get("last_used_at") or ""
+        raw[token] = rec
+        _save_tokens(raw)
     out = dict(rec)
     out["token"] = token
     return out
@@ -866,11 +982,12 @@ def add_token(token: str, user: str, role: str = "", scopes=None,
 
 def remove_token(token: str) -> dict:
     token = (token or "").strip()
-    raw = _read_tokens_raw()
-    if token not in raw:
-        raise HTTPException(404, detail="token 不存在")
-    rec = _normalize_token_record(raw.pop(token), token)
-    _save_tokens(raw)
+    with state_lock():
+        raw = _read_tokens_raw()
+        if token not in raw:
+            raise HTTPException(404, detail="token 不存在")
+        rec = _normalize_token_record(raw.pop(token), token)
+        _save_tokens(raw)
     return {"removed": token, "user": rec.get("user", "")}
 
 
@@ -909,19 +1026,20 @@ def _merge_datahub_users(users) -> dict:
     - 已存在 token：仅更新 user 名（保留 role/scopes/资源范围/过期）
     - 新 token：按默认 role=user 建立记录（与旧行为一致）
     """
-    raw = _read_tokens_raw()
-    for u in users or []:
-        tok = (u.get("api_token") or "").strip()
-        name = (u.get("name") or "").strip()
-        if not tok or not name:
-            continue
-        if tok in raw:
-            rec = _normalize_token_record(raw[tok], tok)
-            rec["user"] = name
-        else:
-            rec = _default_token_record(name, "user")
-        raw[tok] = rec
-    _save_tokens(raw)
+    with state_lock():
+        raw = _read_tokens_raw()
+        for u in users or []:
+            tok = (u.get("api_token") or "").strip()
+            name = (u.get("name") or "").strip()
+            if not tok or not name:
+                continue
+            if tok in raw:
+                rec = _normalize_token_record(raw[tok], tok)
+                rec["user"] = name
+            else:
+                rec = _default_token_record(name, "user")
+            raw[tok] = rec
+        _save_tokens(raw)
     return load_tokens()
 
 
@@ -984,8 +1102,51 @@ def audit(action: str, bucket: str, key: str, actor: str = "",
         rec.update(extra)
     p = _audit_path()
     p.parent.mkdir(parents=True, exist_ok=True)
-    with open(p, "a", encoding="utf-8") as f:
+    fd = os.open(p, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+    with os.fdopen(fd, "a", encoding="utf-8") as f:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    try:
+        os.chmod(p, 0o600)
+    except OSError:
+        pass
+    _maybe_rotate_audit()
+
+
+def _maybe_rotate_audit() -> None:
+    """audit.log 超过 config.audit_max_mb 时轮转，保留 audit_backups 个历史文件。"""
+    p = _audit_path()
+    max_mb = int(get_config().get("audit_max_mb", 50) or 0)
+    if max_mb <= 0:
+        return
+    try:
+        if p.stat().st_size < max_mb * 1024 * 1024:
+            return
+    except OSError:
+        return
+    backups = max(1, int(get_config().get("audit_backups", 5) or 5))
+    with state_lock():
+        try:
+            if p.stat().st_size < max_mb * 1024 * 1024:
+                return
+        except OSError:
+            return
+        oldest = p.with_name(f"audit.log.{backups}")
+        try:
+            if oldest.exists():
+                oldest.unlink()
+        except OSError:
+            pass
+        for i in range(backups - 1, 0, -1):
+            src = p.with_name(f"audit.log.{i}")
+            if src.exists():
+                try:
+                    os.replace(src, p.with_name(f"audit.log.{i + 1}"))
+                except OSError:
+                    pass
+        try:
+            os.replace(p, p.with_name("audit.log.1"))
+        except OSError:
+            pass
 
 
 def query_audit(bucket: str = "", key: str = "", actor: str = "",
@@ -993,30 +1154,39 @@ def query_audit(bucket: str = "", key: str = "", actor: str = "",
     """按条件过滤审计记录（返回最近 limit 条，倒序）"""
     if limit <= 0:
         return []
-    p = _audit_path()
-    if not p.exists():
-        return []
-    result = []
-    with open(p, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rec = json.loads(line)
-            except Exception:
-                continue
-            if bucket and rec.get("bucket") != bucket:
-                continue
-            if key and rec.get("key", "") != key:
-                continue
-            if actor and rec.get("actor") != actor:
-                continue
-            if since and rec.get("time", "") < since:
-                continue
-            rec["time"] = _ensure_utc_z(rec.get("time", ""))
-            result.append(rec)
-    return result[-limit:]
+    base = _audit_path()
+    backups = max(0, int(get_config().get("audit_backups", 5) or 5))
+    # 从最旧到最新读取：audit.log.N ... audit.log.1, audit.log
+    paths = [base.with_name(f"audit.log.{i}") for i in range(backups, 0, -1)]
+    paths.append(base)
+    out = deque(maxlen=limit)   # 只保留最近 limit 条，避免全量读入内存
+    for p in paths:
+        if not p.exists():
+            continue
+        try:
+            f = open(p, encoding="utf-8")
+        except OSError:
+            continue
+        with f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                if bucket and rec.get("bucket") != bucket:
+                    continue
+                if key and rec.get("key", "") != key:
+                    continue
+                if actor and rec.get("actor") != actor:
+                    continue
+                if since and rec.get("time", "") < since:
+                    continue
+                rec["time"] = _ensure_utc_z(rec.get("time", ""))
+                out.append(rec)
+    return list(out)
 
 
 # ---------------------------------------------------------------------------
@@ -1027,22 +1197,98 @@ def _chunk_dir() -> Path:
     return Path(tempfile.gettempdir()) / "dw_chunks"
 
 
+# upload_id 由服务端 secrets.token_urlsafe(16) 生成（22 个 [A-Za-z0-9_-] 字符）。
+# 客户端回传时必须严格匹配该字符集：否则 `Path(base) / "../../x"` 或绝对路径
+# （如 "/"）会逃出 /tmp/dw_chunks，abort 时 shutil.rmtree 可删除任意目录（严重漏洞）。
+_UPLOAD_ID_RE = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
+MAX_TOTAL_CHUNKS = 100000          # total_chunks 上限，避免超大 range 循环 DoS
+MAX_CHUNK_BYTES = 64 * 1024 * 1024       # 单分片上限 64MB（前端分片 8MB，留足余量）
+MAX_SESSION_BYTES = 200 * 1024 ** 3      # max_upload_mb=0 时的会话硬上限 200GB，防 /tmp 写满
+_SESSION_META = ".session.json"
+
+
+def _validate_upload_id(upload_id: str) -> str:
+    uid = (upload_id or "").strip()
+    if not _UPLOAD_ID_RE.match(uid):
+        raise HTTPException(400, detail="非法或无效的 upload_id")
+    return uid
+
+
 def _chunk_session_path(upload_id: str) -> Path:
-    return _chunk_dir() / upload_id
+    """分片会话目录；严格校验 upload_id，并二次确认解析结果落在会话根内。"""
+    uid = _validate_upload_id(upload_id)
+    base = _chunk_dir().resolve()
+    d = (base / uid).resolve()
+    if not d.is_relative_to(base):
+        raise HTTPException(400, detail="非法或无效的 upload_id")
+    return d
 
 
 def _chunk_part_path(upload_id: str, index: int) -> Path:
-    return _chunk_dir() / upload_id / f"chunk_{index}.part"
+    return _chunk_session_path(upload_id) / f"chunk_{index}.part"
 
 
-def create_chunk_session() -> str:
-    """创建分片上传会话，返回 upload_id
+def _session_meta_path(upload_id: str) -> Path:
+    return _chunk_session_path(upload_id) / _SESSION_META
+
+
+def _write_session_meta(upload_id: str, meta: dict) -> None:
+    try:
+        _atomic_write_text(_session_meta_path(upload_id),
+                           json.dumps(meta, ensure_ascii=False), mode=0o600)
+    except OSError:
+        pass
+
+
+def _load_chunk_session(upload_id: str):
+    """返回 (会话目录, 元数据)；目录不存在返回 (None, {})。会校验 upload_id 合法性。"""
+    d = _chunk_session_path(upload_id)
+    if not d.is_dir():
+        return None, {}
+    meta = {}
+    p = d / _SESSION_META
+    if p.is_file():
+        try:
+            val = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(val, dict):
+                meta = val
+        except Exception:
+            meta = {}
+    return d, meta
+
+
+def get_chunk_session(upload_id: str) -> dict:
+    """读取分片会话元数据（不存在返回 {}）。"""
+    return _load_chunk_session(upload_id)[1]
+
+
+def _assert_session_access(upload_id: str, actor: str = "", is_admin: bool = False):
+    """校验会话存在且归属当前主体，返回 (会话目录, 元数据)。
+
+    新会话一律绑定创建者；历史无 owner 的会话按“无主”放行（向后兼容）。
+    """
+    d, meta = _load_chunk_session(upload_id)
+    if d is None:
+        raise HTTPException(400, detail=f"无效或已失效的分片会话：{upload_id}")
+    owner = (meta.get("owner") or "").strip()
+    if owner and not is_admin and (actor or "").strip() != owner:
+        raise HTTPException(403, detail="无权访问该分片会话")
+    return d, meta
+
+
+def create_chunk_session(owner: str = "") -> str:
+    """创建分片上传会话，返回 upload_id；会话绑定创建者，避免被他人接管。
 
     顺手清理过期会话：客户端 abort 前崩溃/关页会残留 /tmp/dw_chunks/<id>，
     无 TTL 就永久堆积占满磁盘；这里把 mtime 超过 CHUNK_SESSION_TTL 的旧会话删掉。"""
     upload_id = secrets.token_urlsafe(16)
-    d = _chunk_dir() / upload_id
+    d = _chunk_session_path(upload_id)
     d.mkdir(parents=True, exist_ok=True)
+    _write_session_meta(upload_id, {
+        "owner": (owner or "").strip(),
+        "created_at": _utc_now_iso(),
+        "received_bytes": 0,
+    })
     cleanup_stale_chunk_sessions()
     return upload_id
 
@@ -1061,7 +1307,7 @@ def cleanup_stale_chunk_sessions() -> int:
     now = time.time()
     removed = 0
     for d in root.iterdir():
-        if not d.is_dir():
+        if not d.is_dir() or d.is_symlink():
             continue
         try:
             if now - d.stat().st_mtime < CHUNK_SESSION_TTL:
@@ -1073,19 +1319,41 @@ def cleanup_stale_chunk_sessions() -> int:
     return removed
 
 
-def store_chunk(upload_id: str, index: int, src_path: Path) -> dict:
-    """保存一个分片（src_path 是已落盘临时文件）到会话目录"""
-    d = _chunk_session_path(upload_id)
-    if not d.exists():
-        raise HTTPException(400, detail=f"无效或已失效的分片会话：{upload_id}")
-    if not isinstance(index, int) or index < 0 or index > 99999:
-        raise HTTPException(400, detail=f"非法分片索引：{index}")
-    part = _chunk_part_path(upload_id, index)
-    # 原子写入
-    tmp = part.with_suffix(".part.tmp")
-    shutil.copyfile(src_path, tmp)
-    tmp.rename(part)
-    return {"upload_id": upload_id, "index": index, "size": part.stat().st_size}
+def _session_size_limit() -> int:
+    """会话总大小上限：优先 max_upload_mb，未配置时用 MAX_SESSION_BYTES 兜底。"""
+    max_mb = int(get_config().get("max_upload_mb", 0) or 0)
+    return max_mb * 1024 * 1024 if max_mb else MAX_SESSION_BYTES
+
+
+def store_chunk(upload_id: str, index: int, src_path: Path,
+                actor: str = "", is_admin: bool = False) -> dict:
+    """保存一个分片（src_path 是已落盘临时文件）到会话目录。
+
+    在 state_lock 内完成「配额校验 + 落盘 + 更新 received_bytes」，避免并发分片
+    绕过 max_upload_mb、或把 /tmp 写满。
+    """
+    size = src_path.stat().st_size
+    if size > MAX_CHUNK_BYTES:
+        raise HTTPException(413,
+            detail=f"单个分片超过上限 {MAX_CHUNK_BYTES // (1024 * 1024)}MB")
+    with state_lock():
+        _d, meta = _assert_session_access(upload_id, actor, is_admin)
+        if not isinstance(index, int) or index < 0 or index >= MAX_TOTAL_CHUNKS:
+            raise HTTPException(400, detail=f"非法分片索引：{index}")
+        part = _chunk_part_path(upload_id, index)
+        old_size = part.stat().st_size if part.exists() else 0
+        total = int(meta.get("received_bytes") or 0)
+        limit = _session_size_limit()
+        if total - old_size + size > limit:
+            raise HTTPException(413,
+                detail=f"超过单文件上传上限 {limit // (1024 * 1024)}MB")
+        # 原子写入
+        tmp = part.with_suffix(".part.tmp")
+        shutil.copyfile(src_path, tmp)
+        tmp.rename(part)
+        meta["received_bytes"] = total - old_size + size
+        _write_session_meta(upload_id, meta)
+    return {"upload_id": upload_id, "index": index, "size": size}
 
 
 def _sum_chunk_sizes(upload_id: str, total_chunks: int) -> int:
@@ -1110,13 +1378,13 @@ def _merge_chunks(upload_id: str, total_chunks: int, out_path: Path) -> None:
 
 def finalize_chunk_upload(upload_id: str, bucket: str, key: str, total_chunks: int,
                           source_url: str = "", uploader: str = "",
-                          overwrite: bool = True) -> dict:
+                          overwrite: bool = True,
+                          actor: str = "", is_admin: bool = False) -> dict:
     """合并分片并写入仓库"""
-    if total_chunks < 1:
-        raise HTTPException(400, detail="total_chunks 必须 >= 1")
-    d = _chunk_session_path(upload_id)
-    if not d.exists():
-        raise HTTPException(400, detail=f"无效或已失效的分片会话：{upload_id}")
+    d, _meta = _assert_session_access(upload_id, actor, is_admin)
+    if not isinstance(total_chunks, int) or total_chunks < 1 or total_chunks > MAX_TOTAL_CHUNKS:
+        raise HTTPException(400,
+            detail=f"total_chunks 必须在 1-{MAX_TOTAL_CHUNKS} 之间")
     # 检查分片齐全
     for i in range(total_chunks):
         if not _chunk_part_path(upload_id, i).exists():
@@ -1138,8 +1406,11 @@ def finalize_chunk_upload(upload_id: str, bucket: str, key: str, total_chunks: i
     return result
 
 
-def abort_chunk_session(upload_id: str) -> dict:
-    d = _chunk_session_path(upload_id)
-    if d.exists():
-        shutil.rmtree(d, ignore_errors=True)
-    return {"aborted": upload_id}
+def abort_chunk_session(upload_id: str, actor: str = "", is_admin: bool = False) -> dict:
+    """取消分片会话：校验 upload_id 合法性与归属后删除会话目录（幂等）。"""
+    d, _ = _load_chunk_session(upload_id)   # 非法 upload_id 直接 400
+    if d is None:
+        return {"aborted": upload_id, "existed": False}
+    _assert_session_access(upload_id, actor, is_admin)
+    shutil.rmtree(d, ignore_errors=True)
+    return {"aborted": upload_id, "existed": True}
