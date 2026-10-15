@@ -211,9 +211,8 @@ image_tag() {
 
   case "$mode" in
     dynamic)
-      local t="${CLI_TAG:-$DEFAULT_TAG}"
-      [[ -n "$t" ]] || die "镜像 [$id] 是 dynamic tag，但未提供 --tag 且 DEFAULT_TAG 为空"
-      printf '%s' "$t"
+      # 实际取值由 resolve_tag_early() 在主 shell 内解析好，避免 die 落在子 shell 里失效
+      printf '%s' "$RESOLVED_TAG"
       ;;
     fixed)
       local v
@@ -252,6 +251,46 @@ expand_save_name() {
   s="${s//\$\{REGISTRY\}/${REGISTRY}}"
   s="${s//\$\{PROJECT_ID\}/${PROJECT_ID}}"
   printf '%s' "$s"
+}
+
+# ---------- 版本唯一源 ----------
+# 版本号只写在项目根 VERSION 文件里（build_image.conf 的 DEFAULT_TAG 留空即自动读取）。
+# 优先级：--tag 命令行 > VERSION 文件 > build_image.conf 的 DEFAULT_TAG
+read_version_file() {
+  local f="$SCRIPT_DIR/VERSION"
+  [[ -f "$f" ]] || return 0
+  grep -m1 -oE '[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?' "$f" 2>/dev/null | head -1
+}
+
+resolve_build_version() {
+  if [[ -n "${CLI_TAG:-}" ]]; then
+    printf '%s' "$CLI_TAG"
+    return
+  fi
+  local v=""
+  v="$(read_version_file)"
+  if [[ -z "$v" ]]; then
+    v="$DEFAULT_TAG"
+  fi
+  [[ -n "$v" ]] || die "未能确定版本：VERSION 文件与 build_image.conf 的 DEFAULT_TAG 都为空"
+  printf '%s' "$v"
+}
+
+# 在主 shell 内解析版本（必须在构建前调用：resolve_build_version 里的 die 只有
+# 在 main shell 执行才能真正终止脚本）
+RESOLVED_TAG=""
+resolve_tag_early() {
+  local id mode
+  for id in "$@"; do
+    mode="$(image_field IMAGE_TAG_MODE "$id")"
+    mode="${mode:-dynamic}"
+    if [[ "$mode" == "dynamic" ]]; then
+      RESOLVED_TAG="$(resolve_build_version)"
+      return 0
+    fi
+  done
+  RESOLVED_TAG=""
+  return 0
 }
 
 # ---------- 参数解析 ----------
@@ -381,6 +420,9 @@ for id in "${SELECTED_IMAGES[@]}"; do
   [[ "$found" == true ]] || die "镜像 [$id] 不在 IMAGE_IDS 配置里"
 done
 
+# 版本早绑定：在主 shell 内解析（VERSION 文件优先），非法配置在此直接退出
+resolve_tag_early "${SELECTED_IMAGES[@]}"
+
 # ---------- 检测容器工具 ----------
 detect_tool() {
   local tool
@@ -491,6 +533,11 @@ build_extra_args() {
 
   platform="$(image_field IMAGE_PLATFORM "$id")"
   [[ -n "$platform" ]] && args+=(--platform "$platform")
+
+  # 把版本号传给 Dockerfile（LABEL org.opencontainers.image.version）
+  if [[ -n "$RESOLVED_TAG" ]]; then
+    args+=(--build-arg "APP_VERSION=$RESOLVED_TAG")
+  fi
 
   if [[ "$TOOL" == "podman" ]] && is_true "$(image_podman_format_docker "$id")"; then
     args+=(--format docker)

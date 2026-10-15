@@ -166,9 +166,12 @@ cd ArtifactDepot
 ./dev_start_headless.sh stop        # 停止
 ```
 
-或 `./scripts/start.sh`（自动找带 uvicorn 的 python；`--port` / `--config` 可选）。
+端口默认 8004，可用环境变量 `AD_PORT` 覆盖（`AD_PORT=8090 ./dev_start_headless.sh start`）。
+启动命令等价于（需要当前环境里的 `python3` 已装 `uvicorn`/`fastapi`）：
 
-端口默认 8004，可用环境变量 `AD_PORT` 覆盖（`AD_PORT=8090 ./dev_start_headless.sh start`，`scripts/start.sh` 同样透传 `--port`）。
+```bash
+PYTHONPATH=src python3 -m uvicorn artifactdepot.main:app --host 0.0.0.0 --port 8004
+```
 
 ### 容器部署（带自启）
 
@@ -337,8 +340,7 @@ ArtifactDepot/
 - docker/supervisord.conf         # supervisor 托管 uvicorn（8004）
 - build_image.sh                  # 构建脚本：构建 + 自动导出 tar（默认 --save）
 - deploy_container.sh             # 部署脚本：建容器 + Podman systemd / Docker restart（--config/--meta-dir/--token/--datahub-url/--data-dir/--port-map）
-- dev_start_headless.sh           # 本地后台启动脚本
-- scripts/start.sh                # 本地启动脚本（自动找带 uvicorn 的 python）
+- dev_start_headless.sh           # 本地后台启动脚本（源码模式直启 uvicorn）
 - src/artifactdepot/
   - main.py                       # FastAPI 入口 + lifespan（建目录 + 启动同步）
   - config/                       # 配置包：__init__.py（加载/手动重载）+ config.json + config.production.json + .env(.example)
@@ -621,7 +623,7 @@ curl -X POST -H "Authorization: Bearer $ADMIN" "$BASE/api/tokens/sync"
 | 访问 `:8002` 连接被重置 | collab 容器默认只映射 8003；用多端口部署把 8002 也 `-p` 出来，并确认 DataHub 绑 `0.0.0.0` |
 | 点 Swagger / ReDoc 打不开或样式为空 | 0.7.3 起 Swagger UI / ReDoc 静态资源已自托管在 `/static/`，内网/离线可用；若仍异常请确认镜像包含 `src/artifactdepot/resources/static/`。也可用公开只读接口 `GET /api/docs`（清单）与 `GET /api/docs/{name}?raw=1`（Markdown 原文） |
 | 大文件上传「没反应」 | 看进度条；uvicorn 访问日志在**请求完成后**才打印，传输期间终端安静是正常的 |
-| 启动报 `No module named uvicorn` | `python3` 解析到无 uvicorn 的 `/usr/bin/python3`；`scripts/start.sh` 已自动探测 |
+| 启动报 `No module named uvicorn` | 当前 `python3` 未安装运行依赖；执行 `pip install -r requirements.txt`，或让 `python3` 指向已装依赖的解释器 |
 | 容器里服务反复退出 | 缺 `python-multipart`（上传必需）；确认镜像构建时已安装 |
 
 ---

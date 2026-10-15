@@ -3,8 +3,8 @@
 # ArtifactDepot 开发环境一键启动脚本（无图形 / SSH 版）
 # 后台运行数据仓库服务，日志写到 logs/ 目录
 #
-#  服务           命令                      端口    日志文件
-#  ArtifactDepot  bash scripts/start.sh     8004    logs/artifactdepot.log
+#  服务           命令                                                  端口    日志文件
+#  ArtifactDepot  python3 -m uvicorn artifactdepot.main:app --port 8004  8004    logs/artifactdepot.log
 #
 # 用法：
 #   ./dev_start_headless.sh            # 后台启动
@@ -25,7 +25,9 @@ mkdir -p "$LOGDIR"
 # ---------- 服务配置 ----------
 SERVICE_DIR="${ROOT}"
 HOST_PORT="${AD_PORT:-8004}"           # 服务端口（可用 AD_PORT 环境变量覆盖）
-START_CMD="bash scripts/start.sh --port ${HOST_PORT}"   # 复用项目的启动脚本（自动找带 uvicorn 的 python，并传端口）
+CONFIG_FILE="${ARTIFACT_DEPOT_CONFIG:-${ROOT}/src/artifactdepot/config/config.json}"
+# 直接以源码模式启动（不再依赖 scripts/start.sh；PYTHONPATH 指向 src）
+START_CMD="env PYTHONPATH=src ARTIFACT_DEPOT_CONFIG=${CONFIG_FILE} python3 -m uvicorn artifactdepot.main:app --host 0.0.0.0 --port ${HOST_PORT}"
 
 # ---------- 当前主机 IP（打印服务地址用） ----------
 HOST_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"

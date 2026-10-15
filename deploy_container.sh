@@ -46,8 +46,20 @@ set -euo pipefail
 : "${HOME:?HOME 未设置}"
 
 # ---------- 可配置参数（按需修改） ----------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# 版本唯一源：项目根 VERSION 文件；可用环境变量 IMAGE_TAG 覆盖
+_resolve_image_tag() {
+  if [ -n "${IMAGE_TAG:-}" ]; then printf '%s' "$IMAGE_TAG"; return; fi
+  if [ -f "$SCRIPT_DIR/VERSION" ]; then
+    _v="$(grep -m1 -oE '[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?' "$SCRIPT_DIR/VERSION" 2>/dev/null | head -1)"
+    if [ -n "$_v" ]; then printf '%s' "$_v"; return; fi
+  fi
+  printf '0.7.3'   # 兜底：VERSION 缺失时使用上次已知版本
+}
+
 IMAGE_NAME="artifactdepot"           # 镜像名
-IMAGE_TAG="0.7.3"                    # 镜像版本标签
+IMAGE_TAG="$(_resolve_image_tag)"    # 镜像版本标签（取自 VERSION 文件）
 FULL_IMAGE="localhost/${IMAGE_NAME}:${IMAGE_TAG}"
 CONTAINER_NAME="artifactdepot"       # 容器名
 HOST_PORT="8004"                     # 宿主机映射端口（仅 --port-map 使用）
@@ -110,6 +122,7 @@ usage() {
   -h, --help             显示本帮助
 
 环境变量:
+  IMAGE_TAG                     覆盖镜像版本标签（默认读项目根 VERSION 文件）
   FORCE=podman|docker           强制指定容器工具
   ARTIFACT_DEPOT_ACCESS_TOKEN        默认 token
   ARTIFACT_DEPOT_DATAHUB_URL         默认 DataHub 地址

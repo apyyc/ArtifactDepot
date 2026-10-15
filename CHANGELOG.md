@@ -9,6 +9,31 @@ ArtifactDepot v0.7.3 — 所有对本项目的重要更改都将记录在此文�
 
 ## [Unreleased]
 
+### Added
+
+- **开源许可证**：项目以 Apache License 2.0 授权（SPDX `Apache-2.0`）。
+  新增 `LICENSE`（英文原文）、`LICENSE.zh-CN.md`（中文版）、`LICENSE-HEADER`（源文件署名模板）；
+  README「许可证与支持」章节同步更新；许可证通过 `GET /api/docs/license`、`GET /api/docs/license_zh`
+  公开只读提供，满足 Apache-2.0 第 4(a) 条「向接收者提供许可证副本」。
+- **版本唯一源**：新增项目根 `VERSION` 文件，版本号不再散落各处。
+  `build_image.sh`（`--tag` > `VERSION` > `DEFAULT_TAG`）、`deploy_container.sh`（可用 `IMAGE_TAG` 覆盖）、
+  `main.py`（FastAPI `version`）、Dockerfile（`ARG APP_VERSION` → OCI 版本标签）均从该文件读取。
+
+### Changed
+
+- **代理配置**：`build_image.conf` 新增 `PROXY_MODE=set` 与 `PROXY_URL`，可把代理地址（含账密）写在配置里；
+  构建日志中的账密自动打码为 `***:***@`。
+- 移除 `scripts/start.sh`（本地启动改由 `dev_start_headless.sh` 直接以源码模式启动）；
+  `dev_common.sh` 一并移除。
+
+### Fixed
+
+- **业务数据脱离版本控制**：`warehouse/` 下的视频等产物曾误入 git（历史中约 51 MiB），
+  现已移出索引并加入 `.gitignore` / `.dockerignore`。
+- `.dockerignore` 中 `test/` 更正为 `tests/`（该规则从未生效），并补充 `warehouse/`、
+  `.pytest_cache/`、`COPYRIGHT-DECLARATION.md`。
+- 修复构建脚本中 `die` 落在子 shell 导致非法配置仍继续构建的问题（版本与代理配置校验移至主 shell 执行）。
+
 ### Tests
 
 - 新增 `tests/test_acceptance_batch4.py`（32 例）与 `tests/conftest.py`（隔离真实 `.env`）：

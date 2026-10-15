@@ -50,7 +50,7 @@ ArtifactDepot/
 ├── docs/
 │   ├── api_rules.md              # 对外接口文档（也由 /api/docs 提供原文）
 │   └── architecture.md           # 本文档
-├── scripts/start.sh              # 本地启动脚本
+├── dev_start_headless.sh         # 本地后台启动（源码模式直启 uvicorn）
 ├── build_image.sh                # 构建 + 自动导出 tar
 ├── deploy_container.sh           # 部署（host 网络默认 + --config/VOLUME_MAPS）
 └── src/artifactdepot/

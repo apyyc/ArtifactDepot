@@ -12,3 +12,4 @@ signed_links.json
 audit.log
 # 版权归属声明（含真实姓名，仅本地留存，不进 git）
 COPYRIGHT-DECLARATION.md
+warehouse/

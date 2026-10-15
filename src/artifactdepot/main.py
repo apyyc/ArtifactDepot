@@ -27,6 +27,28 @@ from artifactdepot.web.ui import router as web_router
 logger = logging.getLogger("artifactdepot")
 
 
+def _app_version() -> str:
+    """版本唯一源：项目根 VERSION 文件；取不到则回退到内置版本。
+
+    开发态路径为 <repo>/src/artifactdepot/main.py -> parents[2] = <repo>；
+    容器内 /app/artifactdepot/src/artifactdepot/main.py -> parents[2] = /app/artifactdepot
+    （构建时 Dockerfile 已把 VERSION 复制进去）。
+    """
+    try:
+        for base in (Path(__file__).resolve().parents[2], Path(__file__).resolve().parents[3]):
+            f = base / "VERSION"
+            if f.is_file():
+                v = f.read_text(encoding="utf-8").strip().splitlines()[0].strip()
+                if v:
+                    return v
+    except OSError:
+        pass
+    return "0.7.3"
+
+
+APP_VERSION = _app_version()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # 访问日志脱敏（token 等 query 参数不入日志）+ 结构化日志/指标
@@ -48,7 +70,7 @@ async def lifespan(app: FastAPI):
 _STATIC_DIR = Path(__file__).resolve().parent / "resources" / "static"
 _FAVICON = ("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=")
 
-app = FastAPI(title="ArtifactDepot - Object Storage", version="0.7.3", lifespan=lifespan,
+app = FastAPI(title="ArtifactDepot - Object Storage", version=APP_VERSION, lifespan=lifespan,
               docs_url=None, redoc_url=None)
 
 # CORS / TrustedHost：默认都不限制（内网部署）；生产按 config 收紧

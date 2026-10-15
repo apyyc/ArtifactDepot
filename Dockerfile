@@ -13,7 +13,9 @@ FROM docker.io/library/python:3.12-alpine
 
 LABEL org.opencontainers.image.title="ArtifactDepot-ObjectStorage"
 LABEL org.opencontainers.image.description="Object storage depot (FastAPI :8004)"
-LABEL org.opencontainers.image.version="0.7.3"
+# 版本号唯一源：项目根 VERSION 文件（由 build_image.sh 用 --build-arg 传入，勿在此写死）
+ARG APP_VERSION=unknown
+LABEL org.opencontainers.image.version="${APP_VERSION}"
 
 # 安装 Supervisor + curl（健康检查用）+ tzdata（容器内统一中国时区）
 # 先把 Alpine apk 源换成清华镜像：官方源 dl-cdn.alpinelinux.org 的 DNS 返回 IPv6，
@@ -33,7 +35,7 @@ RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple \
 WORKDIR /app/artifactdepot
 COPY src/ /app/artifactdepot/src/
 COPY docs/ /app/artifactdepot/docs/
-COPY README.md CHANGELOG.md /app/artifactdepot/
+COPY README.md CHANGELOG.md VERSION /app/artifactdepot/
 COPY LICENSE LICENSE.zh-CN.md LICENSE-HEADER /app/artifactdepot/
 COPY docker/supervisord.conf /etc/supervisor.d/artifactdepot.ini
 

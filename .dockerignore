@@ -7,6 +7,11 @@
 depot/
 logs/
 *.sh
-test/
+tests/
 # 隐私配置绝不进镜像；默认 config/config.json 会进镜像（不含密钥），密钥放 .env
 **/.env
+
+# 业务数据与本地私有文件：不进构建上下文
+warehouse/
+.pytest_cache/
+COPYRIGHT-DECLARATION.md
