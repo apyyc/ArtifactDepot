@@ -20,6 +20,10 @@ CATALOG = (
     ("architecture", "架构说明（docs/architecture.md）", "docs/architecture.md"),
     ("readme", "项目说明（README.md）", "README.md"),
     ("changelog", "变更日志（CHANGELOG.md）", "CHANGELOG.md"),
+    # 许可证：Apache-2.0 第 4(a) 条要求向接收者提供许可证副本，做成可读接口
+    ("license", "Apache License 2.0 英文版（LICENSE）", "LICENSE"),
+    ("license_zh", "Apache License 2.0 中文版（LICENSE.zh-CN.md）", "LICENSE.zh-CN.md"),
+    ("license_header", "源文件署名模板（LICENSE-HEADER）", "LICENSE-HEADER"),
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]

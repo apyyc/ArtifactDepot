@@ -565,7 +565,7 @@ GET /
 单页控制台：目录浏览 + 上传（拖拽/分片）+ 下载 + 新建目录 + 签名链接管理 + Token 管理 + 审计。
 
 - 标签栏右侧提供 **Swagger**（`/docs`）/ **ReDoc**（`/redoc`）入口，由 FastAPI 依据实际路由自动生成；前端资源（`/static/swagger-ui-bundle.js` 等）**自托管**，内网/离线可用；
-- 两者依赖外网 CDN 加载前端资源，内网/离线环境可改用公开只读接口 `GET /api/docs` 查看原始 Markdown。
+- 内网/离线环境也可用公开只读接口 `GET /api/docs` 查看原始 Markdown；许可证（`/api/docs/license`、`/api/docs/license_zh`）同样通过该接口提供，满足 Apache-2.0 第 4(a) 条「向接收者提供许可证副本」的要求。
 
 ### 7.1 文档接口（0.7.1 新增，公开）
 
@@ -575,7 +575,8 @@ GET /api/docs/{name}       # 文档内容（JSON：{name,title,content}）
 GET /api/docs/{name}?raw=1 # 直接返回 text/plain 原文
 ```
 
-`name` 白名单（不可任意路径读取）：`api_rules`（本文档）、`architecture`、`readme`、`changelog`。
+`name` 白名单（不可任意路径读取）：`api_rules`（本文档）、`architecture`、`readme`、`changelog`、
+`license`（Apache-2.0 英文版）、`license_zh`（Apache-2.0 中文版）、`license_header`（源文件署名模板）。
 文档按**项目根**解析（开发态 `<repo>/docs/...`，容器内 `/app/artifactdepot/docs/...`）；
 镜像未包含文档时 `available=false`、获取返回 `404` 并带可读原因。
 

@@ -18,6 +18,13 @@
 #   ./build_image.sh --images                # 只列出配置里的镜像
 #   ./build_image.sh -h | --help
 #
+# 代理:
+#   - build_image.conf 的 PROXY_MODE 决定构建时是否使用代理:
+#       keep  = 继承当前 shell 的 HTTP(S)_PROXY 环境变量
+#       strip = 摘掉环境里的代理，构建全程直连
+#       set   = 用 PROXY_URL 显式注入（可含账号密码）
+#   - 代理地址与账号密码直接写在 build_image.conf 的 PROXY_URL
+#
 # 依赖:
 #   - bash 4+
 #   - podman 或 docker
@@ -62,8 +69,10 @@ DEFAULT_TAG=""
 TOOL_PREFERENCE=(podman docker)
 
 BUILD_NETWORK="host"
-PROXY_MODE="keep"          # keep / strip
+PROXY_MODE="keep"          # keep / strip / set
 PROXY_VARS=(HTTP_PROXY HTTPS_PROXY http_proxy https_proxy)
+PROXY_URL=""               # PROXY_MODE=set 时注入的代理地址（可含账号密码）
+PROXY_NO_PROXY=""          # 可选：不走代理的地址（逗号分隔，仅 set 模式使用）
 
 PODMAN_HTTP_PROXY_FALSE=false
 PODMAN_FORMAT_DOCKER=false
@@ -149,6 +158,35 @@ image_proxy_mode() {
   local v
   v="$(image_field IMAGE_PROXY_MODE "$id")"
   printf '%s' "${v:-$PROXY_MODE}"
+}
+
+image_proxy_url() {
+  printf '%s' "$PROXY_URL"
+}
+
+# 代理配置校验：必须放在主 shell 里执行（build_proxy_env_args 跑在进程替换的子 shell 中，
+# 在里面 die 只会终止子 shell，主流程会带着空参数继续构建）
+validate_proxy_config() {
+  local id="$1"
+  local mode url
+  mode="$(image_proxy_mode "$id")"
+
+  case "$mode" in
+    keep|strip)
+      ;;
+    set)
+      url="$(image_proxy_url "$id")"
+      if [[ -z "$url" ]]; then
+        die "镜像 [$id] 的 PROXY_MODE=set，但代理地址为空：请在 build_image.conf 里填写 PROXY_URL=\"http://用户名:密码@主机:端口/\"（或把 PROXY_MODE 改成 strip/keep）"
+      fi
+      if [[ "$url" != *"://"* ]]; then
+        die "镜像 [$id] 的 PROXY_URL 格式不对（应形如 http://user:pass@host:port/）: $url"
+      fi
+      ;;
+    *)
+      die "镜像 [$id] 的 proxy mode 无效: $mode（只支持 keep / strip / set）"
+      ;;
+  esac
 }
 
 image_podman_http_proxy_false() {
@@ -414,8 +452,23 @@ build_proxy_env_args() {
       ;;
     keep)
       ;;
+    set)
+      local url
+      url="$(image_proxy_url "$id")"
+      if [[ -z "$url" ]]; then
+        die "镜像 [$id] 的 PROXY_MODE=set，但代理地址为空：请在 build_image.conf 里填写 PROXY_URL"
+      fi
+      local p
+      for p in "${PROXY_VARS[@]}"; do
+        printf '%s\0' "$p=$url"
+      done
+      if [[ -n "$PROXY_NO_PROXY" ]]; then
+        printf '%s\0' "NO_PROXY=$PROXY_NO_PROXY"
+        printf '%s\0' "no_proxy=$PROXY_NO_PROXY"
+      fi
+      ;;
     *)
-      die "镜像 [$id] 的 proxy mode 无效: $mode（只支持 keep / strip）"
+      die "镜像 [$id] 的 proxy mode 无效: $mode（只支持 keep / strip / set）"
       ;;
   esac
 }
@@ -463,9 +516,14 @@ build_extra_args() {
 }
 
 # ---------- 执行命令 ----------
+mask_secrets() {
+  # 日志展示用：把 http://user:pass@host 里的账号密码遮掉
+  printf '%s' "$1" | sed -E 's#(//)[^/@[:space:]]+@#\1***:***@#g'
+}
+
 run_cmd() {
   if is_true "$SHOW_COMMANDS" || [[ "$LOG_LEVEL" == "verbose" ]]; then
-    log "➤ $*"
+    log "➤ $(mask_secrets "$*")"
   fi
   "$@"
 }
@@ -553,6 +611,7 @@ build_one() {
   log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
   validate_context "$id"
+  validate_proxy_config "$id"
 
   run_hook "$id" "pre-build" "$(image_field IMAGE_PRE_BUILD_CMD "$id")"
 

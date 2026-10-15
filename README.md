@@ -628,6 +628,8 @@ curl -X POST -H "Authorization: Bearer $ADMIN" "$BASE/api/tokens/sync"
 
 ## 许可证与支持
 
-- **许可证**：本项目未单独声明许可证，随 `ass-Computational` 系统使用。
-- **支持**：问题与建议请联系系统维护者；版本记录见 [CHANGELOG.md](CHANGELOG.md)。
+- **许可证**：Apache License 2.0（SPDX 标识 `Apache-2.0`），英文版见 [LICENSE](LICENSE)，中文版见 [LICENSE.zh-CN.md](LICENSE.zh-CN.md)。
+- **版权**：Copyright 2026 apyyc。
+- **源文件署名**：[LICENSE-HEADER](LICENSE-HEADER) 是官方推荐的源文件署名模板，复制到文件头即可。
+- **支持**：2479511984@qq.com；版本记录见 [CHANGELOG.md](CHANGELOG.md)。
 - **相关**：依赖 DataHub（用户/token 权威源）与协作平台（「查看我的 Token」）；处理端对接见 [docs/architecture.md](docs/architecture.md)。

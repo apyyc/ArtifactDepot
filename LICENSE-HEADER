@@ -1,0 +1,42 @@
+Copyright [yyyy] [name of copyright owner]
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+================================================================================
+使用说明（以下内容不属于许可证条款，仅供套用参考）
+
+这是什么
+  Apache License 2.0 官方推荐的“源文件署名模板”（即 LICENSE 文件附录中的
+  APPENDIX: How to apply the Apache License to your work）。把它放在根目录，
+  使用者打开仓库第一眼就能看到许可证名称与获取地址。
+
+怎么用
+  1) 复制上面第一段（到 limitations under the License. 为止）整体粘贴到每个
+     源文件头部，按文件格式加注释符号：
+       Python   # Copyright 2026 apyyc
+                # Licensed under the Apache License, Version 2.0 ...
+       Shell    # 同上
+       HTML/JS  // 或 <!-- -->
+  2) 替换两个占位符：
+       [yyyy]                    首次发布年份，例如 2026
+       [name of copyright owner] 版权所有者名称，例如 apyyc（本项目公开署名）
+  3) 占位符连同方括号一起替换，不要保留方括号。
+
+本项目的实际署名
+  Copyright 2026 apyyc
+
+相关文件
+  LICENSE          许可证英文版
+  LICENSE.zh-CN.md 许可证中文版
+  README.md        「许可证与支持」章节
+================================================================================
