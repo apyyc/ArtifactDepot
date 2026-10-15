@@ -156,10 +156,17 @@ ArtifactDepot/
   - 拷贝 tar 到生产机 → `podman load -i` → `./deploy_container.sh --token <你的管理员token>`
 - **host 网络默认**：容器共享宿主网络，`datahub_url` 用 `127.0.0.1:8002` 直连同机 DataHub；
   `--port-map` 可改回端口映射（不推荐，rootless 桥接常不通）。
-- **config.json 挂载**：`deploy_container.sh` 自动探测 `~/SERVER/artifactdepot/config/config.json`，
-  也可用 `--config <宿主机路径>` 显式挂到容器内 `config/config.json`，生产配置显式可改、无需重建镜像。
-- 数据卷默认 `~/SERVER/artifactdepot/artifactdepot_0.7.4/warehouse` → 容器 `/data/depot`；
-  若该路径不可写，脚本自动回退到 `~/.local/share/artifactdepot/...`。
+- **三卷分离挂载**（`deploy_container.sh`，均不随镜像版本变化，升级后原地沿用）：
+  - `<部署根>/config/` → `/data/config`：配置目录（`config.json` + `.env`），首次运行用
+    `config.production.json` 播种；改完重启容器即生效，无需重建镜像
+  - `<部署根>/data/` → `/data/depot`：业务数据（bucket 与对象）
+  - `<部署根>/state/` → `/data/state`：状态文件（`tokens.json` / `signed_links.json` / `audit.log`）
+  - 默认部署根 `~/SERVER/artifactdepot`；不可写时回退到 `~/.local/share/artifactdepot`
+  - `--deploy-root` 改基目录；`--data-dir` / `--state-dir` / `--config-dir` 单独覆盖；
+    `--config <文件>` 只挂单个 `config.json`（不含 `.env`）
+  - 容器内通过 `ARTIFACT_DEPOT_DIR` / `ARTIFACT_DEPOT_META_DIR` / `ARTIFACT_DEPOT_CONFIG` /
+    `ARTIFACT_DEPOT_ENV` 四个环境变量告知应用实际路径
+  - 旧布局（`artifactdepot_<版本>/warehouse`，状态文件混在数据目录）会被自动检测并打印迁移命令
 - **自启**：Podman 走 `systemd --user`；Docker 走 `--restart=always`。
 - 排障：`bash check_ad_sync.sh` 逐段定位 token 同步链路。
 - 可选 Nginx `location /depot/` 反代到 8004。

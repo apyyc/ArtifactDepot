@@ -44,7 +44,7 @@ load_pid() { SERVICED_PID="$(cat "$PIDFILE" 2>/dev/null || echo "")"; }
 
 # ---------- 后台启动服务 ----------
 start_one() {
-  echo "  ▶ 启动 artifactdepot : $START_CMD"
+  echo "  - 启动 artifactdepot : $START_CMD"
   # 直接在主 shell 后台启动 + disown 脱离任务表 + stdin 脱离，避免脚本在后台服务上 do_wait 挂住不退出
   cd "$SERVICE_DIR" || exit 1
   nohup bash -c "$START_CMD" > "${LOGDIR}/artifactdepot.log" 2>&1 < /dev/null &
@@ -69,21 +69,21 @@ stop_one() {
 check_and_free_port() {
   local port="$1"
   if ss -tlnp 2>/dev/null | grep -q ":${port}\b"; then
-    echo "  ⚠️  端口 ${port} 被占用，清理旧进程 ..."
+    echo "  WARN: 端口 ${port} 被占用，清理旧进程 ..."
     fuser -k "${port}/tcp" 2>/dev/null || pkill -f "uvicorn artifactdepot.main" 2>/dev/null || true
     sleep 1
     if ss -tlnp 2>/dev/null | grep -q ":${port}\b"; then
-      echo "  ❌ 端口 ${port} 仍被占用，可能需要 sudo 清理：sudo fuser -k ${port}/tcp"
+      echo "  ERROR: 端口 ${port} 仍被占用，可能需要 sudo 清理：sudo fuser -k ${port}/tcp"
     fi
   fi
 }
 
 # ---------- 启动（供 start / restart 复用） ----------
 do_start() {
-  echo "📁 项目根目录: $ROOT"
-  echo "📄 日志目录:   $LOGDIR"
+  echo "项目根目录: $ROOT"
+  echo "日志目录:   $LOGDIR"
   echo ""
-  echo "🚀 后台启动数据仓库 ..."
+  echo "后台启动数据仓库 ..."
 
   # 先停旧进程 + 端口预检
   load_pid
@@ -95,7 +95,7 @@ do_start() {
   save_pid
 
   echo ""
-  echo "✅ 已后台启动。"
+  echo "OK: 已后台启动。"
   echo "   查看日志:  ./dev_start_headless.sh tail"
   echo "   查看状态:  ./dev_start_headless.sh status"
   echo "   停止:      ./dev_start_headless.sh stop"
@@ -112,12 +112,12 @@ do_start() {
 
 # ---------- 停止（供 stop / restart 复用） ----------
 do_stop() {
-  echo "🛑 停止数据仓库 ..."
+  echo "停止数据仓库 ..."
   load_pid
   stop_one
   pkill -f "uvicorn artifactdepot.main" 2>/dev/null && echo "  ⏹  清理残留 uvicorn 进程" || true
   rm -f "$PIDFILE"
-  echo "✅ 已停止"
+  echo "OK: 已停止"
 }
 
 # ---------- 主逻辑 ----------
@@ -132,26 +132,26 @@ case "$CMD" in
     ;;
 
   restart)
-    echo "🔄 重启数据仓库 ..."
+    echo "重启数据仓库 ..."
     do_stop
     sleep 1
     do_start
     ;;
 
   status)
-    echo "📊 服务状态："
+    echo "服务状态："
     load_pid
     pid="${SERVICED_PID:-}"
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-      echo "  ✅ artifactdepot  运行中 (PID $pid)"
+      echo "  OK: artifactdepot  运行中 (PID $pid)"
     else
       if curl -s -m 2 "http://127.0.0.1:${HOST_PORT}/health" >/dev/null 2>&1; then
-        echo "  ✅ artifactdepot  运行中（端口响应）"
+        echo "  OK: artifactdepot  运行中（端口响应）"
       else
         if tail -n 3 "${LOGDIR}/artifactdepot.log" 2>/dev/null | grep -qiE "error|exception|failed"; then
-          echo "  ❌ artifactdepot  已退出（日志有错误）"
+          echo "  ERROR: artifactdepot  已退出（日志有错误）"
         else
-          echo "  ⚠️  artifactdepot  未检测到 PID（可能已退出，看日志）"
+          echo "  WARN: artifactdepot  未检测到 PID（可能已退出，看日志）"
         fi
       fi
     fi
@@ -160,12 +160,12 @@ case "$CMD" in
     ;;
 
   logs)
-    echo "📄 日志文件（$LOGDIR）："
+    echo "日志文件（$LOGDIR）："
     ls -lht "${LOGDIR}"/*.log 2>/dev/null | awk '{print "  " $5 "  " $NF}' || echo "  （暂无日志）"
     ;;
 
   tail)
-    echo "🖥  跟踪数据仓库日志（Ctrl+C 退出）..."
+    echo "跟踪数据仓库日志（Ctrl+C 退出）..."
     tail -f "${LOGDIR}/artifactdepot.log" 2>/dev/null || echo "  （暂无日志）"
     ;;
 

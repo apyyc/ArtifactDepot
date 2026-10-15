@@ -98,10 +98,9 @@ cd ArtifactDepot
 ./deploy_container.sh --token <你的管理员token>   # 默认 host 网络；datahub_url 用挂载的 config.json
 ```
 
-> 升级到新版本时数据卷默认指到 `~/SERVER/artifactdepot/artifactdepot_0.7.4/warehouse`（新目录，空）。
-> 若想沿用上一版数据，用 `--data-dir ~/SERVER/artifactdepot/<上一版目录>/warehouse` 指过去，
-> 或把旧数据目录内容拷贝/移动到新目录（`tokens.json` 可让同步从 DataHub 重新生成）。
-> 若 `~/SERVER` 不可写，脚本会自动回退到 `${XDG_DATA_HOME:-~/.local/share}/artifactdepot/artifactdepot_0.7.4/warehouse`。
+> 升级到新版本时挂载目录**不再变化**（三卷固定为 `<部署根>/{config,data,state}`），
+> 直接部署即可原地沿用数据与配置。
+> 若 `~/SERVER` 不可写，脚本会自动回退到 `${XDG_DATA_HOME:-~/.local/share}/artifactdepot/{config,data,state}`。
 
 ---
 
@@ -179,15 +178,28 @@ PYTHONPATH=src python3 -m uvicorn artifactdepot.main:app --host 0.0.0.0 --port 8
 ./deploy_container.sh --token <你的管理员token>
 ```
 
-- **默认 host 网络**：容器共享宿主网络，不再映射端口；容器内 `127.0.0.1` 就是宿主机，同机连 DataHub（`http://127.0.0.1:8002/api/data`）最稳。用 `--port-map` 才改为端口映射（rootless 桥接下容器连宿主发布端口常不通）
-- **自启**：Podman 默认生成 `systemd --user` 服务；Docker 没有 `podman generate systemd`，脚本自动改用 `--restart=always`
-- **非 root**：镜像以 `artifactdepot(10001)` 运行；绑定数据卷时 `deploy_container.sh` 自动以宿主当前 UID/GID 运行（Podman 另加 `--userns=keep-id`），保证挂载目录可写
-- `--token <你的管理员token>` / 环境变量 `ARTIFACT_DEPOT_ACCESS_TOKEN`：注入共享令牌（不传且 config.json 也无 access_token 时，管理/写接口返回 401）。脚本用 **600 权限的临时 env-file** 传递，令牌不出现在命令行（`ps` 看不到），容器创建后立即删除该文件；但 `podman/docker inspect <容器>` 仍可读到，属容器运行时固有行为
-- `--datahub-url <地址>` / 环境变量 `ARTIFACT_DEPOT_DATAHUB_URL`：**显式**注入 DataHub 地址；**不传则不注入**，以容器内配置文件的 `datahub_url` 为准
-- 数据卷默认 `~/SERVER/artifactdepot/artifactdepot_0.7.4/warehouse` 挂到容器 `/data/depot`（`--data-dir` 指定；默认目录不可写时自动回退到 `~/.local/share/artifactdepot/...`）。**目录名含版本号**，升级后会指向新（空）目录；脚本会检测同级其它版本的非空数据目录并提示用 `--data-dir <旧目录>` 沿用旧数据
-- **配置挂载**：脚本自动探测 `~/SERVER/artifactdepot/config/config.json` 或 `~/SERVER/artifactdepot/artifactdepot_0.7.4/config/config.json`；也可用 `--config <宿主机路径>` 显式挂载。容器内挂载点从镜像 `WorkingDir` 推导（不再写死）
-- **额外挂载**：环境变量 `VOLUME_MAPS` 可传空格分隔的 `宿主机路径:容器内路径` 列表（容器内路径须为绝对路径）
-- **meta_dir**：默认不注入 `ARTIFACT_DEPOT_META_DIR`，完全以 config.json 的 `meta_dir` 为准；需要显式覆盖时用 `--meta-dir <容器内路径>`
+**挂载布局：三卷分离，不随镜像版本变化**（升级镜像后数据与配置原地沿用，不再需要每次 `--data-dir` 指旧目录）：
+
+| 宿主机 | 容器内 | 内容 |
+|---|---|---|
+| `<部署根>/config/` | `/data/config` | 配置目录：`config.json` + `.env`（首次运行自动用 `config.production.json` 播种） |
+| `<部署根>/data/` | `/data/depot` | 业务数据：bucket 与对象文件 |
+| `<部署根>/state/` | `/data/state` | 状态文件：`tokens.json` / `signed_links.json` / `audit.log` |
+
+- **默认部署根** `~/SERVER/artifactdepot`；不可写时自动回退到 `${XDG_DATA_HOME:-~/.local/share}/artifactdepot`。可用 `--deploy-root` 或环境变量 `DEPLOY_ROOT` 改基目录
+- **单独指定**：`--data-dir` / `--state-dir` / `--config-dir`；或 `--config <文件>` 只挂单个 `config.json`（此时不挂 `.env`，敏感项请用 `--token` / `--datahub-url` 注入）
+- **配置即文件即生效**：改 `<部署根>/config/config.json` 后重启容器即可，无需重建镜像
+- **默认 host 网络**：容器共享宿主网络，不再映射端口；容器内 `127.0.0.1` 就是宿主机，同机连 DataHub（`http://127.0.0.1:8002/api/data`）最稳。用 `--port-map` 才改为端口映射
+- **自启**：Podman 默认生成 `systemd --user` 服务；Docker 自动改用 `--restart=always`
+- **非 root 运行**：绑定卷时脚本自动以宿主当前 UID/GID 运行（Podman 另加 `--userns=keep-id`），保证挂载目录可写
+- `--token` / `ARTIFACT_DEPOT_ACCESS_TOKEN`：注入共享令牌。脚本用 600 权限临时 env-file 传递，令牌不出现在命令行（`ps` 看不到），容器创建后即删
+- `--datahub-url` / `ARTIFACT_DEPOT_DATAHUB_URL`：显式注入 DataHub 地址；不传则以配置文件里的值为准
+- `--no-volume`：跳过全部挂载（用镜像内数据，删除容器即丢失，仅调试用）
+- `--meta-dir <容器内路径>`：显式覆盖 `meta_dir`（默认已指向状态卷 `/data/state`）
+
+> **从旧版本升级**：0.7.4 之前数据放在 `~/SERVER/artifactdepot/artifactdepot_<版本>/warehouse`（状态文件混在数据目录里）。
+> 部署时脚本会自动检测这类旧目录并打印迁移命令；也可直接用
+> `--data-dir <旧目录> --state-dir <旧目录>` 沿用旧路径。
 
 ### 首次使用流程
 
@@ -219,6 +231,47 @@ ARTIFACT_DEPOT_CONFIG=$(mktemp) PYTHONPATH=src python3 -m pytest tests/test_acce
 ---
 
 ## 配置说明
+
+### 配置读取顺序（后者覆盖前者）
+
+程序启动时按四层叠加，**优先级由低到高**：
+
+| 层 | 来源 | 路径 / 方式 |
+|---|---|---|
+| 1 | 内置默认 | 代码里的 `DEFAULT` 字典（`config/__init__.py`） |
+| 2 | 配置文件 | `ARTIFACT_DEPOT_CONFIG` 指定，否则包内 `config/config.json` |
+| 3 | `.env` | `ARTIFACT_DEPOT_ENV` 指定，否则包内 `config/.env` |
+| 4 | 真实环境变量 | `ARTIFACT_DEPOT_*`（旧 `WAREHOUSE_*` 仅在无新前缀时生效） |
+
+几条容易踩的规则：
+
+- **`.env` 里的空值视为「未设置」**，不会覆盖 `config.json`。例：`config.json` 有 `access_token=abc`，`.env` 写 `access_token=`（空），最终仍是 `abc`
+- **`.env` 支持点号嵌套**：`signed_links.count_max=99` 直接写进嵌套字段
+- **未知配置项只告警不报错**：启动时提示 `未知配置项：xxx（已忽略）`
+- **只有 6 个字段有环境变量入口**：`depot_dir` / `meta_dir` / `datahub_url` / `access_token` / `port` / `max_upload_mb`；其余（如 `ui_enabled`、`signed_links`、`audit_max_mb`）只能靠 `config.json` 或 `.env`
+- **相对路径按「项目根」解析，不是按配置文件所在目录**。`"depot_dir": "./data"` 会解析成 `<仓库根>/data`；**容器部署必须写绝对路径**（如 `/data/depot`）
+
+容器部署时，`deploy_container.sh` 注入第 4 层环境变量：
+
+```
+ARTIFACT_DEPOT_DIR=/data/depot                  # 覆盖 config.json 的 depot_dir
+ARTIFACT_DEPOT_META_DIR=/data/state             # 覆盖 config.json 的 meta_dir
+ARTIFACT_DEPOT_CONFIG=/data/config/config.json  # 第 2 层：指向挂载出来的配置
+ARTIFACT_DEPOT_ENV=/data/config/.env            # 第 3 层：同目录，敏感项放这里
+ARTIFACT_DEPOT_ACCESS_TOKEN=...                 # 仅在使用 --token 时注入
+```
+
+### 三个 config 文件的区别
+
+| 文件 | 位置 | 谁读 | 说明 |
+|---|---|---|---|
+| `config.json` | 仓库内 `src/artifactdepot/config/` | 运行时 | 默认配置，**会进镜像**，无挂载时兜底（`depot_dir=./depot`） |
+| `config.production.json` | 仓库内 `src/artifactdepot/config/` | 仅部署脚本 | **纯模板，运行时从不读取**；首次部署时被复制成下面那份 |
+| `config.json` | `<部署根>/config/`（如 `~/SERVER/artifactdepot/config/`） | 运行时 | **你的生产配置**，独立于仓库，升级镜像不会被覆盖 |
+
+> 结论：**不要**把仓库里的 `config.production.json` 改名为 `config.json`（会覆盖镜像内默认配置）。
+> 要改生产配置，请编辑 `<部署根>/config/config.json`——它由部署脚本首次运行时自动播种。
+
 
 配置文件：`src/artifactdepot/config/config.json`（非敏感项，会进镜像）；**隐私项放 `src/artifactdepot/config/.env`**（字段名=值，如 `access_token=...`，不进 git/镜像）。可用 `ARTIFACT_DEPOT_CONFIG` 指定外部 config.json、`ARTIFACT_DEPOT_ENV` 指定外部 .env。
 
@@ -254,7 +307,7 @@ ARTIFACT_DEPOT_CONFIG=$(mktemp) PYTHONPATH=src python3 -m pytest tests/test_acce
 | 字段 | 默认 | 说明 |
 |---|---|---|
 | `depot_dir` | `./warehouse` | 对象存储根目录。相对路径按**项目根**解析（本地免 sudo）；**容器部署填 `/data/depot` 卷路径** |
-| `meta_dir` | `""` | **状态文件目录**（`tokens.json` / `signed_links.json` / `audit.log`）。留空 = 放在 `depot_dir` 根下；设了则独立存放（相对路径按 `depot_dir` 解析）。生产建议 `"/data/depot/state"`，把可再生的状态文件与业务文件隔离、备份更清晰（0.5.0 新增） |
+| `meta_dir` | `""` | **状态文件目录**（`tokens.json` / `signed_links.json` / `audit.log`）。留空 = 放在 `depot_dir` 根下；设了则独立存放（相对路径按 `depot_dir` 解析）。生产建议 `"/data/state"`（与部署脚本的状态卷挂载点一致），把可再生的状态文件与业务文件隔离、备份更清晰（0.5.0 新增） |
 | `datahub_url` | `http://127.0.0.1:8002/api/data` | 从哪个 DataHub 拉取用户 token（collab 权威源）。**同机 host 网络**部署就用 `127.0.0.1:8002`；跨机用 `http://<IP>:8002/api/data` |
 | `host` | `0.0.0.0` | 监听地址 |
 | `port` | `8004` | 服务端口 |
@@ -309,7 +362,7 @@ cp src/artifactdepot/config/config.production.json ~/SERVER/artifactdepot/config
 ```json
 {
   "depot_dir": "/data/depot",
-  "meta_dir": "/data/depot/state",
+  "meta_dir": "/data/state",
   "datahub_url": "http://127.0.0.1:8002/api/data",
   "host": "0.0.0.0",
   "port": 8004,

@@ -37,7 +37,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONF_FILE="$SCRIPT_DIR/build_image.conf"
 
 if [[ ! -f "$CONF_FILE" ]]; then
-  echo "❌ 未找到构建配置文件: $CONF_FILE" >&2
+  echo "ERROR: 未找到构建配置文件: $CONF_FILE" >&2
   exit 1
 fi
 
@@ -50,11 +50,11 @@ log() {
 }
 
 warn() {
-  printf '⚠️  %s\n' "$*" >&2
+  printf 'WARN: %s\n' "$*" >&2
 }
 
 die() {
-  printf '❌ %s\n' "$*" >&2
+  printf 'ERROR: %s\n' "$*" >&2
   exit 1
 }
 
@@ -570,7 +570,7 @@ mask_secrets() {
 
 run_cmd() {
   if is_true "$SHOW_COMMANDS" || [[ "$LOG_LEVEL" == "verbose" ]]; then
-    log "➤ $(mask_secrets "$*")"
+    log "> $(mask_secrets "$*")"
   fi
   "$@"
 }
@@ -578,7 +578,7 @@ run_cmd() {
 run_hook() {
   local id="$1" phase="$2" cmd="$3"
   [[ -n "$cmd" ]] || return 0
-  log "➤ [$id] $phase hook"
+  log "> [$id] $phase hook"
   (
     cd "$ROOT_DIR"
     bash -c "$cmd"
@@ -592,12 +592,12 @@ save_image() {
   local enabled
   enabled="$(image_field IMAGE_SAVE_ENABLED "$id")"
   if [[ -n "$enabled" ]] && ! is_true "$enabled"; then
-    log "⏭️  跳过导出 [$id]"
+    log "跳过导出 [$id]"
     return 0
   fi
 
   if [[ "$DO_SAVE" == false ]]; then
-    log "⏭️  跳过导出（--no-save）"
+    log "跳过导出（--no-save）"
     return 0
   fi
 
@@ -636,7 +636,7 @@ save_image() {
     fi
   fi
 
-  log "📦 导出镜像: $full_ref → $out"
+  log "导出镜像: $full_ref → $out"
   run_cmd "$TOOL" save -o "$out" "$full_ref"
   SAVED_TARS+=("$out")
 }
@@ -700,7 +700,7 @@ for id in "${SELECTED_IMAGES[@]}"; do
 done
 
 log ""
-log "✅ 构建完成"
+log "OK: 构建完成"
 for ref in "${BUILT_IMAGES[@]}"; do
   log "  - $ref"
 done

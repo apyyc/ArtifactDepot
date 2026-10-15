@@ -13,6 +13,36 @@ ArtifactDepot v0.7.4 — 所有对本项目的重要更改都将记录在此文�
 
 ## [0.7.4] - 2026-10-16
 
+### 部署与挂载重构（无接口变更）
+
+#### Changed
+
+- **挂载框架重做：三卷分离，去掉版本隔离**。此前数据目录名含镜像版本
+  （`<部署根>/artifactdepot_<版本>/warehouse`），升级后默认指向新（空）目录，用户必须每次手动
+  `--data-dir` 指回旧数据。现改为固定三卷，升级镜像原地沿用：
+  - `<部署根>/config/` → `/data/config`：配置目录（`config.json` + `.env`），首次运行用
+    `config.production.json` 播种
+  - `<部署根>/data/` → `/data/depot`：业务数据
+  - `<部署根>/state/` → `/data/state`：状态文件（`tokens.json` / `signed_links.json` / `audit.log`）
+  新增 `--deploy-root`（或环境变量 `DEPLOY_ROOT`）与 `--data-dir` / `--state-dir` / `--config-dir`；
+  `--config <文件>` 只挂单个 `config.json`。容器内以 `ARTIFACT_DEPOT_DIR` /
+  `ARTIFACT_DEPOT_META_DIR` / `ARTIFACT_DEPOT_CONFIG` / `ARTIFACT_DEPOT_ENV` 告知应用实际路径。
+- `config.production.json` 的 `meta_dir` 由 `/data/depot/state` 改为 `/data/state`，与状态卷一致；
+  README 中 `meta_dir` 生产建议同步更新。
+- Dockerfile：`VOLUME` 增列 `/data/state`、`/data/config`，并为其建目录与授权。
+- README 新增「配置读取顺序」与「三个 config 文件的区别」两节，明确四层覆盖规则、
+  `.env` 空值语义、相对路径按项目根解析等易踩坑点。
+- `check_ad_sync.sh` 改为优先读取容器内实际生效的 `ARTIFACT_DEPOT_CONFIG`，
+  回退镜像内路径（此前硬编码，挂载外部配置后读不到真实配置）。
+
+#### Fixed
+
+- `deploy_container.sh` 修复 `--deploy-root` 不生效（三卷在参数解析前派生）、
+  `META_DIR_CONTAINER` 未初始化导致 `set -u` 中断、`ARTIFACT_DEPOT_META_DIR` 被注入两次
+  三个问题。
+- 全部 shell 脚本去除 emoji，统一为 `OK:` / `WARN:` / `ERROR:` / `INFO:` 文本前缀
+  （deploy 58 处、dev_start 18 处、build_image 13 处、check_ad_sync 8 处）。
+
 ### 工程化与发布整理（本版为工程化收尾，无接口变更）
 
 #### Added

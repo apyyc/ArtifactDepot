@@ -38,14 +38,14 @@ USAGE
 esac
 
 if ! command -v python3 >/dev/null 2>&1; then
-  echo "❌ 未找到 python3" >&2
+  echo "ERROR: 未找到 python3" >&2
   exit 1
 fi
 
 if [ -n "${FORCE:-}" ]; then
   TOOL="$FORCE"
   if ! command -v "$TOOL" >/dev/null 2>&1; then
-    echo "❌ FORCE 指定的容器工具不存在: $TOOL" >&2
+    echo "ERROR: FORCE 指定的容器工具不存在: $TOOL" >&2
     exit 1
   fi
 elif command -v podman >/dev/null 2>&1 && podman info >/dev/null 2>&1; then
@@ -53,12 +53,12 @@ elif command -v podman >/dev/null 2>&1 && podman info >/dev/null 2>&1; then
 elif command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
   TOOL="docker"
 else
-  echo "❌ 未检测到可用的 podman 或 docker" >&2
+  echo "ERROR: 未检测到可用的 podman 或 docker" >&2
   exit 1
 fi
 
-echo "🔧 容器工具: $TOOL"
-echo "📦 容器名:   $CONTAINER"
+echo "容器工具: $TOOL"
+echo "容器名:   $CONTAINER"
 echo ""
 
 exec python3 - "$TOOL" "$CONTAINER" <<'PY'
@@ -168,8 +168,17 @@ else:
     info("ARTIFACT_DEPOT_DATAHUB_URL 未注入（datahub_url 以 config.json 为准）")
 
 # --- 4. 容器内 config.json -------------------------------------------------
-config_path = "/app/artifactdepot/src/artifactdepot/config/config.json"
+# 优先用容器内实际生效的 ARTIFACT_DEPOT_CONFIG（部署脚本默认指向 /data/config/config.json），
+# 回退到镜像内配置目录，兼容未挂载外部配置的部署方式。
+def _env_of(name):
+    r = run([tool, "exec", container, "printenv", name])
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+config_path = _env_of("ARTIFACT_DEPOT_CONFIG") or "/data/config/config.json"
 cp = run([tool, "exec", container, "cat", config_path])
+if cp.returncode != 0:
+    config_path = "/app/artifactdepot/src/artifactdepot/config/config.json"
+    cp = run([tool, "exec", container, "cat", config_path])
 config = {}
 if cp.returncode == 0:
     try:
@@ -277,7 +286,7 @@ finally:
 
 print("")
 if fail_count:
-    print(f"❌ 诊断完成，有 {fail_count} 项 FAIL")
+    print(f"ERROR: 诊断完成，有 {fail_count} 项 FAIL")
     sys.exit(1)
-print("✅ 诊断完成，未发现 FAIL")
+print("OK: 诊断完成，未发现 FAIL")
 PY

@@ -42,21 +42,22 @@ COPY docker/supervisord.conf /etc/supervisor.d/artifactdepot.ini
 # 非 root 运行：创建 artifactdepot(10001)，把代码与数据目录归属它
 RUN addgroup -g 10001 artifactdepot \
     && adduser -D -u 10001 -G artifactdepot artifactdepot \
-    && mkdir -p /data/depot \
-    && chown -R artifactdepot:artifactdepot /app /data/depot
+    && mkdir -p /data/depot /data/state /data/config \
+    && chown -R artifactdepot:artifactdepot /app /data/depot /data/state /data/config
 USER artifactdepot
 
 # 环境变量（数据目录挂载点）
 # 注意：ARTIFACT_DEPOT_DATAHUB_URL 不要在这里预设默认值——config/__init__.py 里环境变量优先级
 # 高于配置文件，镜像内烤死的 127.0.0.1 会把挂载 config.json 里的 datahub_url 盖掉
 # （症状：改了配置文件同步仍报 "All connection attempts failed"）。datahub_url 以
-# 容器内配置文件的字段为准；生产用 VOLUME_MAPS 挂载宿主机 config.json 显式填写。
+# 容器内配置文件的字段为准；生产用 deploy_container.sh 的三卷挂载显式提供
+# （/data/config 配置、/data/depot 数据、/data/state 状态）。
 # ARTIFACT_DEPOT_DIR 保留：把数据目录固定到 VOLUME 挂载点 /data/depot。
 ENV ARTIFACT_DEPOT_DIR=/data/depot \
     PYTHONPATH=/app/artifactdepot/src
 
-# 数据卷
-VOLUME ["/data/depot"]
+# 数据卷（部署脚本会分别挂载这三个路径，各自独立可备份）
+VOLUME ["/data/depot", "/data/state", "/data/config"]
 
 EXPOSE 8004
 
