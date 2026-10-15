@@ -1,6 +1,6 @@
 # ArtifactDepot 接口文档
 
-> 版本 0.7.3 · FastAPI 服务 · 默认端口 8004
+> 版本 0.7.4 · FastAPI 服务 · 默认端口 8004
 >
 > 0.7.1 变更：新增 `GET /api/docs`（公开、只读文档清单 + 内容，供查看原始 Markdown）；网页 UI 标签栏右侧提供 Swagger / ReDoc 入口（FastAPI 自动生成，可在线调试）；修复两处与文档语义不一致的问题：`scopes: []` 现在真正表示「无权限」（此前会被回退成角色预设），`require_read_token=true` 时资源范围外调用 `GET /api/objects/list` 返回 `403`（此前会忽略范围过滤、返回白名单外 bucket 的内容）。
 >

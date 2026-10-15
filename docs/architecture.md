@@ -1,6 +1,6 @@
 # ArtifactDepot 架构说明
 
-> 版本 **0.7.3**
+> 版本 **0.7.4**
 
 ## 定位
 
@@ -152,13 +152,13 @@ ArtifactDepot/
 ## 部署
 
 - **build → save → 拷贝 → load → deploy**：
-  - 开发机 `./build_image.sh`（构建 + 自动导出 `artifactdepot-0.7.3.tar`）
+  - 开发机 `./build_image.sh`（构建 + 自动导出 `artifactdepot-0.7.4.tar`）
   - 拷贝 tar 到生产机 → `podman load -i` → `./deploy_container.sh --token <你的管理员token>`
 - **host 网络默认**：容器共享宿主网络，`datahub_url` 用 `127.0.0.1:8002` 直连同机 DataHub；
   `--port-map` 可改回端口映射（不推荐，rootless 桥接常不通）。
 - **config.json 挂载**：`deploy_container.sh` 自动探测 `~/SERVER/artifactdepot/config/config.json`，
   也可用 `--config <宿主机路径>` 显式挂到容器内 `config/config.json`，生产配置显式可改、无需重建镜像。
-- 数据卷默认 `~/SERVER/artifactdepot/artifactdepot_0.7.3/warehouse` → 容器 `/data/depot`；
+- 数据卷默认 `~/SERVER/artifactdepot/artifactdepot_0.7.4/warehouse` → 容器 `/data/depot`；
   若该路径不可写，脚本自动回退到 `~/.local/share/artifactdepot/...`。
 - **自启**：Podman 走 `systemd --user`；Docker 走 `--restart=always`。
 - 排障：`bash check_ad_sync.sh` 逐段定位 token 同步链路。

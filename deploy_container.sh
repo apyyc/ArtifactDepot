@@ -4,14 +4,20 @@
 #
 # 前提：镜像已存在（如 localhost/artifactdepot:0.5.5）
 #
-# 数据卷：默认挂载 ${HOME}/SERVER/artifactdepot/artifactdepot_0.6.1/warehouse
-#   → /data/depot；若该默认路径不可写，会自动回退到
-#   ${XDG_DATA_HOME:-$HOME/.local/share}/artifactdepot/artifactdepot_0.6.1/warehouse。
+# 数据卷：默认挂载 ${HOME}/SERVER/artifactdepot/<镜像名>_<版本>/warehouse
+#   → /data/depot（<版本> 取自项目根 VERSION 文件）；若该默认路径不可写，会自动回退到
+#   ${XDG_DATA_HOME:-$HOME/.local/share}/artifactdepot/<镜像名>_<版本>/warehouse。
 #   - 用 --data-dir <路径> 显式指定挂载位置（显式路径不可写会直接报错）
 #   - 加 --no-volume 可跳过挂载（用镜像内数据，删除容器即丢失）
 #   - 主数据卷始终注入 ARTIFACT_DEPOT_DIR=/data/depot，固定数据落点
 #   - meta_dir 默认不注入环境变量，以容器内 config.json 为准；
 #     需要覆盖时用 --meta-dir <容器内目录>
+#   - 注意：默认目录名含版本号，升级后会指向新（空）目录；
+#     脚本会检测上一版本的非空数据目录并提示 --data-dir 用法。
+#
+# 安全性：token 通过 600 权限的临时 env-file 传给容器运行时，
+#   不出现在命令行（ps 不可见）；容器创建后立即删除该文件。
+#   注意 token 仍会写入容器配置，`podman/docker inspect` 可读到。
 #
 # 仓库令牌 / DataHub 地址：
 #   - token：--token <值> 或环境变量 ARTIFACT_DEPOT_ACCESS_TOKEN
@@ -45,6 +51,14 @@
 set -euo pipefail
 : "${HOME:?HOME 未设置}"
 
+# 退出时清理临时 env-file（token），避免残留
+ENV_FILE=""
+cleanup_env_file() {
+  [ -n "${ENV_FILE:-}" ] && [ -f "$ENV_FILE" ] && rm -f "$ENV_FILE"
+  return 0
+}
+trap cleanup_env_file EXIT INT TERM
+
 # ---------- 可配置参数（按需修改） ----------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -55,7 +69,7 @@ _resolve_image_tag() {
     _v="$(grep -m1 -oE '[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?' "$SCRIPT_DIR/VERSION" 2>/dev/null | head -1)"
     if [ -n "$_v" ]; then printf '%s' "$_v"; return; fi
   fi
-  printf '0.7.3'   # 兜底：VERSION 缺失时使用上次已知版本
+  printf '0.7.4'   # 兜底：VERSION 缺失时使用上次已知版本
 }
 
 IMAGE_NAME="artifactdepot"           # 镜像名
@@ -65,7 +79,10 @@ CONTAINER_NAME="artifactdepot"       # 容器名
 HOST_PORT="8004"                     # 宿主机映射端口（仅 --port-map 使用）
 CONTAINER_PORT="8004"                # 容器内端口
 CONTAINER_DATA_PATH="/data/depot"  # 容器内数据目录（由 Dockerfile VOLUME 固定）
-CONTAINER_CONFIG_PATH="/app/artifactdepot/src/artifactdepot/config/config.json"
+# 容器内配置路径：镜像 WORKDIR 由 Dockerfile 决定，部署时从镜像元数据推导，
+# 避免与 Dockerfile 隐式耦合；推导失败时回退到兜底路径。
+CONTAINER_CONFIG_FALLBACK="/app/artifactdepot/src/artifactdepot/config/config.json"
+CONTAINER_CONFIG_PATH=""           # 镜像检查后推导
 
 # 宿主机默认数据目录（按版本隔离）。默认不可写时自动回退到用户数据目录。
 DATA_BASE="${HOME}/SERVER/artifactdepot"
@@ -78,7 +95,7 @@ VOLUME_ENABLED=true
 # 留空 = 不注入 ARTIFACT_DEPOT_META_DIR，完全以容器内 config.json 的 meta_dir 为准。
 META_DIR_CONTAINER=""
 
-# 默认配置文件候选路径：
+# 默认配置文件候选路径（宿主机侧；容器内路径在镜像检查后推导）
 #   1) 多个版本共用的 ~/SERVER/artifactdepot/config/config.json
 #   2) 与数据目录同级的 ~/SERVER/artifactdepot/<image>_<tag>/config/config.json
 # 找到第一个存在的文件就自动挂载；也可用 --config 显式覆盖。
@@ -86,14 +103,10 @@ DEFAULT_CONFIG_CANDIDATES=(
   "${DATA_BASE}/config/config.json"
   "${DATA_BASE}/${IMAGE_NAME}_${IMAGE_TAG}/config/config.json"
 )
+
+# 允许用环境变量 VOLUME_MAPS 传入额外挂载（空格分隔的 host:container 列表）
+USER_VOLUME_MAPS="${VOLUME_MAPS:-}"
 VOLUME_MAPS=()
-for _cfg in "${DEFAULT_CONFIG_CANDIDATES[@]}"; do
-  if [ -f "$_cfg" ]; then
-    VOLUME_MAPS=("${_cfg}:${CONTAINER_CONFIG_PATH}")
-    break
-  fi
-done
-unset _cfg
 
 # 仓库令牌与 DataHub 地址（可用 --token / --datahub-url 覆盖，也可用环境变量）
 ARTIFACT_DEPOT_TOKEN="${ARTIFACT_DEPOT_ACCESS_TOKEN:-}"
@@ -118,11 +131,12 @@ usage() {
   --network-host         使用 host 网络（默认）
   --no-systemd           不配置自启（Podman 不生成 systemd；Docker 不加 --restart）
   --stop                 停止容器并禁用自启
-  --rm                   删除容器（数据卷保留）
+  --rm                   删除容器（数据卷保留；与 --stop 同给时以 --rm 为准）
   -h, --help             显示本帮助
 
 环境变量:
   IMAGE_TAG                     覆盖镜像版本标签（默认读项目根 VERSION 文件）
+  VOLUME_MAPS                   额外挂载，空格分隔的 host:container 列表
   FORCE=podman|docker           强制指定容器工具
   ARTIFACT_DEPOT_ACCESS_TOKEN        默认 token
   ARTIFACT_DEPOT_DATAHUB_URL         默认 DataHub 地址
@@ -165,7 +179,7 @@ while [[ $# -gt 0 ]]; do
     --no-volume)  VOLUME_ENABLED=false ;;
     --token)
       shift
-      if [ $# -eq 0 ]; then echo "❌ --token 需要参数" >&2; exit 1; fi
+      if [ $# -eq 0 ] || [[ "$1" == -* ]]; then echo "❌ --token 需要参数" >&2; exit 1; fi
       ARTIFACT_DEPOT_TOKEN="$1"
       ;;
     --datahub-url)
@@ -199,6 +213,11 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
+# --stop 与 --rm 同时给出时以 --rm 为准（下面分支顺序如此），这里显式提示避免误解
+if [ "$DO_STOP" = true ] && [ "$DO_RM" = true ]; then
+  echo "ℹ️  --stop 与 --rm 同时指定，按 --rm 处理（删除容器；宿主机数据卷保留）" >&2
+fi
+
 # 显式配置优先；默认自动探测的配置文件映射会被替换。
 if [ -n "$CONFIG_HOST" ]; then
   if [ ! -f "$CONFIG_HOST" ]; then
@@ -206,7 +225,16 @@ if [ -n "$CONFIG_HOST" ]; then
     exit 1
   fi
   CONFIG_HOST="$(make_absolute "$CONFIG_HOST")"
-  VOLUME_MAPS=("${CONFIG_HOST}:${CONTAINER_CONFIG_PATH}")
+  CONFIG_MAP="$CONFIG_HOST:${CONTAINER_CONFIG_FALLBACK}"
+else
+  CONFIG_MAP=""
+  for _cfg in "${DEFAULT_CONFIG_CANDIDATES[@]}"; do
+    if [ -f "$_cfg" ]; then
+      CONFIG_MAP="$_cfg:${CONTAINER_CONFIG_FALLBACK}"
+      break
+    fi
+  done
+  unset _cfg
 fi
 
 # 显式数据目录转换为绝对路径，避免 podman/docker -v 对相对路径处理不一致。
@@ -230,6 +258,30 @@ if [ "$VOLUME_ENABLED" = true ] && [ "$DO_STOP" = false ] && [ "$DO_RM" = false 
     echo "   请创建可写目录，或用 --data-dir 指定其他路径。" >&2
     exit 1
   fi
+fi
+
+# 升级提醒：默认数据目录名含版本号，升级后会指向新（空）目录。
+# 若同级存在其它版本的非空数据目录，明确提示，避免误判为「数据丢失」。
+if [ "$VOLUME_ENABLED" = true ] && [ "$DATA_DIR_EXPLICIT" = false ] \
+   && [ "$DO_STOP" = false ] && [ "$DO_RM" = false ]; then
+  _old_dirs=()
+  for _d in "${DATA_BASE}/${IMAGE_NAME}_"*/warehouse \
+            "${XDG_DATA_HOME:-${HOME}/.local/share}/artifactdepot/${IMAGE_NAME}_"*/warehouse; do
+    [ -d "$_d" ] || continue
+    [ "$_d" = "$DATA_DIR" ] && continue
+    # 只提示确有数据的旧目录
+    if [ -n "$(find "$_d" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]; then
+      _old_dirs+=("$_d")
+    fi
+  done
+  if [ ${#_old_dirs[@]} -gt 0 ]; then
+    echo "⚠️  检测到其它版本的数据目录（当前默认指向: $DATA_DIR）:" >&2
+    for _d in "${_old_dirs[@]}"; do
+      echo "     $_d  ($(du -sh "$_d" 2>/dev/null | cut -f1))" >&2
+    done
+    echo "   如需沿用旧数据，请加 --data-dir <旧目录>；否则容器将使用新目录（空）。" >&2
+  fi
+  unset _d
 fi
 
 # ---------- 检测容器工具 ----------
@@ -304,10 +356,20 @@ echo "🔍 [1/5] 检查镜像 $FULL_IMAGE ..."
 if ! "$TOOL" image inspect "$FULL_IMAGE" >/dev/null 2>&1; then
   echo "❌ 镜像 $FULL_IMAGE 不存在！请先构建："
   echo "   ./build_image.sh"
-  echo "   或 $TOOL build -t $FULL_IMAGE ."
+  echo "  或 $TOOL build -t $FULL_IMAGE ."
   exit 1
 fi
 echo "✅ 镜像存在"
+
+# 从镜像元数据推导容器内配置路径（避免与 Dockerfile WORKDIR 隐式耦合）。
+# 镜像内结构固定为 <workdir>/src/artifactdepot/config/config.json。
+CONTAINER_WORKDIR="$("$TOOL" image inspect -f '{{.Config.WorkingDir}}' "$FULL_IMAGE" 2>/dev/null || true)"
+if [ -n "$CONTAINER_WORKDIR" ] && [ "$CONTAINER_WORKDIR" != "/" ]; then
+  CONTAINER_CONFIG_PATH="${CONTAINER_WORKDIR%/}/src/artifactdepot/config/config.json"
+else
+  CONTAINER_CONFIG_PATH="$CONTAINER_CONFIG_FALLBACK"
+fi
+echo "   容器内配置路径: $CONTAINER_CONFIG_PATH"
 
 # ---------- 2. 清理同名旧容器 ----------
 echo ""
@@ -342,24 +404,60 @@ else
 fi
 
 # 附加卷映射（配置文件等）
-for m in "${VOLUME_MAPS[@]}"; do
-  [ -n "$m" ] || continue
-  host="${m%%:*}"
-  if [ ! -e "$host" ]; then
-    echo "   ⚠️  跳过附加卷：宿主机路径不存在: $host（请先创建文件/目录）"
-    continue
+# 解析规则：host:container 用「最后一个冒号」分隔，兼容宿主机路径含冒号的少见情况；
+# 含容器侧路径必须绝对路径，否则按解析失败跳过。
+add_volume_map() {
+  local m="$1" host="" cont="" reason=""
+  if [[ "$m" == *:* ]]; then
+    host="${m%:*}"
+    cont="${m##*:}"
+  else
+    host="$m"; cont=""
   fi
-  VOLUME_ARGS+=(-v "$m")
-  echo "   📄 附加卷: $m"
+  if [ -z "$host" ]; then
+    reason="格式应为 host:container"
+  elif [ -z "$cont" ]; then
+    reason="缺少容器侧路径（格式 host:container）"
+  elif [[ "$cont" != /* ]]; then
+    reason="容器侧路径必须是绝对路径: $cont"
+  elif [ ! -e "$host" ]; then
+    reason="宿主机路径不存在: $host（请先创建文件/目录）"
+  fi
+  if [ -n "$reason" ]; then
+    echo "   ⚠️  跳过附加卷 [$m]：$reason" >&2
+    return 0
+  fi
+  VOLUME_ARGS+=(-v "${host}:${cont}")
+  echo "   📄 附加卷: ${host} → ${cont}"
+}
+
+[ -n "$CONFIG_MAP" ] && add_volume_map "$CONFIG_MAP"
+# 环境变量 VOLUME_MAPS 传入的额外挂载（空格分隔）
+if [ -n "$USER_VOLUME_MAPS" ]; then
+  read -r -a _user_maps <<< "$USER_VOLUME_MAPS"
+  for m in "${_user_maps[@]}"; do
+    [ -n "$m" ] && add_volume_map "$m"
+  done
+  unset _user_maps
+fi
+# 脚本内部 VOLUME_MAPS 数组（若有人 source 本脚本后追加）
+for m in "${VOLUME_MAPS[@]}"; do
+  [ -n "$m" ] && add_volume_map "$m"
 done
-if [ ${#VOLUME_MAPS[@]} -eq 0 ]; then
+unset m
+if [ "$CONFIG_MAP" = "" ] && [ -z "$USER_VOLUME_MAPS" ] && [ ${#VOLUME_MAPS[@]} -eq 0 ]; then
   echo "   ℹ️  未配置外部 config.json，使用镜像内 config/config.json"
 fi
 
 if [ -n "$ARTIFACT_DEPOT_TOKEN" ]; then
-  ENV_ARGS+=(-e "ARTIFACT_DEPOT_ACCESS_TOKEN=$ARTIFACT_DEPOT_TOKEN")
-  echo "   token: 已设置"
+  # token 走 600 权限的临时 env-file，避免出现在 podman/docker 命令行（ps 可见）
+  ENV_FILE="$(mktemp "${TMPDIR:-/tmp}/artifactdepot-env.XXXXXX")"
+  chmod 600 "$ENV_FILE"
+  printf 'ARTIFACT_DEPOT_ACCESS_TOKEN=%s\n' "$ARTIFACT_DEPOT_TOKEN" > "$ENV_FILE"
+  ENV_ARGS+=(--env-file "$ENV_FILE")
+  echo "   token: 已设置（经临时 env-file 注入，命令行不可见）"
 else
+  ENV_FILE=""
   echo "   ⚠️  未通过 --token / ARTIFACT_DEPOT_ACCESS_TOKEN 注入 token；若 config.json 也无 access_token，写操作会 401"
 fi
 if [ -n "$DATAHUB_URL" ]; then
@@ -409,6 +507,8 @@ CONTAINER_ID="$("$TOOL" run -d \
   "${ENV_ARGS[@]}" \
   "${VOLUME_ARGS[@]}" \
   "$FULL_IMAGE")"
+cleanup_env_file
+ENV_FILE=""
 echo "   容器 ID: ${CONTAINER_ID:0:12}"
 if [ "$DO_HOST_NETWORK" = true ]; then
   echo "✅ 容器已创建: $CONTAINER_NAME  （host 网络，端口 ${CONTAINER_PORT} 即宿主端口）"

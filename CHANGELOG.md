@@ -1,6 +1,6 @@
 # Changelog
 
-ArtifactDepot v0.7.3 — 所有对本项目的重要更改都将记录在此文件中。
+ArtifactDepot v0.7.4 — 所有对本项目的重要更改都将记录在此文件中。
 
 本日志格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本号遵循 [语义化版本规范](https://semver.org/lang/zh-CN/)。
@@ -8,6 +8,53 @@ ArtifactDepot v0.7.3 — 所有对本项目的重要更改都将记录在此文�
 ---
 
 ## [Unreleased]
+
+---
+
+## [0.7.4] - 2026-10-16
+
+### 工程化与发布整理（本版为工程化收尾，无接口变更）
+
+#### Added
+
+- **版本唯一源**：新增项目根 `VERSION` 文件，`build_image.sh`（`--tag` > `VERSION` > `DEFAULT_TAG`）、
+  `deploy_container.sh`（可用 `IMAGE_TAG` 覆盖）、`main.py`（FastAPI `version`）、
+  Dockerfile（`ARG APP_VERSION` → OCI 版本标签）均从该文件读取，版本号不再散落多处。
+- **开源许可**：项目以 Apache License 2.0 授权（SPDX `Apache-2.0`）。新增 `LICENSE`（英文版）、
+  `LICENSE.zh-CN.md`（中文版）、`LICENSE-HEADER`（源文件署名模板）；许可证经
+  `GET /api/docs/license`、`GET /api/docs/license_zh`、`GET /api/docs/license_header` 公开只读提供，
+  满足 Apache-2.0 第 4(a) 条「向接收者提供许可证副本」。
+- **构建代理可配置**：`build_image.conf` 支持 `PROXY_MODE=keep|strip|set` 与 `PROXY_URL`；
+  构建日志中的代理账密自动打码为 `***:***@`。
+- `deploy_container.sh` 支持环境变量 `VOLUME_MAPS`（空格分隔的 `宿主机路径:容器内路径`）追加挂载。
+
+#### Changed
+
+- **部署脚本加固**：token 改经 600 权限临时 env-file 注入（不再出现在 `podman/docker` 命令行，
+  `ps` 不可见，容器创建后即删）；容器内配置挂载点从镜像 `WorkingDir` 推导，去掉与 Dockerfile 的隐式耦合；
+  附加卷解析改为「取最后一个冒号 + 完整校验」，兼容宿主机路径含冒号的少见情况。
+- 移除 `scripts/start.sh` 与 `dev_common.sh`；`dev_start_headless.sh` 改为源码模式直启 uvicorn
+  （`PYTHONPATH=src python3 -m uvicorn artifactdepot.main:app`）。
+- `.dockerignore` 修正 `test/` → `tests/`（该规则此前从未生效），并补充 `warehouse/`、
+  `.pytest_cache/`、`COPYRIGHT-DECLARATION.md`；构建上下文由约 97 MB 降至约 3 MB。
+
+#### Fixed
+
+- **业务数据脱离版本控制**：`warehouse/` 下的视频等产物曾误入git（历史中约 51 MiB），
+  已移出索引并加入 `.gitignore` / `.dockerignore`；仓库历史经 `git filter-repo` 重写后
+  `.git` 由 55 MB 降至约 1.1 MB。
+- `deploy_container.sh` 的 `--token` 缺少「下一个参数不能是选项」校验，误写 `--token --stop`
+  会把字面量当作令牌注入；现与其他参数一致直接报错退出。
+- 修复构建脚本中 `die` 落在子 shell（`$(...)`）导致非法配置仅打印错误、构建照常继续的问题；
+  版本与代理配置校验移至主 shell 执行。
+- `config.json` 的 `access_token` 恢复为空（此前被误填弱值 `"y"`）。
+
+#### Removed
+
+- 移除 `.github/workflows/ci.yml`。
+
+---
+
 
 ### Added
 

@@ -1,6 +1,6 @@
 # ArtifactDepot — 对象存储仓库站点
 
-> 版本 0.7.3，端口 8004，独立服务
+> 版本 0.7.4，端口 8004，独立服务
 
 **一句话**：按行业标准（对象存储 / S3 模型）设计的文件仓库站点，收存处理产物（视频 / 文件），提供上传、列表、Range 下载、删除、新建目录、签名链接与审计，并带网页界面。业务 JSON 数据在 DataHub，**本服务不承担业务逻辑**。
 
@@ -80,28 +80,28 @@
 
 ```bash
 cd ArtifactDepot
-./build_image.sh                     # 构建 localhost/artifactdepot:0.7.3 + 自动导出 artifactdepot-0.7.3.tar
+./build_image.sh                     # 构建 localhost/artifactdepot:0.7.4 + 自动导出 artifactdepot-0.7.4.tar
 ```
 
 2. 把 tar 拷到生产机
 
 ```bash
-scp artifactdepot-0.7.3.tar apyyc@<生产机>:~/SERVER/artifactdepot/
+scp artifactdepot-0.7.4.tar apyyc@<生产机>:~/SERVER/artifactdepot/
 ```
 
 3. 生产机导入并部署
 
 ```bash
 cd ~/SERVER/artifactdepot
-podman load -i artifactdepot-0.7.3.tar
+podman load -i artifactdepot-0.7.4.tar
 cd ArtifactDepot
 ./deploy_container.sh --token <你的管理员token>   # 默认 host 网络；datahub_url 用挂载的 config.json
 ```
 
-> 升级到新版本时数据卷默认指到 `~/SERVER/artifactdepot/artifactdepot_0.7.3/warehouse`（新目录，空）。
+> 升级到新版本时数据卷默认指到 `~/SERVER/artifactdepot/artifactdepot_0.7.4/warehouse`（新目录，空）。
 > 若想沿用上一版数据，用 `--data-dir ~/SERVER/artifactdepot/<上一版目录>/warehouse` 指过去，
 > 或把旧数据目录内容拷贝/移动到新目录（`tokens.json` 可让同步从 DataHub 重新生成）。
-> 若 `~/SERVER` 不可写，脚本会自动回退到 `${XDG_DATA_HOME:-~/.local/share}/artifactdepot/artifactdepot_0.7.3/warehouse`。
+> 若 `~/SERVER` 不可写，脚本会自动回退到 `${XDG_DATA_HOME:-~/.local/share}/artifactdepot/artifactdepot_0.7.4/warehouse`。
 
 ---
 
@@ -127,7 +127,7 @@ pip install -r requirements.txt
 
 ```bash
 cd ArtifactDepot
-./build_image.sh                      # 构建 + 自动导出 artifactdepot-0.7.3.tar
+./build_image.sh                      # 构建 + 自动导出 artifactdepot-0.7.4.tar
 ```
 
 常用参数：
@@ -137,7 +137,7 @@ cd ArtifactDepot
 | `--no-save` | 只构建，不导出 tar |
 | `--save /path/to/out.tar` | 指定导出路径（默认同目录 `artifactdepot-<tag>.tar`） |
 | `--no-cache` | 不用构建缓存（依赖层有改动时用） |
-| `--tag <版本>` | 自定义版本标签（默认 0.7.3） |
+| `--tag <版本>` | 自定义版本标签（默认 0.7.4） |
 | `--load /path/to/in.tar` | 不构建，直接导入已有 tar |
 | `--list` | 只列出本地镜像 |
 
@@ -147,9 +147,9 @@ cd ArtifactDepot
 
 ```bash
 # 导出（等价于 build_image.sh 的自动步骤）
-podman save -o artifactdepot-0.7.3.tar localhost/artifactdepot:0.7.3
+podman save -o artifactdepot-0.7.4.tar localhost/artifactdepot:0.7.4
 # 目标机导入
-podman load -i artifactdepot-0.7.3.tar
+podman load -i artifactdepot-0.7.4.tar
 ```
 
 ---
@@ -182,10 +182,11 @@ PYTHONPATH=src python3 -m uvicorn artifactdepot.main:app --host 0.0.0.0 --port 8
 - **默认 host 网络**：容器共享宿主网络，不再映射端口；容器内 `127.0.0.1` 就是宿主机，同机连 DataHub（`http://127.0.0.1:8002/api/data`）最稳。用 `--port-map` 才改为端口映射（rootless 桥接下容器连宿主发布端口常不通）
 - **自启**：Podman 默认生成 `systemd --user` 服务；Docker 没有 `podman generate systemd`，脚本自动改用 `--restart=always`
 - **非 root**：镜像以 `artifactdepot(10001)` 运行；绑定数据卷时 `deploy_container.sh` 自动以宿主当前 UID/GID 运行（Podman 另加 `--userns=keep-id`），保证挂载目录可写
-- `--token <你的管理员token>` / 环境变量 `ARTIFACT_DEPOT_ACCESS_TOKEN`：注入共享令牌（不传且 config.json 也无 access_token 时，管理/写接口返回 401）
+- `--token <你的管理员token>` / 环境变量 `ARTIFACT_DEPOT_ACCESS_TOKEN`：注入共享令牌（不传且 config.json 也无 access_token 时，管理/写接口返回 401）。脚本用 **600 权限的临时 env-file** 传递，令牌不出现在命令行（`ps` 看不到），容器创建后立即删除该文件；但 `podman/docker inspect <容器>` 仍可读到，属容器运行时固有行为
 - `--datahub-url <地址>` / 环境变量 `ARTIFACT_DEPOT_DATAHUB_URL`：**显式**注入 DataHub 地址；**不传则不注入**，以容器内配置文件的 `datahub_url` 为准
-- 数据卷默认 `~/SERVER/artifactdepot/artifactdepot_0.7.3/warehouse` 挂到容器 `/data/depot`（`--data-dir` 指定；默认目录不可写时自动回退到 `~/.local/share/artifactdepot/...`）
-- **配置挂载**：脚本自动探测 `~/SERVER/artifactdepot/config/config.json` 或 `~/SERVER/artifactdepot/artifactdepot_0.7.3/config/config.json`；也可用 `--config <宿主机路径>` 显式挂载
+- 数据卷默认 `~/SERVER/artifactdepot/artifactdepot_0.7.4/warehouse` 挂到容器 `/data/depot`（`--data-dir` 指定；默认目录不可写时自动回退到 `~/.local/share/artifactdepot/...`）。**目录名含版本号**，升级后会指向新（空）目录；脚本会检测同级其它版本的非空数据目录并提示用 `--data-dir <旧目录>` 沿用旧数据
+- **配置挂载**：脚本自动探测 `~/SERVER/artifactdepot/config/config.json` 或 `~/SERVER/artifactdepot/artifactdepot_0.7.4/config/config.json`；也可用 `--config <宿主机路径>` 显式挂载。容器内挂载点从镜像 `WorkingDir` 推导（不再写死）
+- **额外挂载**：环境变量 `VOLUME_MAPS` 可传空格分隔的 `宿主机路径:容器内路径` 列表（容器内路径须为绝对路径）
 - **meta_dir**：默认不注入 `ARTIFACT_DEPOT_META_DIR`，完全以 config.json 的 `meta_dir` 为准；需要显式覆盖时用 `--meta-dir <容器内路径>`
 
 ### 首次使用流程
@@ -333,30 +334,34 @@ cp src/artifactdepot/config/config.production.json ~/SERVER/artifactdepot/config
 
 ```
 ArtifactDepot/
-- README.md / CHANGELOG.md / docs/architecture.md
-- check_ad_sync.sh                # 生产诊断脚本（python3-only，不依赖 curl/jq）
-- .dockerignore                   # 构建上下文排除 tar / warehouse / logs / __pycache__ 等
-- Dockerfile                      # 单阶段镜像（python:3.12-alpine + supervisor + tzdata）
-- docker/supervisord.conf         # supervisor 托管 uvicorn（8004）
-- build_image.sh                  # 构建脚本：构建 + 自动导出 tar（默认 --save）
-- deploy_container.sh             # 部署脚本：建容器 + Podman systemd / Docker restart（--config/--meta-dir/--token/--datahub-url/--data-dir/--port-map）
-- dev_start_headless.sh           # 本地后台启动脚本（源码模式直启 uvicorn）
+- README.md / CHANGELOG.md / VERSION        # VERSION 是版本号唯一源
+- LICENSE / LICENSE.zh-CN.md / LICENSE-HEADER  # Apache-2.0（英文版 / 中文版 / 源文件署名模板）
+- docs/                          # docs/api_rules.md（接口文档）、docs/architecture.md（架构说明）
+- check_ad_sync.sh               # 生产诊断脚本（python3-only，不依赖 curl/jq）
+- .dockerignore / .gitignore     # 构建上下文与版本控制排除规则
+- Dockerfile                     # 单阶段镜像（python:3.12-alpine + supervisor + tzdata）
+- docker/supervisord.conf        # supervisor 托管 uvicorn（8004）
+- build_image.sh / build_image.conf  # 构建脚本：构建 + 自动导出 tar（默认 --save）
+- deploy_container.sh            # 部署脚本：建容器 + Podman systemd / Docker restart
+                                 #   （--config/--meta-dir/--token/--datahub-url/--data-dir/--port-map）
+- dev_start_headless.sh          # 本地后台启动脚本（源码模式直启 uvicorn）
+- requirements.txt               # 运行依赖（精确锁定）
 - src/artifactdepot/
-  - main.py                       # FastAPI 入口 + lifespan（建目录 + 启动同步）
-  - config/                       # 配置包：__init__.py（加载/手动重载）+ config.json + config.production.json + .env(.example)
-  - storage.py                    # 核心引擎：路径安全 / bucket-key / manifest / 签名链接注册表 / token 注册表 / 审计 / DataHub 同步 / mkdir / meta_dir
-  - auth.py                       # 认证：管理员 token（UTF-8 比较）、用户 token、惰性同步
+  - main.py                      # FastAPI 入口 + lifespan（建目录 + 启动同步）
+  - config/                      # 配置包：__init__.py（加载/手动重载）+ config.json + config.production.json + .env(.example)
+  - storage.py                   # 核心引擎：路径安全 / bucket-key / manifest / 签名链接注册表 / token 注册表 / 审计 / DataHub 同步 / mkdir / meta_dir
+  - auth.py                      # 认证：管理员 token（UTF-8 比较）、用户 token、惰性同步
+  - permissions.py               # 权限点目录与角色预设
+  - logging_utils.py / netutil.py / observability.py  # 日志脱敏 / 网络工具 / 指标与健康检查
   - api/
-    - objects.py                  # 对象 API（上传/列表/下载/删除/mkdir/签名/作废）
-    - system.py                   # /health /api/buckets /api/tokens /api/audit /api/auth/check
-    - docs.py                     # /api/docs 文档清单与内容（公开只读，供外部/脚本读取）
-  - permissions.py                # 权限点目录与角色预设
-- tests/                          # pytest 回归测试（权限点 / 文档接口 / 资源范围）
-  - web/
-    - ui.py                       # 网页 UI（读 resources/index.html）
+    - objects.py                 # 对象 API（上传/列表/下载/删除/mkdir/签名/作废）
+    - system.py                  # /health /api/buckets /api/tokens /api/audit /api/auth/check
+    - docs.py                    # /api/docs 文档清单与内容（公开只读，含许可证）
+  - web/ui.py                    # 网页 UI（读 resources/index.html）
   - resources/
-    - config.json                 # 运行配置（含 signed_links 上下限、meta_dir）
-    - index.html                  # 单页界面（拖拽/新建目录/签名/Token/审计；标签栏含 Swagger/ReDoc 入口）
+    - index.html                 # 单页界面（拖拽/新建目录/签名/Token/审计）
+    - static/                    # 外置 app.js / app.css + 自托管 Swagger UI / ReDoc 资源
+- tests/                         # pytest 回归测试（83 例，含 conftest 隔离真实 .env）
 ```
 
 > 文档相关：`docs/api_rules.md` 是对外接口文档；`docs/architecture.md` 是架构说明。
@@ -562,17 +567,17 @@ curl -o out.mp4 "$BASE/api/objects/download?bucket=音视门carryVdeio&key=任�
 
 # 签名链接 —— 按时效
 curl -X POST -H "Content-Type: application/json" -H "Authorization: Bearer $USER" \
-  -d '{"bucket":"音视门carryVdeio","key":"artifactdepot_0.7.3.tar","mode":"time","expires":3600}' \
+  -d '{"bucket":"音视门carryVdeio","key":"artifactdepot_0.7.4.tar","mode":"time","expires":3600}' \
   "$BASE/api/objects/presign"
 
 # 签名链接 —— 按次数（3 次）
 curl -X POST -H "Content-Type: application/json" -H "Authorization: Bearer $USER" \
-  -d '{"bucket":"音视门carryVdeio","key":"artifactdepot_0.7.3.tar","mode":"count","count":3}' \
+  -d '{"bucket":"音视门carryVdeio","key":"artifactdepot_0.7.4.tar","mode":"count","count":3}' \
   "$BASE/api/objects/presign"
 
 # 签名链接 —— 永久
 curl -X POST -H "Content-Type: application/json" -H "Authorization: Bearer $USER" \
-  -d '{"bucket":"音视门carryVdeio","key":"artifactdepot_0.7.3.tar","mode":"permanent"}' \
+  -d '{"bucket":"音视门carryVdeio","key":"artifactdepot_0.7.4.tar","mode":"permanent"}' \
   "$BASE/api/objects/presign"
 
 # 删除（需 object:delete；目录仅空可删）
