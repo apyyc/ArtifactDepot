@@ -15,6 +15,3 @@ COPYRIGHT-DECLARATION.md
 # 源文件署名约定说明：本地/镜像内文档，不随 git 分发（约定本体见 README）
 docs/LICENSE-HEADER
 warehouse/
-
-# 本地同步配置（含内网 IP/账号，不随 git 分发；模板见同步脚本头部注释）
-sync_artifacts.conf
