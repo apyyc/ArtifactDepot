@@ -1,6 +1,6 @@
 # ArtifactDepot 架构说明
 
-> 版本 **0.7.4**
+> 版本 **0.8.0**
 
 ## 定位
 
@@ -152,7 +152,7 @@ ArtifactDepot/
 ## 部署
 
 - **build → save → 拷贝 → load → deploy**：
-  - 开发机 `./build_image.sh`（构建 + 自动导出 `artifactdepot-0.7.4.tar`）
+  - 开发机 `./build_image.sh`（构建 + 自动导出 `artifactdepot-0.8.0.tar`）
   - 拷贝 tar 到生产机 → `podman load -i` → `./deploy_container.sh --token <你的管理员token>`
 - **host 网络默认**：容器共享宿主网络，`datahub_url` 用 `127.0.0.1:8002` 直连同机 DataHub；
   `--port-map` 可改回端口映射（不推荐，rootless 桥接常不通）。

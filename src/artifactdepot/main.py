@@ -1,3 +1,6 @@
+# Copyright 2026 apyyc
+# SPDX-License-Identifier: Apache-2.0
+
 """ArtifactDepot — 对象存储仓库站点（FastAPI 入口）
 
 行业定位：对象存储/工件仓库（S3 模型）。收存处理产物（视频等），
@@ -43,7 +46,7 @@ def _app_version() -> str:
                     return v
     except OSError:
         pass
-    return "0.7.4"
+    return "0.8.0"
 
 
 APP_VERSION = _app_version()

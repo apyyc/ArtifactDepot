@@ -1,3 +1,5 @@
+// Copyright 2026 apyyc
+// SPDX-License-Identifier: Apache-2.0
 
 const $ = (id) => document.getElementById(id)
 let state = { bucket: '', prefix: '', limit: 200, offset: 0, items: [], total: 0, truncated: false }
@@ -16,6 +18,8 @@ function switchTab(t) {
   ;['browse', 'links', 'tokens', 'audit'].forEach(s => {
     $('sec-' + s).style.display = s === t ? '' : 'none'
   })
+  // 进入 Token 页时拉取现有 bucket，渲染「资源范围」多选框（拉过一次后复用，「刷新现有 bucket」可强制刷新）
+  if (t === 'tokens') loadTokenBuckets()
 }
 
 function authHeaders(token, extra) {
@@ -62,6 +66,7 @@ document.addEventListener('click', (e) => {
   else if (a === 'copy-link') copyLink(el)
   else if (a === 'load-links') loadLinks()
   else if (a === 'load-tokens') loadTokens()
+  else if (a === 'load-tk-buckets') loadTokenBuckets(true)
   else if (a === 'generate-token') generateToken()
   else if (a === 'copy-token') copyTkResult()
   else if (a === 'sync-tokens') syncTokens()
@@ -791,6 +796,113 @@ function parsePrefixes(text) {
   return out
 }
 
+// ---- Token 资源范围（bucket 多选 + 手填）----
+
+let TKBUCKETS = []          // GET /api/buckets 返回的现有 bucket
+let tkBucketsLoaded = false // 是否已拉取过（进入 Token 页只自动拉一次）
+
+async function loadTokenBuckets(force) {
+  const box = $('tkBucketChecks')
+  if (!box) return
+  if (tkBucketsLoaded && !force) return
+  box.textContent = '（加载中…）'
+  try {
+    // 带管理员令牌请求：require_read_token=true 时 /api/buckets 也需要 bucket:list
+    const body = await api('/api/buckets', {}, $('admToken').value.trim())
+    TKBUCKETS = (body.data || []).slice()
+    tkBucketsLoaded = true
+    renderTokenBuckets()
+  } catch (e) {
+    box.textContent = '（bucket 列表加载失败：' + e.message + '；可直接手填 bucket）'
+  }
+}
+
+// 渲染「全部 bucket」+ 现有 bucket 复选框；保留用户已勾选的项
+function renderTokenBuckets() {
+  const box = $('tkBucketChecks')
+  if (!box) return
+  const keep = new Set(tkCheckedBuckets())
+  box.innerHTML = ''
+  box.className = ''
+  const allWrap = document.createElement('label')
+  allWrap.style.cssText = 'margin-right:14px;white-space:nowrap;'
+  const allCb = document.createElement('input')
+  allCb.type = 'checkbox'
+  allCb.id = 'tkBucketAll'
+  allCb.checked = !keep.size && !parseList($('tkBuckets').value).length
+  allWrap.appendChild(allCb)
+  allWrap.appendChild(document.createTextNode(' 全部 bucket（不限制）'))
+  box.appendChild(allWrap)
+  if (!TKBUCKETS.length) {
+    const span = document.createElement('span')
+    span.className = 'muted'
+    span.textContent = '（暂无现有 bucket，可手填新 bucket）'
+    box.appendChild(span)
+    renderTkScopePreview()
+    return
+  }
+  TKBUCKETS.forEach(name => {
+    const wrap = document.createElement('label')
+    wrap.style.cssText = 'margin-right:14px;white-space:nowrap;'
+    const cb = document.createElement('input')
+    cb.type = 'checkbox'
+    cb.className = 'tkBucket'
+    cb.value = name
+    cb.checked = keep.has(name)
+    wrap.appendChild(cb)
+    wrap.appendChild(document.createTextNode(' ' + name))
+    box.appendChild(wrap)
+  })
+  renderTkScopePreview()
+}
+
+// 已勾选的现有 bucket（不含手填）
+function tkCheckedBuckets() {
+  return Array.from(document.querySelectorAll('.tkBucket')).filter(b => b.checked).map(b => b.value)
+}
+
+// 合并「勾选的现有 bucket」与「手填 bucket」：去重、去空；勾了「全部 bucket」返回 []（=不限制）
+function collectTokenBuckets() {
+  const all = $('tkBucketAll')
+  if (all && all.checked) return []
+  const out = []
+  tkCheckedBuckets().forEach(b => { if (b && !out.includes(b)) out.push(b) })
+  parseList($('tkBuckets').value).forEach(b => { if (b && !out.includes(b)) out.push(b) })
+  return out
+}
+
+function onTkBucketChange(e) {
+  const el = e.target
+  if (!el) return
+  if (el.id === 'tkBucketAll') {
+    // 勾「全部」→ 清空其它勾选与手填；勾任一具体 bucket → 取消「全部」
+    if (el.checked) {
+      document.querySelectorAll('.tkBucket').forEach(b => { b.checked = false })
+      $('tkBuckets').value = ''
+    }
+  } else if (el.classList && el.classList.contains('tkBucket') && el.checked) {
+    const all = $('tkBucketAll')
+    if (all) all.checked = false
+  }
+  renderTkScopePreview()
+}
+
+// 生成前/勾选时实时展示生效范围与前端校验提示
+function renderTkScopePreview() {
+  const el = $('tkScopePreview')
+  if (!el) return
+  const buckets = collectTokenBuckets()
+  const prefixes = parsePrefixes($('tkPrefixes').value)
+  const prefixBuckets = Object.keys(prefixes)
+  const outside = buckets.length ? prefixBuckets.filter(b => !buckets.includes(b)) : []
+  const unrestricted = !buckets.length && !prefixBuckets.length
+  let txt = '生效范围：' + fmtScopeRange({ allow_buckets: buckets, allow_prefixes: prefixes })
+  if (unrestricted) txt += '　（该 token 可访问全部 bucket）'
+  if (outside.length) txt += '　⚠️ 前缀所属 bucket 不在白名单：' + outside.join('、')
+  el.textContent = txt
+  el.style.color = (unrestricted || outside.length) ? '#e6a23c' : ''
+}
+
 async function generateToken() {
   const t = $('admToken').value.trim()
   if (!t) { toast('请先填写管理员令牌', false); return }
@@ -801,6 +913,22 @@ async function generateToken() {
   if (!scopes.length && role !== 'custom') {
     if (!confirm('尚未勾选任何接口，生成的 token 将没有任何权限。继续？')) return
   }
+  const allowBuckets = collectTokenBuckets()
+  const allowPrefixes = parsePrefixes($('tkPrefixes').value)
+  const prefixBuckets = Object.keys(allowPrefixes)
+  // 前端校验 1：前缀所属 bucket 必须在 Bucket 白名单内，否则该前缀不会生效
+  if (allowBuckets.length) {
+    const outside = prefixBuckets.filter(b => !allowBuckets.includes(b))
+    if (outside.length) {
+      toast('前缀白名单里的 bucket 不在 Bucket 白名单内：' + outside.join('、') + '（请先勾选/填写该 bucket，否则前缀不生效）', false)
+      return
+    }
+  }
+  // 前端校验 2：范围全空 = 该 token 可访问全部 bucket，需二次确认
+  if (!allowBuckets.length && !prefixBuckets.length) {
+    const okAll = await confirmDialog('该 token 未设置资源范围：将可访问全部 bucket（含未来新建的 bucket）。确认继续？')
+    if (!okAll) return
+  }
   try {
     const body = await api('/api/tokens', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -808,8 +936,8 @@ async function generateToken() {
         user,
         role,
         scopes,
-        allow_buckets: parseList($('tkBuckets').value),
-        allow_prefixes: parsePrefixes($('tkPrefixes').value),
+        allow_buckets: allowBuckets,
+        allow_prefixes: allowPrefixes,
         expires_at: $('tkExpires').value.trim(),
         description: $('tkDesc').value.trim(),
       }),
@@ -817,6 +945,16 @@ async function generateToken() {
     const d = body.data || {}
     $('tkResult').value = d.token || ''
     $('tkResultRow').style.display = ''
+    // 生成结果区展示生效范围（以服务端返回为准，回退到本次提交值）
+    const info = $('tkScopeInfo')
+    if (info) {
+      info.textContent = '生效范围：' + fmtScopeRange({
+        allow_buckets: d.allow_buckets || allowBuckets,
+        allow_prefixes: d.allow_prefixes || allowPrefixes,
+      }) + '　（请把范围一并告知使用者）'
+    }
+    const infoRow = $('tkScopeInfoRow')
+    if (infoRow) infoRow.style.display = 'flex'
     toast('已生成 token（仅展示本次）')
     await loadTokens()
   } catch (e) { toast(e.message, false) }
@@ -871,7 +1009,7 @@ function fmtScopeRange(rec) {
   const parts = []
   if (bs) parts.push('bucket=' + bs)
   if (ps) parts.push('前缀=' + ps)
-  return parts.length ? parts.join('；') : '全部'
+  return parts.length ? parts.join('；') : '⚠️ 全部 bucket'
 }
 
 async function loadTokens() {
@@ -901,7 +1039,8 @@ async function loadTokens() {
       tb.appendChild(tr)
       const detail = document.createElement('tr')
       detail.innerHTML = '<td colspan="8" class="muted mono" style="font-size:12px;">' +
-        esc((rec.scopes || []).join('  ')) + (rec.description ? '　|　' + esc(rec.description) : '') + '</td>'
+        esc((rec.scopes || []).join('  ')) + (rec.description ? '　|　' + esc(rec.description) : '') +
+        '　|　生效范围：' + esc(fmtScopeRange(rec)) + '</td>'
       tb.appendChild(detail)
     }
   } catch (e) { toast(e.message, false) }
@@ -964,6 +1103,18 @@ async function runAudit() {
 document.querySelectorAll('input[name="psType"]').forEach(el => el.addEventListener('change', psTypeChange))
 const _tkReveal = $('tkReveal'); if (_tkReveal) _tkReveal.addEventListener('change', loadTokens)
 const _tkRole = $('tkRole'); if (_tkRole) _tkRole.addEventListener('change', applyRolePreset)
+// Token 资源范围：手填/勾选变化时实时刷新「生效范围」预览
+const _tkBucketsInput = $('tkBuckets')
+if (_tkBucketsInput) _tkBucketsInput.addEventListener('input', () => {
+  const all = $('tkBucketAll')
+  if (all && _tkBucketsInput.value.trim()) all.checked = false
+  renderTkScopePreview()
+})
+const _tkPrefixesInput = $('tkPrefixes')
+if (_tkPrefixesInput) _tkPrefixesInput.addEventListener('input', renderTkScopePreview)
+const _tkBucketChecks = $('tkBucketChecks')
+if (_tkBucketChecks) _tkBucketChecks.addEventListener('change', onTkBucketChange)
+renderTkScopePreview()
 document.querySelectorAll('.select-on-focus').forEach(el => el.addEventListener('focus', () => el.select()))
 document.addEventListener('click', (e) => {
   const a = e.target && e.target.closest ? e.target.closest('a[href="#"]') : null

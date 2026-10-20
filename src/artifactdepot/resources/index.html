@@ -98,7 +98,7 @@
         <thead><tr><th>用户</th><th>Token</th><th>角色</th><th>权限点数</th><th>资源范围</th><th>过期</th><th>状态</th><th>操作</th></tr></thead>
         <tbody id="tokensBody"></tbody>
       </table>
-      <div class="muted" style="margin-top:4px;">每行下方展示该 token 的具体权限点；「显示明文」需管理员令牌。</div>
+      <div class="muted" style="margin-top:4px;">每行下方展示该 token 的具体权限点与生效范围；「资源范围」显示「⚠️ 全部 bucket」表示该 token 未受限、可访问任意 bucket。「显示明文」需管理员令牌。</div>
     </div>
 
     <div class="card">
@@ -115,11 +115,20 @@
       </div>
       <div class="row">
         <label>Bucket 白名单:</label>
-        <input id="tkBuckets" placeholder="留空=全部；逗号分隔，如 voicevideo,myproj" style="width:340px;" class="mono" />
+        <input id="tkBuckets" placeholder="可手填未创建的 bucket，逗号分隔，如 demo,myproj；留空=全部" style="width:340px;" class="mono" />
+        <button class="ghost" data-action="load-tk-buckets">刷新现有 bucket</button>
+        <span class="muted">勾选下方现有 bucket，或手填；两者合并去重</span>
+      </div>
+      <div class="row" id="tkBucketCheckRow">
+        <label>选择现有 bucket:</label>
+        <span id="tkBucketChecks" class="muted">（进入本页时自动加载；暂无数据时可手填）</span>
       </div>
       <div class="row">
         <label>路径前缀白名单:</label>
-        <input id="tkPrefixes" placeholder="留空=全部；格式 bucket:前缀，逗号分隔，如 voicevideo:carryvideo/2026/" style="width:420px;" class="mono" />
+        <input id="tkPrefixes" placeholder="留空=全部；格式 bucket:前缀，逗号分隔，如 demo:carryvideo/2026/" style="width:420px;" class="mono" />
+      </div>
+      <div class="row">
+        <span class="muted" id="tkScopePreview" style="font-weight:bold;">生效范围：⚠️ 全部 bucket</span>
       </div>
 
       <div class="row" style="margin-top:8px;">
@@ -140,6 +149,9 @@
         <label>新 Token:</label>
         <input id="tkResult" readonly class="mono select-on-focus" style="flex:1; font-size:12px;" />
         <button class="ghost" data-action="copy-token">复制</button>
+      </div>
+      <div class="row" id="tkScopeInfoRow" style="display:none; margin-top:4px;">
+        <span class="muted" id="tkScopeInfo"></span>
       </div>
     </div>
   </div>

@@ -1,3 +1,6 @@
+# Copyright 2026 apyyc
+# SPDX-License-Identifier: Apache-2.0
+
 """系统 API：健康检查、bucket 列表、权限目录、Token 注册表管理、审计查询、token 校验"""
 import hashlib
 
@@ -10,7 +13,9 @@ from typing import List, Optional
 
 from artifactdepot import netutil, storage
 from artifactdepot.auth import (
-    Principal, extract_token, require_admin, require_scope, resolve_principal,
+    Principal, ensure_can_grant, extract_token, optional_read_principal,
+    read_requires_token, require_admin, require_scope, resolve_principal,
+    resource_allowed,
 )
 from artifactdepot.config import get_config, reload_config
 from artifactdepot.observability import render_metrics
@@ -35,27 +40,8 @@ def _public_catalog():
     return PERMISSION_CATALOG + PUBLIC_CATALOG
 
 
-def _read_requires_token() -> bool:
-    """读接口是否要求带 token（默认 false，保持历史公开行为）"""
-    return bool(get_config().get("require_read_token", False))
-
-
-async def _optional_read_principal(request: Request, scope: str):
-    """读接口鉴权：require_read_token=true 时强制 scope；否则有 token 且具备 scope 才返回主体"""
-    token = extract_token(request)
-    principal = await resolve_principal(token) if token else None
-    if _read_requires_token():
-        from artifactdepot.auth import ensure_scope
-        if not principal:
-            raise HTTPException(401, detail="缺少或无效的访问令牌")
-        ensure_scope(principal, scope)
-        return principal
-    if principal is None:
-        return None
-    # 公开模式下：token 没有该读权限时按匿名处理，不阻断（列表仍可能按资源范围过滤）
-    if not principal.is_admin and not principal.has_scope(scope):
-        return None
-    return principal
+# 读接口鉴权统一走 auth.optional_read_principal（fail-closed）：
+# 不带 token 时按 require_read_token 决定是否公开；带 token 时必须有效且具备 scope。
 
 
 @router.get("/api/auth/permissions")
@@ -67,7 +53,7 @@ async def permissions_catalog():
         "roles": [{"key": k, "label": v["label"], "scopes": v["scopes"]}
                   for k, v in ROLE_PRESETS.items()],
         "default_role": DEFAULT_ROLE,
-        "require_read_token": _read_requires_token(),
+        "require_read_token": read_requires_token(),
     }}
 
 
@@ -143,8 +129,12 @@ async def config_reload(request: Request, actor: str = Depends(require_admin)):
 
 @router.get("/api/buckets")
 async def list_buckets(request: Request):
-    """列 bucket。默认公开；config.require_read_token=true 时需要 bucket:list 权限。"""
-    principal = await _optional_read_principal(request, "bucket:list")
+    """列 bucket。
+
+    鉴权（fail-closed）：不带 token 时默认公开；带 token 时必须有效且具备 `bucket:list`；
+    带资源范围的 token 只列出范围内的 bucket。
+    """
+    principal = await optional_read_principal(request, "bucket:list")
     buckets = storage.list_buckets()
     # 带资源范围的 token：只列出允许范围内的 bucket
     if principal is not None and not principal.is_admin and principal.allow_buckets:
@@ -214,11 +204,63 @@ async def add_token_entry(body: TokenEntry, request: Request,
 
     - `scopes` 为「逐接口勾选」结果；不传则用 `role` 预设
     - `token` 留空由服务端生成，响应一次性返回明文
+    - **防提权**：非共享 token 不能创建出「scope / bucket / 前缀范围超出自己」的 token（403）
+    - **覆写既有 token = 更新**：显式传入的 `token` 若已在注册表中，按 `PUT` 的**合并语义**
+      处理（未传字段一律保留），并复用同一套防提权/范围校验与 `token_update` 审计。
+      这样不会因为「重新登记一次」就把资源范围静默放宽为全部 bucket、或把
+      已禁用 / 已过期的 token 复活。
     """
     legacy = (body.role in ("", None) and body.scopes is None
               and body.allow_buckets is None and body.allow_prefixes is None
               and not (body.expires_at or "").strip()
               and not (body.description or "").strip())
+
+    existing_token = (body.token or "").strip()
+    raw_existing = storage._read_tokens_raw() if existing_token else {}
+    overwriting = bool(existing_token) and existing_token in raw_existing
+
+    # 覆写（非 legacy）→ 完全走 PUT 的合并语义：未传字段保留、目标/结果双向防提权、
+    # 范围自洽与前缀规范化、审计记 token_update。
+    if overwriting and not legacy:
+        explicit = body.model_fields_set
+        updatable = ("user", "role", "scopes", "allow_buckets",
+                     "allow_prefixes", "expires_at", "description")
+        patch = {f: getattr(body, f) for f in updatable if f in explicit}
+        resp = await update_token_entry(
+            existing_token, TokenUpdate(**patch), request, actor)
+        data = dict(resp.get("data") or {})
+        # POST 契约要回带明文：调用方本就持有该 token 字符串
+        data["token"] = existing_token
+        return {"code": 0, "message": "success", "data": data}
+
+    if not actor.is_admin:
+        from artifactdepot.permissions import role_scopes
+        # 目标 token 若**已存在**，无论 legacy 登记还是普通覆写，都等同于「修改既有 token」，
+        # 因此必须先校验目标现有授权不超出自己（否则可以把更大的 token 降级、
+        # 甚至把已禁用的 token 直接覆写复活）。用原始记录判断，避免 disabled/expired 被当作新 token。
+        pat = (body.token or "").strip()
+        raw_tokens = storage._read_tokens_raw() if pat else {}
+        existing = (storage._normalize_token_record(raw_tokens[pat], pat)
+                    if pat and pat in raw_tokens else None)
+        if existing is not None:
+            ensure_can_grant(actor, scopes=existing.get("scopes") or [],
+                             allow_buckets=existing.get("allow_buckets") or [],
+                             allow_prefixes=existing.get("allow_prefixes") or {},
+                             action="登记")
+        if legacy:
+            # 旧协议「仅登记 token+user」：新建时按 role=user 预设建立，也要校验
+            if existing is None:
+                ensure_can_grant(actor, scopes=role_scopes(DEFAULT_ROLE) or [],
+                                 allow_buckets=[], allow_prefixes={}, action="登记")
+        else:
+            req_scopes = body.scopes
+            if req_scopes is None:
+                req_scopes = role_scopes(body.role or DEFAULT_ROLE) or []
+            ensure_can_grant(
+                actor, scopes=req_scopes,
+                allow_buckets=body.allow_buckets if body.allow_buckets is not None else [],
+                allow_prefixes=body.allow_prefixes if body.allow_prefixes is not None else {},
+                action="创建")
     result = storage.add_token(
         body.token, body.user, role=body.role or DEFAULT_ROLE,
         scopes=body.scopes, allow_buckets=body.allow_buckets,
@@ -226,10 +268,12 @@ async def add_token_entry(body: TokenEntry, request: Request,
         description=body.description, created_by=actor.actor,
         keep_existing_permissions=legacy,
     )
-    storage.audit("token_create", "", "", actor.actor,
+    # legacy「仅登记 token+user」命中已存在 token 时同样是更新 → 审计按 update 记
+    storage.audit("token_update" if overwriting else "token_create", "", "", actor.actor,
                   request.client.host if request.client else "",
                   extra={"user": result.get("user"), "role": result.get("role"),
-                         "scopes": result.get("scopes")})
+                         "scopes": result.get("scopes"),
+                         "allow_buckets": result.get("allow_buckets")})
     return {"code": 0, "message": "success", "data": result}
 
 
@@ -253,6 +297,12 @@ async def update_token_entry(value: str, body: TokenUpdate, request: Request,
         if value not in raw:
             raise HTTPException(404, detail="token 不存在")
         rec = storage._normalize_token_record(raw[value], value)
+        # 防提权（第一道）：不能改动「自身范围之外」的既有 token。
+        # 否则受限用户可以把一个更大的 token 降级/改写为自身范围（实测曾返回 200）。
+        ensure_can_grant(actor, scopes=rec.get("scopes") or [],
+                         allow_buckets=rec.get("allow_buckets") or [],
+                         allow_prefixes=rec.get("allow_prefixes") or {},
+                         action="更新")
         if body.user is not None and body.user.strip():
             rec["user"] = body.user.strip()
         if body.role is not None and body.role.strip():
@@ -287,7 +337,7 @@ async def update_token_entry(value: str, body: TokenUpdate, request: Request,
                     prefixes = [prefixes]
                 if not isinstance(prefixes, list):
                     raise HTTPException(400, detail=f"allow_prefixes[{b}] 必须是数组")
-                clean_prefixes[b] = [str(x).strip().strip("/") for x in prefixes if str(x).strip()]
+                clean_prefixes[b] = storage.normalize_prefixes(prefixes)
             rec["allow_prefixes"] = clean_prefixes
         if body.expires_at is not None:
             rec["expires_at"] = body.expires_at.strip()
@@ -295,15 +345,46 @@ async def update_token_entry(value: str, body: TokenUpdate, request: Request,
             rec["description"] = body.description.strip()
         if body.enabled is not None:
             rec["enabled"] = bool(body.enabled)
+        # 资源范围必须自洽：写了路径前缀就必须把该 bucket 纳入 allow_buckets，
+        # 否则未被点名的 bucket 会不受限制（静默放大权限）。
+        storage.validate_scope_range(rec.get("allow_buckets"), rec.get("allow_prefixes"))
+        # 防提权：校验**更新后的最终授权**不超出操作者自身范围。
+        # 这同时覆盖「目标 token 本来就比自己大」的情况（不允许受限用户改动更大的 token）。
+        ensure_can_grant(actor, scopes=rec.get("scopes") or [],
+                         allow_buckets=rec.get("allow_buckets") or [],
+                         allow_prefixes=rec.get("allow_prefixes") or {},
+                         action="更新")
         raw[value] = rec
         storage._save_tokens(raw)
+    storage.audit("token_update", "", "", actor.actor,
+                  request.client.host if request.client else "",
+                  extra={"user": rec.get("user"), "role": rec.get("role"),
+                         "scopes": rec.get("scopes"),
+                         "allow_buckets": rec.get("allow_buckets"),
+                         "allow_prefixes": rec.get("allow_prefixes"),
+                         "enabled": rec.get("enabled", True),
+                         "expires_at": rec.get("expires_at", "")})
     return {"code": 0, "message": "success", "data": _record_public(value, rec, False)}
 
 
 @router.delete("/api/tokens")
 async def del_token(value: str, request: Request,
                     actor: Principal = Depends(require_scope("token:delete"))):
-    """移除 token（如用户重置/注销）；value 为要删除的 token"""
+    """移除 token（如用户重置/注销）；value 为要删除的 token
+
+    防提权：非共享 token 只能删除「授权不超出自己」的 token（否则 403）。
+    """
+    if not actor.is_admin:
+        # 用原始记录（而非 get_token_record）判断：目标即使已过期/禁用，
+        # 也不能成为绕过范围限制的删除对象。
+        raw = storage._read_tokens_raw()
+        target = (value or "").strip()
+        if target in raw:
+            rec = storage._normalize_token_record(raw[target], target)
+            ensure_can_grant(actor, scopes=rec.get("scopes") or [],
+                             allow_buckets=rec.get("allow_buckets") or [],
+                             allow_prefixes=rec.get("allow_prefixes") or {},
+                             action="删除")
     result = storage.remove_token(value)
     storage.audit("token_delete", "", "", actor.actor,
                   request.client.host if request.client else "",
@@ -332,6 +413,31 @@ async def list_audit(request: Request,
                      since: str = Query("", description="只取 >= 此时间（YYYY-MM-DD 或完整）"),
                      limit: int = Query(500, ge=0, description="最多返回条数（0 表示不返回）"),
                      _actor: Principal = Depends(require_scope("audit:read"))):
-    """查询审计日志（谁在何时上传/下载/删除/生成签名）"""
-    rows = storage.query_audit(bucket, key, actor, since, limit)
+    """查询审计日志（谁在何时上传/下载/删除/生成签名）
+
+    资源范围：**受限**的非共享 token（配置了 `allow_buckets` / `allow_prefixes`）
+    只返回其范围内、且**归属到具体 bucket** 的记录。bucket 为空的全局事件
+    （token_create / token_update / token_delete / config_reload 等）无法归属到任何范围，
+    且会泄露其他 token 的 user/role/scopes，故对受限 token 不返回；
+    未配置范围的普通 token 与共享 access_token 行为不变（可见全量）。
+    """
+    if _actor.is_admin:
+        rows = storage.query_audit(bucket, key, actor, since, limit)
+    elif _actor.allow_buckets or _actor.allow_prefixes:
+        def _visible(rec):
+            b = (rec.get("bucket") or "").strip()
+            if not b:
+                return False
+            if not resource_allowed(_actor, b, rec.get("key", "") or ""):
+                return False
+            # rename 记录会把目标路径放在顶层 to_key：若目标落在外面前缀之外，
+            # 只凭 key（源）放行会顺带泄露范围外的路径。
+            to_key = rec.get("to_key")
+            if to_key and not resource_allowed(_actor, b, str(to_key)):
+                return False
+            return True
+
+        rows = storage.query_audit(bucket, key, actor, since, limit, predicate=_visible)
+    else:
+        rows = storage.query_audit(bucket, key, actor, since, limit)
     return {"code": 0, "message": "success", "data": rows}

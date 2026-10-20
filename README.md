@@ -1,6 +1,6 @@
 # ArtifactDepot — 对象存储仓库站点
 
-> 版本 0.7.4，端口 8004，独立服务
+> 版本 0.8.0，端口 8004，独立服务
 
 **一句话**：按行业标准（对象存储 / S3 模型）设计的文件仓库站点，收存处理产物（视频 / 文件），提供上传、列表、Range 下载、删除、新建目录、签名链接与审计，并带网页界面。业务 JSON 数据在 DataHub，**本服务不承担业务逻辑**。
 
@@ -80,20 +80,20 @@
 
 ```bash
 cd ArtifactDepot
-./build_image.sh                     # 构建 localhost/artifactdepot:0.7.4 + 自动导出 artifactdepot-0.7.4.tar
+./build_image.sh                     # 构建 localhost/artifactdepot:0.8.0 + 自动导出 artifactdepot-0.8.0.tar
 ```
 
 2. 把 tar 拷到生产机
 
 ```bash
-scp artifactdepot-0.7.4.tar apyyc@<生产机>:~/SERVER/artifactdepot/
+scp artifactdepot-0.8.0.tar apyyc@<生产机>:~/SERVER/artifactdepot/
 ```
 
 3. 生产机导入并部署
 
 ```bash
 cd ~/SERVER/artifactdepot
-podman load -i artifactdepot-0.7.4.tar
+podman load -i artifactdepot-0.8.0.tar
 cd ArtifactDepot
 ./deploy_container.sh --token <你的管理员token>   # 默认 host 网络；datahub_url 用挂载的 config.json
 ```
@@ -126,7 +126,7 @@ pip install -r requirements.txt
 
 ```bash
 cd ArtifactDepot
-./build_image.sh                      # 构建 + 自动导出 artifactdepot-0.7.4.tar
+./build_image.sh                      # 构建 + 自动导出 artifactdepot-0.8.0.tar
 ```
 
 常用参数：
@@ -136,7 +136,7 @@ cd ArtifactDepot
 | `--no-save` | 只构建，不导出 tar |
 | `--save /path/to/out.tar` | 指定导出路径（默认同目录 `artifactdepot-<tag>.tar`） |
 | `--no-cache` | 不用构建缓存（依赖层有改动时用） |
-| `--tag <版本>` | 自定义版本标签（默认 0.7.4） |
+| `--tag <版本>` | 自定义版本标签（默认 0.8.0） |
 | `--load /path/to/in.tar` | 不构建，直接导入已有 tar |
 | `--list` | 只列出本地镜像 |
 
@@ -146,9 +146,9 @@ cd ArtifactDepot
 
 ```bash
 # 导出（等价于 build_image.sh 的自动步骤）
-podman save -o artifactdepot-0.7.4.tar localhost/artifactdepot:0.7.4
+podman save -o artifactdepot-0.8.0.tar localhost/artifactdepot:0.8.0
 # 目标机导入
-podman load -i artifactdepot-0.7.4.tar
+podman load -i artifactdepot-0.8.0.tar
 ```
 
 ---
@@ -388,9 +388,11 @@ cp src/artifactdepot/config/config.production.json ~/SERVER/artifactdepot/config
 ```
 ArtifactDepot/
 - README.md / CHANGELOG.md / VERSION        # VERSION 是版本号唯一源
-- LICENSE / LICENSE.zh-CN.md / LICENSE-HEADER  # Apache-2.0（英文版 / 中文版 / 源文件署名模板）
-- docs/                          # docs/api_rules.md（接口文档）、docs/architecture.md（架构说明）
+- LICENSE / LICENSE.zh-CN.md      # Apache-2.0（英文版 / 中文版）
+- docs/                          # docs/api_rules.md（接口文档）、docs/architecture.md（架构说明）、
+                                 #   docs/LICENSE-HEADER（源文件 SPDX 署名约定，本地留存不进 git）
 - check_ad_sync.sh               # 生产诊断脚本（python3-only，不依赖 curl/jq）
+- scripts/add_spdx_headers.py    # SPDX 署名头补写/校验（幂等；--check 可用于 CI）
 - .dockerignore / .gitignore     # 构建上下文与版本控制排除规则
 - Dockerfile                     # 单阶段镜像（python:3.12-alpine + supervisor + tzdata）
 - docker/supervisord.conf        # supervisor 托管 uvicorn（8004）
@@ -620,17 +622,17 @@ curl -o out.mp4 "$BASE/api/objects/download?bucket=音视门carryVdeio&key=任�
 
 # 签名链接 —— 按时效
 curl -X POST -H "Content-Type: application/json" -H "Authorization: Bearer $USER" \
-  -d '{"bucket":"音视门carryVdeio","key":"artifactdepot_0.7.4.tar","mode":"time","expires":3600}' \
+  -d '{"bucket":"音视门carryVdeio","key":"artifactdepot_0.8.0.tar","mode":"time","expires":3600}' \
   "$BASE/api/objects/presign"
 
 # 签名链接 —— 按次数（3 次）
 curl -X POST -H "Content-Type: application/json" -H "Authorization: Bearer $USER" \
-  -d '{"bucket":"音视门carryVdeio","key":"artifactdepot_0.7.4.tar","mode":"count","count":3}' \
+  -d '{"bucket":"音视门carryVdeio","key":"artifactdepot_0.8.0.tar","mode":"count","count":3}' \
   "$BASE/api/objects/presign"
 
 # 签名链接 —— 永久
 curl -X POST -H "Content-Type: application/json" -H "Authorization: Bearer $USER" \
-  -d '{"bucket":"音视门carryVdeio","key":"artifactdepot_0.7.4.tar","mode":"permanent"}' \
+  -d '{"bucket":"音视门carryVdeio","key":"artifactdepot_0.8.0.tar","mode":"permanent"}' \
   "$BASE/api/objects/presign"
 
 # 删除（需 object:delete；目录仅空可删）
@@ -690,6 +692,6 @@ curl -X POST -H "Authorization: Bearer $ADMIN" "$BASE/api/tokens/sync"
 
 - **许可证**：Apache License 2.0（SPDX 标识 `Apache-2.0`），英文版见 [LICENSE](LICENSE)，中文版见 [LICENSE.zh-CN.md](LICENSE.zh-CN.md)。
 - **版权**：Copyright 2026 apyyc。
-- **源文件署名**：[LICENSE-HEADER](LICENSE-HEADER) 是官方推荐的源文件署名模板，复制到文件头即可。
+- **源文件署名**：全部第一方源文件带 SPDX 双行头（`# Copyright 2026 apyyc` + `# SPDX-License-Identifier: Apache-2.0`）。补写与校验用 `python3 scripts/add_spdx_headers.py`（`--check` 缺头即退出码 1，可进 CI）。第三方 vendored 静态资源（swagger-ui / redoc）保留原作者版权，不加本声明。各语言注释写法与豁免清单见 `docs/LICENSE-HEADER`——该文件**仅本地与镜像内留存，不随 git 分发**，因此公开仓库中可能不存在；对外以本节的声明与 `LICENSE` 为准。
 - **支持**：2479511984@qq.com；版本记录见 [CHANGELOG.md](CHANGELOG.md)。
 - **相关**：依赖 DataHub（用户/token 权威源）与协作平台（「查看我的 Token」）；处理端对接见 [docs/architecture.md](docs/architecture.md)。

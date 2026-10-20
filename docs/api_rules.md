@@ -1,6 +1,10 @@
 # ArtifactDepot 接口文档
 
-> 版本 0.7.4 · FastAPI 服务 · 默认端口 8004
+> 版本 0.8.0 · FastAPI 服务 · 默认端口 8004
+>
+> **文档勘误（本次按实现逐条校对）**：修正 `public_ip`（客户端自报值一律忽略）、`ETag` 回退规则、错误码表（补 `503`、修正「未配置 access_token → 401」、补「删除非空目录 → 400」）、`auth/check` 成功/失败字段差异、`config/reload` 失败为 `400`、`head`/`health/ready` 返回字段、`Token` 注册表返回结构、`§8` 总表补全并统一 `{link_id}`、`user` 角色补 `link:list`/`link:revoke`；并登记 4 个**已知缺陷**（`OBJ-001/002/003~005/006`，证据见 `reports/final_test_report.md`）。
+>
+> Unreleased 变更：**令牌资源范围（bucket / 路径前缀）硬化为硬边界**——带 token 的读请求在无效 token 时返回 `401`、缺 scope 或范围越界返回 `403`（此前会静默降级为匿名 / 返回 `200`）；审计只返回 token 范围内的记录；非共享 token 不能创建 / 更新超出自身范围的 token（`403`）。详见 1.4、2.2、4.2、5、6、12.4。
 >
 > 0.7.1 变更：新增 `GET /api/docs`（公开、只读文档清单 + 内容，供查看原始 Markdown）；网页 UI 标签栏右侧提供 Swagger / ReDoc 入口（FastAPI 自动生成，可在线调试）；修复两处与文档语义不一致的问题：`scopes: []` 现在真正表示「无权限」（此前会被回退成角色预设），`require_read_token=true` 时资源范围外调用 `GET /api/objects/list` 返回 `403`（此前会忽略范围过滤、返回白名单外 bucket 的内容）。
 >
@@ -26,7 +30,7 @@ http://<主机IP>:8004
 
 ### 1.2 统一响应格式
 
-除下载文件、网页 UI 与 `/health` 外，所有接口返回 JSON，统一结构：
+除下载文件、网页 UI、`/health`、`/health/live`、`/health/ready` 与 `/metrics`（Prometheus 文本）外，所有接口返回 JSON，统一结构：
 
 ```json
 {
@@ -54,7 +58,7 @@ token 的传递方式（**推荐请求头**）：
 1. **请求头（推荐）**：`Authorization: Bearer <令牌>`——不落 URL、不进浏览器历史/Referer/访问日志。
 2. **URL query（兼容）**：`?token=<令牌>`——服务端访问日志会把 `token` / `tk` / `sig` 等参数值脱敏为 `***`，但仍建议优先用请求头。
 
-> 注意：上传接口（`POST /api/objects`）额外支持把 token 作为 **multipart 表单字段** `token=` 传递（见 2.1，兼容旧客户端）。
+> 注意：**multipart 接口**（`POST /api/objects`、`/api/objects/chunk`、`/api/objects/complete`、`/api/objects/abort`）额外支持把 token 作为 **multipart 表单字段** `token=` 传递（兼容旧客户端）。`POST /api/objects/initiate` 的 body 为空，**只认** query `?token=` 或 `Authorization: Bearer`。
 
 token 校验规则：
 
@@ -73,9 +77,19 @@ token 校验规则：
 
 | 等级 | 说明 | 适用接口 |
 |---|---|---|
-| 公开（默认，可收紧） | 知道地址即可调，内网设计；`require_read_token=true` 时读接口也需 scope | `/health`、`/api/auth/check`、`/api/auth/permissions`、`/api/docs`、`/api/objects/signed-links/config`、`/`，以及默认公开的 `GET /api/buckets`、`GET /api/objects/list` |
+| 公开（默认，可收紧） | 知道地址即可调，内网设计；`require_read_token=true` 时读接口也需 scope | `/health`、`/health/live`、`/health/ready`、`/metrics`、`/api/auth/check`、`/api/auth/permissions`、`/api/docs`、`/api/docs/{name}`、`/api/objects/signed-links/config`、`/`，以及默认公开的 `GET /api/buckets`、`GET /api/objects/list` |
 | 按 scope 授权 | 生成 token 时勾选对应权限点 | 上传/下载/建目录/改名/删除/签名链接/分片/审计/token 管理等 |
 | 管理员 | 共享 `access_token` | 全部 |
+
+> **资源范围（bucket / 路径前缀）是硬边界（本版硬化）**：用户 token 可携带 `allow_buckets` / `allow_prefixes`（字段见 12.4）。设置后该 token 只能访问范围内的 bucket 与路径前缀：
+>
+> - **范围内**：正常放行（仍需具备对应权限点）；
+> - **范围外**：一律 `403`，不再「按匿名处理」静默放行，也不再返回范围外内容；
+> - **带了 token 就必须有效**：无效 / 过期 / 禁用 token 返回 `401`，不再静默降级为匿名；
+> - **范围为空 = 不限制**（全部 bucket，含将来新建的 bucket）；共享 `access_token` 永不限范围；
+> - **不能借 token 提权**：非共享 token 创建 / 更新 token 时，请求的权限点与范围不得超出自身（见第五章、12.4）。
+>
+> 这是**行为变更**：此前携带越界 token 的读请求（`GET /api/objects/list`、`GET /api/buckets`）会返回 `200`，现在返回 `403`。
 
 > 安全提示：默认仍保留 `list` / `buckets` 内网公开以兼容历史；若需最小权限，可设 `require_read_token=true` 并给读方签发 `bucket:list` / `object:list`。**不宜将 8004 直接暴露公网。**
 
@@ -85,6 +99,7 @@ token 校验规则：
 
 - 非空，长度 ≤ 63 字符。
 - 不允许以 `.` 开头，不允许包含 `/`、`\` 及控制字符。
+- **首尾不允许空白字符**：落盘校验返回 `400`（携带受限 token 时可能先被资源范围校验拦成 `403`）。否则会出现「授权按去空白后的名字比较、落盘按原名取目录」的错配，可跨 bucket 越权。
 - 允许中文等 Unicode。
 - **无需预创建**：首次上传或 mkdir 时自动创建目录。
 
@@ -100,14 +115,21 @@ token 校验规则：
 
 | HTTP 状态码 | 含义 |
 |---|---|
-| 400 | 参数非法（bucket/key 非法、prefix 越界等） |
-| 401 | 缺少/无效令牌、token 无效、签名无效或过期 |
-| 403 | 已认证但权限不足（缺权限点、token 资源范围越界、非创建者作废他人链接） |
-| 404 | 对象/目录不存在 |
+| 400 | 参数非法（bucket/key 非法、prefix 越界、**删除非空目录**、签名链接 `count`/`expires` 越界、`allow_prefixes` 规范化或范围自洽校验失败） |
+| 401 | 缺少/无效令牌、token 无效/过期/禁用、签名无效或过期 |
+| 403 | 已认证但权限不足（缺权限点、token 资源范围越界、非创建者作废他人链接、非共享 token 越权创建/修改/删除 token） |
+| 404 | 对象/目录不存在（token 不存在时 `DELETE`/`PUT` 也返回 404） |
 | 409 | 对象已存在（`overwrite=false` 时） |
-| 413 | 超过单文件上传上限 `max_upload_mb` |
+| 413 | 超过单文件上传上限 `max_upload_mb`（分片单块超限亦同） |
 | 422 | 请求参数校验失败（字段缺失、类型错误等），`detail` 为数组 |
-| 500 | 服务端异常（如未配置 access_token） |
+| 500 | 服务端异常。**注意**：未配置 `access_token` 时为 `401`（fail-closed），不是 500 |
+| 503 | `/health/ready` 就绪检查失败（depot 目录不存在或不可写） |
+
+> **已知缺陷（待修，证据见 `reports/final_test_report.md`）**
+> - `OBJ-003/004/005`：上传 / 建目录 / 分片合并时，若目标 key 已是目录、或父路径是文件 → 返回 **500**（应为 `400`/`409`），且响应体不是统一 JSON。
+> - `OBJ-001`：`rename` 的文件↔目录类型冲突 → **500**；目录移动**中途失败不回滚**（可能留下部分移动 + 清单不一致）。
+> - `OBJ-002`：`rename` 以 `overwrite=true` 覆盖既有文件后，清单与 `ETag` 仍为旧值，旧 `ETag` 条件下载会返回 `304`。
+> - `OBJ-006`：`presign` 返回的 `url` 未做 URL 编码，key 含 `&`、`#`、`+` 时该链接不可直接使用（改用显式 `bucket`/`key`/`link`/`tk` 参数即可）。
 
 ---
 
@@ -131,7 +153,7 @@ POST /api/objects
 | `token` | string | 条件 | 访问令牌（也可走 query `?token=` 或 `Authorization: Bearer`） |
 | `source_url` | string | 否 | 来源 URL，记入元数据 |
 | `overwrite` | bool | 否 | 是否覆盖同名对象，默认 `true` |
-| `public_ip` | string | 否 | 前端上报的公网 IP，表单字段或 query，记入审计 |
+| `public_ip` | string | 否 | **兼容占位，值被忽略**：审计公网 IP 只由服务端按 `trusted_proxies` 解析 `X-Forwarded-For`（见 10.8） |
 
 **成功响应**（200）：
 
@@ -160,7 +182,14 @@ curl -X POST "http://<IP>:8004/api/objects" \
 GET /api/objects/list
 ```
 
-**鉴权**：公开（无鉴权）
+**鉴权**：
+
+- **不带 token**：公开（`require_read_token=false` 时匿名可调；`true` 时返回 `401` 缺少访问令牌）。
+- **带 token**：必须**有效**（无效 / 过期 / 禁用 → `401`）且具备权限点 `object:list`（缺失 → `403`）；
+  并且 `bucket` / `prefix` 必须落在该 token 的资源范围内，**越界 → `403`**（不再降级为匿名返回 `200`）。
+  共享 `access_token` 不受资源范围限制。
+
+> 注意：`require_read_token=true` 时「无 token」与「token 无效」都是 `401`；`token` 有效但缺 `object:list` 或 bucket/prefix 越界都是 `403`。资源范围为空表示不限制。
 
 **查询参数**：
 
@@ -212,7 +241,7 @@ GET /api/objects/download
 
 **响应**：文件流，支持 **Range（206）** 视频拖动，`Content-Type` 按扩展名推断。
 
-**ETag / 条件请求**：响应带 `ETag`（强 ETag = SHA-256）；请求头 `If-None-Match` 命中时返回 **304**，不传输文件体。
+**ETag / 条件请求**：响应带 `ETag`——有清单记录时为强 ETag（SHA-256）；手工放入、无 `.warehouse.json` 记录的文件回退为 `"<size>-<mtime>"`。请求头 `If-None-Match` 命中时返回 **304**，不传输文件体。
 
 > 对象不存在时返回 `404`；签名链接会先检查对象存在，再扣减次数，避免无效消费。
 
@@ -234,7 +263,7 @@ DELETE /api/objects
 
 **鉴权**：权限点 `object:delete`（管理员共享 token 始终放行；普通用户 token 需显式授予该权限点）
 
-**查询参数**：`bucket`（必填）、`key`（必填）、`public_ip`（可选，记入审计）。
+**查询参数**：`bucket`（必填）、`key`（必填）。审计公网 IP 由服务端按 `trusted_proxies` 解析，不接受客户端自报。
 
 **说明**：删除文件或目录；目录仅空目录可删（防误删）。无 token/无效 token 返回 `401`，token 缺少 `object:delete` 返回 `403`。
 
@@ -256,7 +285,9 @@ POST /api/objects/mkdir
 { "bucket": "voicevideo", "key": "story/20260912" }
 ```
 
-**说明**：按 key 建目录树（`/` 多级自动创建），放隐藏 `.keep` 占位；bucket 不存在时随目录一并创建。可选 query `public_ip` 记入审计。
+**说明**：按 key 建目录树（`/` 多级自动创建），放隐藏 `.keep` 占位；bucket 不存在时随目录一并创建。
+
+> **已知缺陷 `OBJ-004`**：若 key 或父路径已是**文件**，当前返回 `500`（应为 `400`）。
 
 ```bash
 curl -X POST "http://<IP>:8004/api/objects/mkdir?token=<token>" \
@@ -283,10 +314,12 @@ POST /api/objects/rename
 
 **语义说明**：
 
-- 主要用于**目录改名/移动**：服务端整体迁移该前缀下的全部对象与 `.keep` 占位，保证原子性（失败即整体回滚）。
+- 主要用于**目录改名/移动**：服务端整体迁移该前缀下的全部对象与 `.keep` 占位。**业务冲突**（如目标已存在且 `overwrite=false`）会整体回滚；但底层 I/O 异常（如目标路径类型冲突）**不会回滚**，可能留下部分移动——见下方已知缺陷。
 - 也可用于单个对象改名（key 指向文件时）。
 - `new_key` 与 `key` 校验规则同 1.5；不允许把目录移动到自身子目录（`new_key` 以 `key + "/"` 开头时返回 `400`）。
-- 源不存在返回 `404`；审计记录含 `from_key` / `to_key`。可选 query `public_ip` 记入审计。
+- 源不存在返回 `404`；审计记录含 `from_key` / `to_key`。审计公网 IP 由服务端按 `trusted_proxies` 解析，不接受客户端自报。
+- **已知缺陷 `OBJ-001`**：文件↔目录类型冲突（如把文件改名为已存在的目录）返回 **`500`**，且目录移动中途失败**不回滚**——部分文件已被移动、清单仍指向旧路径。
+- **已知缺陷 `OBJ-002`**：`overwrite=true` 覆盖既有文件后，`.warehouse.json` 与 `ETag` 仍是**被覆盖文件的旧值**；用旧 `ETag` 条件下载会得到 `304`，客户端拿不到新内容。
 
 **成功响应**（200）：
 
@@ -314,7 +347,7 @@ GET /api/objects/head
 
 **查询参数**：`bucket`（必填）、`key`（必填）。
 
-**说明**：轻量探测文件或目录是否存在。存在时返回 `data`：`{ "exists": true, "is_dir": false, "size": 123, "sha256": "...", "mtime": "2026-10-07T16:20:09Z" }`（`mtime` 统一为 UTC ISO8601，与 list 一致）。**不存在时返回 `404`**（S3 HeadObject 语义）。响应带 `ETag`，`If-None-Match` 命中返回 **304**。
+**说明**：轻量探测文件或目录是否存在。存在时返回 `data`：`{ "exists": true, "is_dir": false, "bucket": "...", "key": "...", "size": 123, "sha256": "...", "mtime": "2026-10-07T16:20:09Z" }`（`mtime` 统一为 UTC ISO8601，与 list 一致；**目录分支不含 `sha256`**，`is_dir=true`）。**不存在时返回 `404`**（S3 HeadObject 语义）。响应带 `ETag`，`If-None-Match` 命中返回 **304**。
 
 ### 2.8 生成签名下载链接（Presign / 共享链接）
 
@@ -341,13 +374,15 @@ POST /api/objects/presign
   "url": "/api/objects/download?bucket=..&key=..&link=<id>&tk=<token>",
   "id": "<link_id>",
   "mode": "time",
-  "max_uses": 1,
-  "remaining": 1,
+  "max_uses": null,
+  "remaining": null,
   "expires": "<时间戳>"
 }
 ```
 
-**说明**：返回的 `url` 即「共享链接」，可在无 token 情况下限次/限时/永久下载。生成时只校验 bucket/key 格式，不强制对象已存在；可选 query `public_ip` 记入审计。
+**说明**：返回的 `url` 即「共享链接」，可在无 token 情况下限次/限时/永久下载。生成时只校验 bucket/key 格式，不强制对象已存在。`max_uses` / `remaining` 仅在 `mode=count` 时有值，`time` / `permanent` 为 `null`。
+
+> **已知缺陷 `OBJ-006`**：`url` 未做 URL 编码，key 含 `&`、`#`、`+` 时链接不可直接使用（`&` → key 被截断为 404；`#` → 丢掉 `link`/`tk` 变 401；`+` → 被当成空格 404）。此时请改用显式参数并自行编码：`/api/objects/download?bucket=<enc>&key=<enc>&link=<id>&tk=<tk>`。
 
 ### 2.9 签名链接配置
 
@@ -373,7 +408,7 @@ GET /api/objects/signed-links
 POST /api/objects/signed-links/{link_id}/revoke
 ```
 
-**鉴权**：权限点 `link:revoke`；管理员可作废任意，用户只能作废自己创建的。可选 query `public_ip` 记入审计。
+**鉴权**：权限点 `link:revoke`；管理员可作废任意，用户只能作废自己创建的。审计公网 IP 由服务端按 `trusted_proxies` 解析，不接受客户端自报。
 
 ---
 
@@ -409,7 +444,9 @@ POST /api/objects/complete
 
 **鉴权**：权限点 `upload:complete`（并校验 bucket/key 资源范围）
 
-**请求**（multipart）：`upload_id`、`bucket`、`key`、`total_chunks`、可选 `source_url`、`overwrite`、`public_ip`。
+**请求**（multipart）：`upload_id`、`bucket`、`key`、`total_chunks`，可选 `source_url`、`overwrite`。审计公网 IP 由服务端按 `trusted_proxies` 解析（`public_ip` 字段仅为兼容占位，值被忽略）。
+
+> **已知缺陷 `OBJ-005`**：若目标 key 已是**目录**，当前返回 `500`（应为 `400`/`409`）；会话保留、未落盘。
 
 ### 3.4 取消分片上传
 
@@ -438,7 +475,7 @@ GET /health
 ### 4.1.1 存活/就绪
 
 - `GET /health/live`：进程存活即 200 `{ "status": "alive" }`；
-- `GET /health/ready`：depot 目录存在且可写才 200 `{ "status": "ready" }`，否则 `503`；
+- `GET /health/ready`：depot 目录存在且可写才 200 `{ "status": "ready", "depot_dir": "..." }`，否则 `503`；
 - `GET /metrics`：Prometheus 文本格式（`metrics_enabled=false` 时 404）。
 
 ### 4.1.2 手动重新加载配置
@@ -449,7 +486,10 @@ POST /api/config/reload
 
 **鉴权**：仅管理员共享 token。
 
-**说明**：重新读取 `config/config.json` 与 `config/.env`，返回 `{ok, error, changed, needs_restart, warnings}`；`changed` 已即时生效，`needs_restart` 需重启（保留旧值）；语法错误时 `ok=false` 且旧配置保留。
+**说明**：重新读取 `config/config.json` 与 `config/.env`。
+
+- **成功**：HTTP `200`，`data = {ok: true, error: "", changed: [...], needs_restart: [...], warnings: [...]}`。`changed` 已即时生效；`needs_restart` 需重启才生效（当前保留旧值）。
+- **失败**（配置文件语法错误等）：HTTP **`400`**，响应体为 `{"detail": "<可读原因>"}`；**不会**返回 `200 + data.ok=false`。旧配置及其行为保持不变。
 
 ### 4.2 列出所有 bucket
 
@@ -457,7 +497,11 @@ POST /api/config/reload
 GET /api/buckets
 ```
 
-**鉴权**：公开（默认内网开放）；`require_read_token=true` 时需权限点 `bucket:list`；带资源范围的 token 只列出允许的 bucket。
+**鉴权**：
+
+- **不带 token**：公开（默认内网开放）；`require_read_token=true` 时返回 `401`。
+- **带 token**：必须**有效**且具备权限点 `bucket:list`（无效 → `401`，缺失 → `403`）。
+- **范围过滤**：带资源范围的 token 只返回其 `allow_buckets` 内的 bucket（范围外的 bucket 不会出现在结果中）；`allow_buckets` 为空时不限制、返回全部。
 
 **说明**：返回 `data` 为 bucket 名字符串数组。
 
@@ -491,7 +535,9 @@ GET /api/auth/check?token=<token>
 
 **鉴权**：公开（带 token 返回其身份与权限）
 
-返回 `data`：`{ "valid": bool, "actor": "系统/工具" 或 用户名, "role", "scopes", "allow_buckets", "allow_prefixes", "expires_at", "expired", "enabled" }`。
+返回 `data`（**成功**）：`{ "valid": true, "actor": "系统/工具" 或 用户名, "role", "is_admin", "scopes", "allow_buckets", "allow_prefixes", "expires_at", "description" }`。
+
+**失败**（不存在 / 无效 / 过期 / 禁用）返回 `valid: false`，并**额外**带 `expired`、`enabled` 两个字段，便于前端区分「过期」与「无效」。注意：**成功分支不返回** `expired` / `enabled`。
 
 ---
 
@@ -499,21 +545,48 @@ GET /api/auth/check?token=<token>
 
 以下接口分别需要权限点 `token:read` / `token:write` / `token:delete` / `token:sync`（管理员共享 `access_token` 放行全部）。token 通过 `?token=` 或 `Authorization: Bearer` 传递。
 
-### 5.1 查看 token 映射
+> **防提权（本版硬化）**：非共享 token（普通用户 token）调用下列写接口创建 / 更新 token 时，请求的 `scopes`、`allow_buckets`、`allow_prefixes` 必须**不超出自身授权**，否则返回 `403`：
+>
+> - `scopes` ⊆ 自身 scopes（`role` 预设先展开成 scopes 再校验）；
+> - `allow_buckets` ⊆ 自身 `allow_buckets`（自身为空 = 不限，则允许任意）；受限 token 把范围**清空 / 放宽为「全部 bucket」**同样 `403`；
+> - `allow_prefixes` 只能比自身更窄：自身在某 bucket 上有限制时，新 token 覆盖该 bucket 必须显式给出更窄前缀，不能靠「不写前缀」绕过。
+>
+> `PUT /api/tokens/{value}` 还会校验**目标 token 的现有授权**也不超出自身，防止借更新他人 token 扩权。共享 `access_token` 不受上述限制。
+
+### 5.1 查看 token 注册表
 
 ```
 GET /api/tokens
 ```
 
-返回 token → 用户名的映射。
+返回 `data` 为**对象**：键是**脱敏后的 token**（`前缀****后缀-短哈希`，保证唯一），值是完整记录
+`{user, role, scopes, allow_buckets, allow_prefixes, expires_at, expired, enabled, description, created_at, created_by, last_used_at, token}`。
+非共享 token 调用时 `token` 字段仍是脱敏值；只有**共享 `access_token`** 且 `?reveal=true` 时才返回明文键与明文 `token`。
 
-### 5.2 登记 / 更新 token
+### 5.2 登记 / 更新 token（POST / PUT）
 
 ```
 POST /api/tokens
 ```
 
 **请求体**（JSON）：完整字段见 12.4（`user` / `token` / `role` / `scopes` / `allow_buckets` / `allow_prefixes` / `expires_at` / `description`）。仅传 `token`+`user` 为兼容旧协议的登记，只更新用户名、保留已有权限。
+
+**覆写既有 token = 更新（合并语义）**：显式传入的 `token` 若已在注册表中，按 `PUT` 的合并规则处理——**未传字段一律保留**。因此不会因为「重新登记一次」就把 `allow_buckets` 清空成「全部 bucket」、把 `expires_at` 清成「永久」、或把已禁用 token 复活；审计记为 `token_update` 而非 `token_create`。要改这些字段请显式传值（或走 `PUT`）。
+
+**防提权**：非共享 token 调用时，请求的 scopes / 资源范围必须 ⊆ 自身授权，否则 `403`（规则见本章开头）。
+
+**更新已有 token：`PUT /api/tokens/{value}`**
+
+```
+PUT /api/tokens/{value}
+```
+
+- 路径参数 `value` 为要更新的 token（不存在 → `404`）。
+- 请求体（JSON，字段**均可选**）：`user` / `role` / `scopes` / `allow_buckets` / `allow_prefixes` / `expires_at` / `description` / `enabled`。
+- **不传的字段沿用原值**（含 `enabled`、`last_used_at`）；传 `role` 而未传 `scopes` 时按角色预设重置 scopes。
+- 写审计 `token_update`。
+- **防提权（双向）**：先校验**目标 token 现有授权** ⊆ 自身，再校验**更新后授权** ⊆ 自身；任一越界 → `403`。因此受限 token 既不能给自己扩权，也不能修改/降级比自己更大的 token。
+- `allow_prefixes` 的规范化与「前缀必须属于 `allow_buckets`」校验同 12.4，违规 `400`。
 
 ### 5.3 移除 token
 
@@ -540,7 +613,14 @@ POST /api/tokens/sync
 GET /api/audit
 ```
 
-**鉴权**：权限点 `audit:read`
+**鉴权**：权限点 `audit:read`（无效 token → `401`，缺失 → `403`）
+
+**范围过滤（本版硬化）**：**配置了资源范围**的非共享 token（有 `allow_buckets` 或 `allow_prefixes`）只返回其范围内、且**归属到具体 bucket** 的审计记录；过滤在收集阶段完成，`limit` 语义不变（最多返回 `limit` 条**命中**记录）。
+
+> bucket 为空的**全局事件**（`token_create` / `token_update` / `token_delete` / `config_reload` 等）无法归属到任何范围，且会泄露其他 token 的 `user`/`role`/`scopes`，因此**对受限 token 不返回**；未配置范围的普通 token 与共享 `access_token` 行为不变（可见全量）。
+
+> 另：`POST` / `PUT` / `DELETE /api/tokens` 均写审计（`token_create` / `token_update` / `token_delete`）。
+> 受限 token 看到的 `rename` 记录同样按范围裁剪：若目标路径（`to_key`）落在其范围外，该记录整行不返回，避免泄露范围外路径。
 
 **查询参数**：
 
@@ -587,11 +667,17 @@ GET /api/docs/{name}?raw=1 # 直接返回 text/plain 原文
 | 方法 | 路径 | 权限点（scope） | 说明 |
 |---|---|---|---|
 | GET | `/health` | 公开 | 健康检查 |
-| POST | `/api/config/reload` | 仅管理员 | 手动重新加载配置 |
+| GET | `/health/live` | 公开 | 存活探针 |
+| GET | `/health/ready` | 公开 | 就绪探针（depot 不可写 → 503） |
+| GET | `/metrics` | 公开 | Prometheus 指标（`metrics_enabled=false` → 404） |
+| POST | `/api/config/reload` | 仅共享 token | 手动重新加载配置 |
 | GET | `/api/auth/check` | 公开 | 校验 token |
 | GET | `/api/auth/permissions` | 公开 | 权限点目录 |
 | GET | `/api/docs` | 公开 | 文档清单 |
 | GET | `/api/docs/{name}` | 公开 | 文档内容（`?raw=1` 返回 text/plain） |
+| GET | `/docs` | 公开 | Swagger UI（自托管，`include_in_schema=false`） |
+| GET | `/redoc` | 公开 | ReDoc（自托管） |
+| GET | `/openapi.json` | 公开 | OpenAPI 规范 |
 | GET | `/api/objects/signed-links/config` | 公开 | 签名链接上下限 |
 | GET | `/` | 公开 | 网页 UI |
 | GET | `/api/buckets` | 公开 · `bucket:list` | 列出 bucket |
@@ -605,7 +691,7 @@ GET /api/docs/{name}?raw=1 # 直接返回 text/plain 原文
 | GET | `/api/objects/download` | `object:download` / 签名 | 下载（Range） |
 | DELETE | `/api/objects` | `object:delete` | 删除对象/空目录 |
 | GET | `/api/objects/signed-links` | `link:list` | 列签名链接 |
-| POST | `/api/objects/signed-links/{id}/revoke` | `link:revoke` | 作废签名链接 |
+| POST | `/api/objects/signed-links/{link_id}/revoke` | `link:revoke` | 作废签名链接 |
 | POST | `/api/objects/initiate` | `upload:initiate` | 发起分片上传 |
 | POST | `/api/objects/chunk` | `upload:chunk` | 上传分片 |
 | POST | `/api/objects/complete` | `upload:complete` | 合并分片 |
@@ -635,6 +721,8 @@ ArtifactDepot 配置优先级：内置默认 < `config/config.json`（或 `ARTIF
 | `max_upload_mb` | 0（不限） | 单文件上传上限 |
 | `datahub_url` | `http://127.0.0.1:8002/api/data` | 用户 token 权威源 |
 | `ui_enabled` | true | 是否启用网页 UI |
+| `require_read_token` | false | 读接口（`GET /api/objects/list`、`GET /api/buckets`）是否强制要求携带有效 token 且具备对应 scope；`true` 时无 token → `401` |
+| `metrics_enabled` | true | 是否暴露 `GET /metrics`（Prometheus 文本格式）；`false` 时该路由返回 `404` |
 | `trusted_proxies` | `[]` | 可信反代 IP/CIDR；非空才从 XFF 解析审计 public_ip |
 | `audit_max_mb` | 50 | 审计日志单文件上限（MB），超过轮转 |
 | `audit_backups` | 5 | 审计日志保留历史文件数 |
@@ -804,7 +892,7 @@ GET /api/auth/permissions
 | `object:delete` | DELETE `/api/objects` | 删除对象/空目录 |
 | `link:create` | POST `/api/objects/presign` | 生成签名链接 |
 | `link:list` | GET `/api/objects/signed-links` | 查看签名链接列表 |
-| `link:revoke` | POST `/api/objects/signed-links/{id}/revoke` | 作废（本人；管理员任意） |
+| `link:revoke` | POST `/api/objects/signed-links/{link_id}/revoke` | 作废（本人；管理员任意） |
 | `token:read` | GET `/api/tokens` | 查看 token 注册表 |
 | `token:write` | POST `/api/tokens`、PUT `/api/tokens/{value}` | 生成/登记/更新 token |
 | `token:delete` | DELETE `/api/tokens` | 移除 token |
@@ -821,7 +909,7 @@ GET /api/auth/permissions
 | `publisher` | uploader + object:rename, link:create |
 | `operator` | publisher + bucket:create, object:delete, link:list, link:revoke |
 | `auditor` | bucket:list, object:list, audit:read, token:read |
-| `user` | 历史兼容：上传/下载/签名/建目录/建 bucket/改名，无删除与管理 |
+| `user` | 历史兼容：上传/下载/签名/建目录/建 bucket/改名 + 查看/作废自己的签名链接（`link:list` / `link:revoke`），无删除、无 token 管理、无审计 |
 | `custom` | 完全按勾选 |
 | `admin` | 全部权限点 |
 
@@ -841,12 +929,28 @@ POST /api/tokens
 | `token` | string | 否 | 留空由服务端生成（`secrets.token_urlsafe(32)`） |
 | `role` | string | 否 | 角色预设，默认 `user` |
 | `scopes` | string[] | 否 | **逐接口勾选结果**；传入则以此为准。显式空数组 = **无任何权限**（0.7.1 修复：此前会被回退成角色预设） |
-| `allow_buckets` | string[] | 否 | bucket 白名单，空 = 全部 |
+| `allow_buckets` | string[] | 否 | bucket 白名单，空 = 全部（网页「Token 管理」页可从现有 bucket 多选，也支持手填未创建的 bucket） |
 | `allow_prefixes` | object | 否 | `{"bucket": ["前缀/"]}`，路径边界安全匹配 |
 | `expires_at` | string | 否 | `YYYY-MM-DD` 或 ISO 时间；空 = 永久 |
 | `description` | string | 否 | 备注 |
 
-**响应**：`data` 为 token 记录，**仅本次返回明文 `token`**，请立即保存。
+> `enabled`（启用 / 禁用）**不在本接口请求体中**，只能通过 `PUT /api/tokens/{value}` 修改（POST 传了会被忽略）。
+
+**资源范围语义**：`allow_buckets` 与 `allow_prefixes` 均为**硬边界**（见 1.4）。两者都为空表示该 token **可访问全部 bucket**；填了 `allow_prefixes` 时，按 bucket 内的路径前缀收窄。
+
+> **只填 `allow_prefixes` 不合法**：必须同时把这些 bucket 列入 `allow_buckets`，否则未点名的 bucket 不受任何限制（静默放大权限），API 返回 **`400`**。
+
+> `allow_prefixes` 会被规范化：URL-decode、去首尾斜杠、去重；**拒绝**空段 / `.` / `..` / 反斜杠 / `null`，以及 normalize 后为空（如 `"/"`）的写法，一律 `400`。否则会造出「能创建但永不匹配」的死 token，或把「只允许根」静默变成「不限」。
+
+**网页前端校验**（Token 管理页「生成本轮 Token」）：
+
+- `allow_prefixes` 里出现的 bucket 必须已在 `allow_buckets` 中，否则**阻止提交**并提示（该规则后端同样强制，违反返回 `400`）；
+- `allow_buckets` 与 `allow_prefixes` 同时为空时，弹出**二次确认**：「该 token 可访问全部 bucket」；
+- 生成结果区展示「生效范围」，Token 注册表「资源范围」列为空时显示 **`⚠️ 全部 bucket`**。
+
+**防提权**：非共享 token 调用本接口时，请求的 `scopes` / `allow_buckets` / `allow_prefixes` 不得超出自身授权，否则 `403`（规则见第五章）；`role` 预设会先展开成 scopes 再校验。若 `token` **已存在**（即覆写既有 token），还会先校验**目标现有授权**不得超出自身，否则 `403`——防止降级他人更大的 token，或借覆写**复活已禁用 / 已过期的 token**。
+
+**响应**：`data` 为 token 记录（含 `scopes` / `allow_buckets` / `allow_prefixes` 等生效范围字段），**仅本次返回明文 `token`**，请立即保存。
 
 ```bash
 # 只给“往 voicevideo/carryvideo/2026/ 上传 + 列表”的 token

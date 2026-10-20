@@ -1,3 +1,6 @@
+# Copyright 2026 apyyc
+# SPDX-License-Identifier: Apache-2.0
+
 """权限点 / 自定义 Token 的端到端测试
 
 运行：
@@ -141,7 +144,8 @@ def test_expired_and_disabled_token(client):
     expired = _new_token(client, role="viewer", expires_at="2000-01-01")
     d = client.get("/api/auth/check", params={"token": expired}).json()["data"]
     assert d["valid"] is False and d["expired"] is True
-    assert client.get("/api/objects/list", params={"bucket": "b", "token": expired}).status_code == 200
+    # 资源范围硬化后，带过期 token 不再降级为匿名（fail-closed）：读接口返回 401
+    assert client.get("/api/objects/list", params={"bucket": "b", "token": expired}).status_code == 401
 
     tok = _new_token(client, role="viewer")
     assert client.put(f"/api/tokens/{tok}", params={"token": ADMIN}, json={"enabled": False}).status_code == 200

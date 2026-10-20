@@ -1,15 +1,106 @@
 # Changelog
 
-ArtifactDepot v0.7.4 — 所有对本项目的重要更改都将记录在此文件中。
+ArtifactDepot v0.8.0 — 所有对本项目的重要更改都将记录在此文件中。
 
 本日志格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本号遵循 [语义化版本规范](https://semver.org/lang/zh-CN/)。
 
 ---
 
-## [Unreleased]
+## [0.8.0] - 2026-10-21
+
+### 令牌资源范围硬化（bucket/前缀硬边界）
+
+#### Added
+
+- **Token 管理页 bucket 多选**：「Bucket 白名单」升级为「现有 bucket 复选框（含『全部 bucket』选项）+ 手填」，
+  进入 Token 页时自动调用 `GET /api/buckets` 渲染，提交时合并勾选与手填（去重、去空）；
+  新增「刷新现有 bucket」按钮，仍支持手填尚未创建的 bucket。
+- **生成前前端校验**：`allow_buckets` 与 `allow_prefixes` 同时为空时提示「该 token 可访问全部 bucket」
+  并要求二次确认；`allow_prefixes` 里出现不在 `allow_buckets` 中的 bucket 时直接阻止提交并说明原因
+  （避免「写了前缀却不生效」）。
+- **生效范围展示**：生成结果区展示「生效范围：bucket=…；前缀=…」；Token 注册表「资源范围」列空范围时显示
+  `⚠️ 全部 bucket`；「显示明文」下的权限明细行也展示「生效范围」。
+- 文档：`docs/api_rules.md` §1.4（资源范围为硬边界）、§2.2 / §4.2（带 token 的读接口鉴权与越界 `403`）、
+  §5 / §12.4（防提权）、§6（审计范围过滤）、§9（补 `require_read_token` / `metrics_enabled` 配置项）。
+
+#### Changed
+
+- **行为变更（读接口 fail-closed）**：携带**无效 / 过期 / 禁用** token 调用 `GET /api/objects/list`、
+  `GET /api/buckets` 由「静默降级为匿名并返回 `200`」改为 **`401`**；携带有效 token 但缺
+  `object:list` / `bucket:list`、或 bucket / 前缀**越界**，由 `200` 改为 **`403`**。
+  **不带 token 时行为不变**：仍按 `require_read_token` 保持公开（`false`）或 `401`（`true`）。
+- **审计查询范围过滤**：非共享 token 的 `GET /api/audit` 只返回其 `allow_buckets` / `allow_prefixes`
+  范围内的记录（过滤在收集阶段完成，`limit` 语义不变）。
+- **Token 注册表 UI**：「资源范围」列改由统一格式化函数渲染，空范围醒目显示 `⚠️ 全部 bucket`。
+
+#### Security
+
+- **资源范围成为强制边界**：此前 `allow_buckets` / `allow_prefixes` 在默认公开模式下可被绕过
+  （越界 token 按匿名放行、返回范围外内容）；硬化后越界一律 `403`，令牌不再能读取自身范围外的 bucket。
+- **防提权**：非共享 token 通过 `POST /api/tokens`、`PUT /api/tokens/{value}` 创建 / 更新 token 时，
+  `scopes` 必须是自身子集，`allow_buckets` / `allow_prefixes` 不得超出自身范围；`PUT` **同时校验
+  目标 token 的现有授权**（不能改写比自身更大的 token，含把它降级为自身范围）与更新后的最终授权，
+  否则 `403`。受限 token 把范围清空 / 放宽为「全部 bucket」同样被拒绝；共享 `access_token` 不受限。
+  另：非数组 `allow_prefixes`（如 `{"demo": 123}`）由 `400` 兜底，不再出现未捕获 `TypeError` 的 `500`。
+- **审计越权收口**：配置了资源范围的 `audit:read` token 只能看到**归属于其范围内 bucket** 的记录；
+  `bucket` 为空的全局事件（`token_create` / `token_update` / `token_delete` / `config_reload`）
+  会泄露其他 token 的 `user`/`role`/`scopes`，对受限 token 一律不返回。未配置范围的 token 与共享
+  `access_token` 行为不变。
+- **`PUT /api/tokens/{value}` 补审计**：此前该接口不写审计（`POST`/`DELETE` 都有），现追加 `token_update`
+  （含 `user`/`role`/`scopes`/`allow_buckets`/`allow_prefixes`/`enabled`/`expires_at`）。
+- **`POST /api/tokens` 覆写既有 token 也受范围约束**：显式传 `token` 且该 token 已存在时，等同于修改既有 token，
+  先校验目标现有授权不超出操作者范围，否则 `403`。此前可借覆写把更大的 token 降级、破坏其他 bucket 的集成，
+  甚至把**已禁用 / 已过期的 token 覆写复活**（`enabled=True`、`expires_at` 清空）——与 `PUT`/`DELETE`/legacy 三条路径不一致。
+- **路径前缀规范化**：`allow_prefixes` 统一走 `storage.normalize_prefixes()`（URL-decode、去首尾斜杠、去重），
+  并拒绝空段 / `.` / `..` / 反斜杠 / `null` / normalize 后为空（如 `"/"`），一律 `400`；
+  `"/"` 此前会被静默丢弃、从「只允许根」变成「不限前缀」。
+- **资源范围自洽校验**：填了 `allow_prefixes` 却把 `allow_buckets` 留空（或前缀所属 bucket 不在白名单内）时返回 `400`。
+  此前这种写法只收窄被点名的 bucket，**其余 bucket 仍完全开放**，与「只给某目录」的意图相反（网页 UI 早已阻止，API 此前未拦）。
+- **`POST /api/tokens` 覆写既有 token 改为合并语义**（业务验收 BIZ-TOK-001/002）：显式传入的 `token` 若已存在，
+  未传字段一律保留。此前按「全量重建」处理，会静默把 `allow_buckets ["demo"]` 清成 `[]`（资源范围边界失效）、
+  把 `expires_at` 清成永久、把已禁用 token 复活、并把审计误记为 `token_create`；现在统一走 `PUT` 的合并语义
+  与同一套防提权校验，审计记 `token_update`。
+- **审计 `rename` 目标路径按范围裁剪**（业务验收 OBS-02）：前缀受限 token 若能看到一条 `rename` 记录
+  （源在其范围内），其 `to_key` 可能指向范围外。现在目标越界的 `rename` 记录整行不返回。
+- **bucket 名规范化错配修复**：授权层此前对 `bucket` 做 `strip()` 后比较、落盘却按原样取目录，
+  使 `bucket="demo "` 可被按 `demo` 授权、却读取 `demo ` 的数据（跨 bucket 越权）。
+  现在 `resource_allowed()` 按原样精确比较，且 `validate_bucket()` 直接拒绝首尾空白（`400`）。
 
 ---
+
+#### Docs
+
+- **`docs/api_rules.md` 按实现逐条校对**：修正 19 处与实现不符的描述（`public_ip` 被忽略、`ETag` 回退规则、错误码表补 `503` 与「未配置 access_token → 401」、`auth/check` 成功/失败字段差异、`config/reload` 失败为 `400`、Token 注册表返回结构、§8 总表补全并统一 `{link_id}`、`user` 角色补签名链接权限等），并登记 4 个已知缺陷（`OBJ-001/002/003~005/006`）。
+- 版本号统一提升到 `0.8.0`（`VERSION` / `main.py` 兜底 / `build_image.conf` / `deploy_container.sh` / `README` / `docs`）。
+## [Unreleased]
+
+### 许可证署名工程化（无接口变更）
+
+#### Added
+
+- **源文件 SPDX 署名头**：33 个第一方源文件（25 个 `.py` + 5 个 `.sh` +
+  `app.js` + `app.css` + `Dockerfile`）加上双行头
+  `Copyright 2026 apyyc` / `SPDX-License-Identifier: Apache-2.0`，呼应
+  Apache-2.0 第 4(d) 条「在源文件中保留版权与署名声明」，使单个文件被拷出仓库时
+  仍可追溯版权人与许可证。
+- **`scripts/add_spdx_headers.py`**：幂等补头工具。按
+  `git ls-files --cached --others --exclude-standard` 自动发现第一方源文件，
+  按扩展名选择注释符号，保持 shebang 在第 1 行、Python 模块 docstring 仍是首条语句；
+  支持 `--dry-run` 与 `--check`（缺头退出码 1，可接 CI / pre-commit）。
+
+#### Changed
+
+- `LICENSE-HEADER` 由「13 行官方样板的套用说明」改写为本项目实际执行的 SPDX 约定
+  （各语言注释写法、位置规则、JSON/.conf/vendored 豁免清单），官方长样板降级为文末
+  可选项；同时**移入 `docs/LICENSE-HEADER` 并加入 `.gitignore`**（不随 git 分发，
+  对外以根目录 `LICENSE` 与 README「许可证与支持」为准）。路由键 `license_header` 与
+  `GET /api/docs/license_header` 不变，仅展示标题改为「源文件署名约定」。
+- `Dockerfile` 第 42 行的 `COPY` 去掉根目录 `LICENSE-HEADER`：改由上一行的
+  `COPY docs/` 一并带入镜像。纯净 clone（无此文件）构建时不再中断，接口按既有
+  逻辑降级为 `available=false` / `404` 可读原因。
+- README「许可证与支持」与目录结构、`LICENSE.zh-CN.md` 附录指引、`docs/api_rules.md`
+  的 `name` 白名单说明同步为 SPDX 写法，并标明该约定文档不进 git。
 
 ## [0.7.4] - 2026-10-16
 

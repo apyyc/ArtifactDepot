@@ -1,3 +1,6 @@
+# Copyright 2026 apyyc
+# SPDX-License-Identifier: Apache-2.0
+
 """S3-like 对象 API：上传 / 列表 / 下载（Range）/ 删除 / 预签名 / 分片
 
 所有受保护接口按「权限点（scope）」鉴权（见 permissions.py / auth.py）：
@@ -15,8 +18,8 @@ from pydantic import BaseModel
 
 from artifactdepot import storage
 from artifactdepot.auth import (
-    Principal, ensure_scope, extract_form_token, extract_token, require_principal,
-    require_scope, resolve_principal,
+    Principal, ensure_scope, extract_form_token, extract_token, optional_read_principal,
+    require_scope, resolve_principal, resource_allowed,
 )
 from artifactdepot import netutil
 from artifactdepot.observability import DELETES, DOWNLOADS, UPLOADS
@@ -51,25 +54,9 @@ def _etag_matches(if_none_match: str, etag: str) -> bool:
     return False
 
 
-def _read_requires_token() -> bool:
-    """读接口是否要求带 token（默认 false，保持历史公开行为）"""
-    return bool(get_config().get("require_read_token", False))
-
-
-async def _optional_read_principal(request: Request, scope: str):
-    """读接口鉴权：require_read_token=true 时强制 scope；否则有 token 且具备 scope 才返回主体"""
-    token = extract_token(request)
-    principal = await resolve_principal(token) if token else None
-    if _read_requires_token():
-        if not principal:
-            raise HTTPException(401, detail="缺少或无效的访问令牌")
-        ensure_scope(principal, scope)
-        return principal
-    if principal is None:
-        return None
-    if not principal.is_admin and not principal.has_scope(scope):
-        return None
-    return principal
+# 读接口鉴权统一走 auth.optional_read_principal（fail-closed）：
+# 不带 token 时按 require_read_token 决定是否公开；带 token 时必须有效、具备 scope，
+# 且资源范围越界一律 403（不再降级为匿名，否则 bucket 范围会被绕过）。
 
 
 @router.post("")
@@ -126,18 +113,15 @@ async def list_objects(request: Request, bucket: str, prefix: str = "",
                        offset: int = Query(0, ge=0)):
     """列对象（ListObjects）。默认公开；require_read_token=true 时需 object:list。
 
-    带资源范围的 token：在允许范围内正常列出；范围外按匿名处理（公开模式下不阻断、
-    也不泄露额外信息）。require_read_token=true 时 `_optional_read_principal` 已强制校验，
-    且资源范围越界必须返回 403（否则会绕过范围约束、泄露白名单外 bucket 的内容）。
+    鉴权（**fail-closed**）：**不带 token** 时默认公开；**带 token** 时必须是有效 token
+    且具备 `object:list`（缺失 401/403），并且 bucket/prefix 必须落在 token 的资源范围内，
+    **越界一律 403**——不再「降级为匿名放行」，否则资源范围在公开模式下形同虚设。
     """
-    principal = await _optional_read_principal(request, "object:list")
+    principal = await optional_read_principal(request, "object:list")
     if principal is not None and not principal.is_admin:
-        from artifactdepot.auth import resource_allowed
         if not resource_allowed(principal, bucket, prefix):
-            if _read_requires_token():
-                raise HTTPException(
-                    403, detail="权限不足：token 的资源范围不允许该 bucket / 路径")
-            principal = None
+            raise HTTPException(
+                403, detail="权限不足：token 的资源范围不允许该 bucket / 路径")
     result = storage.list_objects(bucket, prefix, limit=limit, offset=offset)
     return {"code": 0, "message": "success",
             "data": {"bucket": bucket, "prefix": prefix, **result}}

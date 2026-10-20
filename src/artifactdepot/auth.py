@@ -1,3 +1,6 @@
+# Copyright 2026 apyyc
+# SPDX-License-Identifier: Apache-2.0
+
 """访问令牌校验、权限（scope）判定与资源范围约束
 
 模型：
@@ -149,7 +152,10 @@ def resource_allowed(principal: Principal, bucket: str = "", key: str = "") -> b
         return False
     if principal.is_admin:
         return True
-    bucket = (bucket or "").strip()
+    # bucket **不做 strip**：授权比较必须与实际落盘目录逐字节一致。
+    # 若这里 strip 而 storage 不 strip，"demo " 会被按 "demo" 授权、却读取 "demo " 的数据
+    # （bucket 名首尾空白已由 storage.validate_bucket 拒绝，见该函数）。
+    bucket = bucket or ""
     key = (key or "").strip("/")
     if principal.allow_buckets and bucket and bucket not in principal.allow_buckets:
         return False
@@ -169,6 +175,107 @@ def ensure_scope(principal: Principal, scope: str,
         raise HTTPException(403, detail=f"权限不足：需要 {scope}")
     if (bucket or key) and not resource_allowed(principal, bucket, key):
         raise HTTPException(403, detail="权限不足：token 的资源范围不允许该 bucket / 路径")
+
+
+def read_requires_token() -> bool:
+    """读接口是否要求带 token（默认 false，保持历史公开行为）"""
+    return bool(get_config().get("require_read_token", False))
+
+
+async def optional_read_principal(request: Request, scope: str):
+    """读接口鉴权（**fail-closed**）：只要带了 token，就必须有效且具备 scope。
+
+    语义（资源范围硬化后）：
+    - **不带 token**：`require_read_token=false` 时返回 None（匿名公开）；true 时 401
+    - **带 token 但无效 / 过期 / 禁用**：401（**不再静默降级为匿名**）
+    - **有效但缺该 scope**：403
+    - **有效且有 scope**：返回 principal，由调用方继续做资源范围（bucket/前缀）校验
+
+    资源范围不在此处校验：各接口 bucket 来源不同（query / JSON body / 路径参数），
+    调用方必须先取到 bucket，再对越界返回 403——**不得退回匿名**，否则「把权限圈在
+    某个 bucket」在默认公开模式下会完全失效。
+    """
+    token = extract_token(request)
+    if not token:
+        if read_requires_token():
+            raise HTTPException(401, detail="缺少访问令牌")
+        return None
+    principal = await resolve_principal(token)
+    if principal is None:
+        raise HTTPException(401, detail="无效的访问令牌")
+    ensure_scope(principal, scope)
+    return principal
+
+
+def _prefix_within(child: str, parent: str) -> bool:
+    """前缀包含判断：child ⊆ parent，按路径段边界（'a/bc' 不算 'a/b' 的子前缀）"""
+    c = (child or "").strip().strip("/")
+    p = (parent or "").strip().strip("/")
+    if not p:
+        return True
+    return c == p or c.startswith(p + "/")
+
+
+def ensure_can_grant(actor: Principal, scopes=None, allow_buckets=None,
+                     allow_prefixes=None, action: str = "授予") -> None:
+    """防提权：非共享 token 不能授予「超出自身范围」的权限。
+
+    检查三个维度（`actor.is_admin` 即共享 access_token，直接放行）：
+    - `scopes ⊆ actor.scopes`
+    - `allow_buckets ⊆ actor.allow_buckets`（actor 为空 = 不限，则允许任意）
+    - `allow_prefixes`：actor 在某个 bucket 上有限制时，新 token 若要覆盖该 bucket
+      （或新 token 不限 bucket），就必须显式给出**更窄**的前缀，不能靠「不写前缀」绕过
+
+    `None` 表示「不涉及」，空列表/空字典表示「显式不限」——后者同样要过检查：
+    受限 actor 把范围清空是最常见的提权路径。
+    """
+    if actor is None or actor.is_admin:
+        return
+
+    if scopes is not None:
+        missing = sorted({str(s).strip() for s in scopes
+                          if str(s).strip() and not actor.has_scope(str(s).strip())})
+        if missing:
+            raise HTTPException(
+                403, detail=f"权限不足：不能{action}自身没有的权限点（{', '.join(missing)}）")
+
+    if actor.allow_buckets:
+        req_buckets = [str(b).strip() for b in (allow_buckets or []) if str(b).strip()]
+        if allow_buckets is not None and not req_buckets:
+            raise HTTPException(
+                403, detail="权限不足：不能把资源范围放宽为『全部 bucket』")
+        outside = sorted({b for b in req_buckets if b not in actor.allow_buckets})
+        if outside:
+            raise HTTPException(
+                403, detail=f"权限不足：不能{action}自身范围外的 bucket（{', '.join(outside)}）")
+
+    if actor.allow_prefixes:
+        if allow_prefixes is not None and not isinstance(allow_prefixes, dict):
+            raise HTTPException(400, detail="allow_prefixes 必须是对象")
+        req_buckets2 = None if allow_buckets is None else \
+            [str(b).strip() for b in allow_buckets if str(b).strip()]
+        req_prefixes = allow_prefixes or {}
+        for b, allowed in actor.allow_prefixes.items():
+            if not allowed:
+                continue
+            covers = (not req_buckets2) or (str(b) in req_buckets2)
+            if not covers:
+                continue
+            req = req_prefixes.get(b)
+            if req is None:
+                req = []
+            elif isinstance(req, str):
+                req = [req]
+            elif not isinstance(req, (list, tuple)):
+                raise HTTPException(400, detail=f"allow_prefixes[{b}] 必须是数组")
+            req = [str(x).strip() for x in req if str(x).strip()]
+            if not req:
+                raise HTTPException(
+                    403, detail=f"权限不足：不能{action}超出自身前缀范围的路径（{b}）")
+            for p in req:
+                if not any(_prefix_within(p, ap) for ap in allowed):
+                    raise HTTPException(
+                        403, detail=f"权限不足：不能{action}自身前缀范围外的路径（{b}:{p}）")
 
 
 async def require_principal(request: Request, allow_form: bool = False) -> Principal:

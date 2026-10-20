@@ -1,3 +1,6 @@
+# Copyright 2026 apyyc
+# SPDX-License-Identifier: Apache-2.0
+
 """对象存储引擎 — S3 风格（bucket/key），文件系统为唯一事实源
 
 存储布局：
@@ -155,6 +158,9 @@ def validate_bucket(bucket: str) -> str:
     """校验 bucket 名：允许中文等 Unicode，但拒绝路径分隔符/穿越/隐藏/控制字符"""
     if not bucket:
         raise HTTPException(400, detail="bucket 名不能为空")
+    if bucket != bucket.strip():
+        # 首尾空白会造成「授权按 strip 后比较、取数按原样」的错配（跨 bucket 越权），直接拒绝。
+        raise HTTPException(400, detail=f"非法 bucket 名（首尾不允许空白字符）：{bucket!r}")
     if len(bucket) > 63:
         raise HTTPException(400, detail=f"bucket 名过长（最长 63 字符）：{bucket!r}")
     if bucket in (".", "..") or bucket.startswith("."):
@@ -180,6 +186,57 @@ def validate_key(key: str) -> str:
     if any(s.startswith(".") for s in segs):
         raise HTTPException(400, detail=f"非法 key（路径段不允许以 . 开头）：{key!r}")
     return k
+
+
+def normalize_prefixes(prefixes) -> list:
+    """规范化令牌的路径前缀列表：URL-decode、去首尾斜杠、去重，并拒绝非法写法。
+
+    前缀在 `auth.resource_allowed()` 里按路径段边界匹配；若放过 `a/../secret`、
+    `%2e%2e`、反斜杠等写法，会造出「能通过创建校验、但永远匹配不上」的死 token，
+    故直接 400。另外 `"/"` 这类 normalize 后为空的写法也拒绝——若静默丢弃，
+    会从「只允许根」变成「不限前缀」，与用户意图相反。
+    """
+    out = []
+    for p in prefixes or []:
+        if p is None:
+            raise HTTPException(400, detail="路径前缀不能为 null")
+        raw = str(p).strip()
+        if not raw:
+            continue                      # 完全空字符串：忽略
+        s = unquote(raw).strip().strip("/")
+        if not s:
+            raise HTTPException(400, detail=f"路径前缀不能为空：{p!r}")
+        if "\\" in s or any(seg in ("", ".", "..") for seg in s.split("/")):
+            raise HTTPException(
+                400, detail=f"非法路径前缀（不允许反斜杠 / 空段 / . / ..）：{p!r}")
+        if s not in out:
+            out.append(s)
+    return out
+
+
+def validate_scope_range(allow_buckets, allow_prefixes) -> None:
+    """校验资源范围的内部一致性：写了路径前缀，就必须同时把该 bucket 纳入 allow_buckets。
+
+    否则 `allow_buckets=[]`（= 不限 bucket）配合 `allow_prefixes={"demo": [...]}`
+    只会收窄 demo，**其余 bucket 反而完全开放**——与「只给 demo:a/」的直觉相反。
+    网页 UI 早已阻止这种组合，API 侧现在同样以 `400` 拒绝（不静默放大权限）。
+    """
+    if allow_prefixes is not None and not isinstance(allow_prefixes, dict):
+        raise HTTPException(400, detail="allow_prefixes 必须是对象")
+    buckets = [str(b).strip() for b in (allow_buckets or []) if str(b).strip()]
+    pfx_keys = {str(b).strip() for b in (allow_prefixes or {}) if str(b).strip()}
+    if not pfx_keys:
+        return
+    if not buckets:
+        raise HTTPException(
+            400,
+            detail="设置 allow_prefixes 时必须同时设置 allow_buckets，"
+                   "否则未被点名的 bucket 将不受任何限制")
+    extra = sorted(pfx_keys - set(buckets))
+    if extra:
+        raise HTTPException(
+            400,
+            detail=f"allow_prefixes 里的 bucket 必须在 allow_buckets 中（缺少：{', '.join(extra)}）")
 
 
 def bucket_dir(bucket: str) -> Path:
@@ -979,8 +1036,9 @@ def add_token(token: str, user: str, role: str = "", scopes=None,
             prefixes = [prefixes]
         if not isinstance(prefixes, list):
             raise HTTPException(400, detail=f"allow_prefixes[{b}] 必须是数组")
-        clean_prefixes[b] = [str(x).strip().strip("/") for x in prefixes if str(x).strip()]
+        clean_prefixes[b] = normalize_prefixes(prefixes)
 
+    validate_scope_range(allow_buckets, clean_prefixes)
     with state_lock():
         raw = _read_tokens_raw()
         existing = _normalize_token_record(raw.get(token, {}), token) if token in raw else None
@@ -1175,8 +1233,12 @@ def _maybe_rotate_audit() -> None:
 
 
 def query_audit(bucket: str = "", key: str = "", actor: str = "",
-                since: str = "", limit: int = 500) -> list:
-    """按条件过滤审计记录（返回最近 limit 条，倒序）"""
+                since: str = "", limit: int = 500, predicate=None) -> list:
+    """按条件过滤审计记录（返回最近 limit 条，倒序）
+
+    `predicate(rec) -> bool`：可选的额外过滤（在计数前应用，因此不会占用 limit 名额）。
+    `/api/audit` 用它把非共享 token 限制在其 bucket/前缀资源范围内。
+    """
     if limit <= 0:
         return []
     base = _audit_path()
@@ -1208,6 +1270,8 @@ def query_audit(bucket: str = "", key: str = "", actor: str = "",
                 if actor and rec.get("actor") != actor:
                     continue
                 if since and rec.get("time", "") < since:
+                    continue
+                if predicate is not None and not predicate(rec):
                     continue
                 rec["time"] = _ensure_utc_z(rec.get("time", ""))
                 out.append(rec)
