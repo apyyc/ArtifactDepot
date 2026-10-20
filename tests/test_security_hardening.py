@@ -1,3 +1,6 @@
+# Copyright 2026 apyyc
+# SPDX-License-Identifier: Apache-2.0
+
 """第 1 批 P0 安全修复的回归测试
 
 覆盖：

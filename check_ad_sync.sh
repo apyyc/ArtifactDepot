@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+
+# Copyright 2026 apyyc
+# SPDX-License-Identifier: Apache-2.0
+
 # ============================================================
 # ArtifactDepot 生产诊断脚本（只依赖宿主 python3）
 #

@@ -1,3 +1,6 @@
+# Copyright 2026 apyyc
+# SPDX-License-Identifier: Apache-2.0
+
 """网页 UI：单页目录浏览 + 上传 + 下载"""
 from pathlib import Path
 

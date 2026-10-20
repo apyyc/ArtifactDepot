@@ -1,3 +1,6 @@
+# Copyright 2026 apyyc
+# SPDX-License-Identifier: Apache-2.0
+
 """第 2 批 P1 加固的回归测试
 
 覆盖：

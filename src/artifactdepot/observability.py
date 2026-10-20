@@ -1,3 +1,6 @@
+# Copyright 2026 apyyc
+# SPDX-License-Identifier: Apache-2.0
+
 """可观测性（无第三方依赖）：请求 ID、结构化访问日志、Prometheus 指标。
 
 - ``ObservabilityMiddleware``：为每个 HTTP 请求生成/透传 ``X-Request-ID``，

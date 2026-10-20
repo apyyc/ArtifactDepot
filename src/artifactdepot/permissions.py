@@ -1,3 +1,6 @@
+# Copyright 2026 apyyc
+# SPDX-License-Identifier: Apache-2.0
+
 """权限目录与角色预设
 
 设计：

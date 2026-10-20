@@ -1,3 +1,6 @@
+# Copyright 2026 apyyc
+# SPDX-License-Identifier: Apache-2.0
+
 """日志安全工具：对 uvicorn access log 的 query string 做脱敏。
 
 背景：token 可能通过 `?token=`（旧式调用/下载直链）出现在请求 URL 中，

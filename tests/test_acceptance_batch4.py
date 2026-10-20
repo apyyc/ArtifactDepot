@@ -1,3 +1,6 @@
+# Copyright 2026 apyyc
+# SPDX-License-Identifier: Apache-2.0
+
 """第 4 批 + 配置重构 的接口级业务验收测试
 
 严格按业务语义验证：不只 200，还验证返回结构、权限、边界、状态、数据一致性。

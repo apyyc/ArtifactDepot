@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+
+# Copyright 2026 apyyc
+# SPDX-License-Identifier: Apache-2.0
+
 # ============================================================
 # ArtifactDepot 开发环境一键启动脚本（无图形 / SSH 版）
 # 后台运行数据仓库服务，日志写到 logs/ 目录

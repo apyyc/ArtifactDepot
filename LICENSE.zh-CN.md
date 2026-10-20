@@ -101,7 +101,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-可直接套用的中文对照写法请见 [LICENSE-HEADER](LICENSE-HEADER)。
+上面是 Apache 官方推荐的完整样板。本项目实际采用的是等价的 SPDX 双行简写（`Copyright 2026 apyyc` + `SPDX-License-Identifier: Apache-2.0`），已批量写入全部第一方源文件；各语言注释符号与豁免清单见 `docs/LICENSE-HEADER`（本地留存文档，不随 git 分发）。
 
 ---
 
@@ -112,5 +112,5 @@ limitations under the License.
 | 项目名称 | ArtifactDepot |
 | 版权所有者 | apyyc |
 | 英文版 | [LICENSE](LICENSE) |
-| 源文件署名模板 | [LICENSE-HEADER](LICENSE-HEADER) |
+| 源文件署名约定（SPDX） | 见上一节与 `docs/LICENSE-HEADER`（本地留存，不随 git 分发） |
 | 联系方式 | 2479511984@qq.com |

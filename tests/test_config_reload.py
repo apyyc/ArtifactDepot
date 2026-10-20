@@ -1,3 +1,6 @@
+# Copyright 2026 apyyc
+# SPDX-License-Identifier: Apache-2.0
+
 """配置包（config/）与手动重载的回归测试
 
 覆盖：

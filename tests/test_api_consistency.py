@@ -1,3 +1,6 @@
+# Copyright 2026 apyyc
+# SPDX-License-Identifier: Apache-2.0
+
 """第 3 批 P2 回归测试
 
 - head：不存在 404，存在 200 且 mtime 为 UTC ISO8601

@@ -1,3 +1,6 @@
+# Copyright 2026 apyyc
+# SPDX-License-Identifier: Apache-2.0
+
 """客户端 IP / 代理转发解析。
 
 审计里的两类 IP：

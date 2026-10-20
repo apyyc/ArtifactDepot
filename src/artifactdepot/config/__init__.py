@@ -1,3 +1,6 @@
+# Copyright 2026 apyyc
+# SPDX-License-Identifier: Apache-2.0
+
 """配置加载（config 包）
 
 目录结构（全部配置集中在本目录）：

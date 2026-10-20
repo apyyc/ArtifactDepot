@@ -1,3 +1,6 @@
+# Copyright 2026 apyyc
+# SPDX-License-Identifier: Apache-2.0
+
 # ============================================================
 # ArtifactDepot 单容器镜像：对象存储仓库站点（FastAPI，8004）
 #
@@ -36,7 +39,7 @@ WORKDIR /app/artifactdepot
 COPY src/ /app/artifactdepot/src/
 COPY docs/ /app/artifactdepot/docs/
 COPY README.md CHANGELOG.md VERSION /app/artifactdepot/
-COPY LICENSE LICENSE.zh-CN.md LICENSE-HEADER /app/artifactdepot/
+COPY LICENSE LICENSE.zh-CN.md /app/artifactdepot/
 COPY docker/supervisord.conf /etc/supervisor.d/artifactdepot.ini
 
 # 非 root 运行：创建 artifactdepot(10001)，把代码与数据目录归属它

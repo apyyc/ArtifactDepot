@@ -1,3 +1,6 @@
+# Copyright 2026 apyyc
+# SPDX-License-Identifier: Apache-2.0
+
 """pytest 全局夹具：隔离真实配置文件
 
 测试默认不读取仓库里的 src/artifactdepot/config/.env（里面可能有真实密钥），

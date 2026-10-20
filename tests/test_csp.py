@@ -1,3 +1,6 @@
+# Copyright 2026 apyyc
+# SPDX-License-Identifier: Apache-2.0
+
 """第 4 批 CSP 回归测试
 
 - index.html 不再有内联 <style>/<script>/on* 事件处理器/javascript:void

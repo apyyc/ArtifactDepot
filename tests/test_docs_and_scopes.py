@@ -1,3 +1,6 @@
+# Copyright 2026 apyyc
+# SPDX-License-Identifier: Apache-2.0
+
 """文档入口 / 空 scopes / 读接口资源范围 的回归测试
 
 覆盖 0.7.1 修复与新增：

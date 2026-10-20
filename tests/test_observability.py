@@ -1,3 +1,6 @@
+# Copyright 2026 apyyc
+# SPDX-License-Identifier: Apache-2.0
+
 """第 4 批可观测性回归测试
 
 - /health/live、/health/ready
