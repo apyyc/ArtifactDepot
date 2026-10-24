@@ -9,6 +9,7 @@
 - token 可限定 bucket / 路径前缀范围。
 """
 import mimetypes
+import secrets
 import tempfile
 import time
 from pathlib import Path
@@ -119,10 +120,28 @@ async def upload(
     storage.touch_token(tok)
 
     max_mb = get_config().get("max_upload_mb", 0) or 0
-    suffix = Path(file.filename or "").suffix
-    tmp_path = None
+    # 伴随文件本地化：直传临时文件写在目标文件父目录（隐藏名，列表会跳过），
+    # 成功后 put_object(move=True) 用 os.replace 原子落盘，不再经 /tmp 中转。
+    dst = storage.object_path(bucket, key)
+    if dst.is_dir():
+        raise HTTPException(409, detail=f"目标路径是目录，不能写入对象：{bucket}/{key}")
+    # 记录本次为落盘临时文件而新建的父目录：读取失败/超限时回滚，保证失败零副作用
+    created_dirs = []
+    probe = dst.parent
+    while not probe.exists() and probe != probe.parent:
+        created_dirs.append(probe)
+        probe = probe.parent
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+    except (FileExistsError, NotADirectoryError, OSError) as e:
+        raise HTTPException(409, detail=f"父路径不是目录，不能写入对象：{bucket}/{key}") from e
+    safe_name = dst.name[:80] or "upload"
+    tmp_path = None
+    success = False
+    try:
+        with tempfile.NamedTemporaryFile(
+                delete=False, dir=str(dst.parent), suffix=".tmp",
+                prefix=f".{safe_name}.artifactdepot-incoming-") as tmp:
             tmp_path = Path(tmp.name)
             size = 0
             while chunk := await file.read(1024 * 1024):
@@ -131,11 +150,19 @@ async def upload(
                     raise HTTPException(413, detail=f"超过单文件上传上限 {max_mb}MB")
                 tmp.write(chunk)
         result = storage.put_object(bucket, key, tmp_path, source_url, overwrite,
-                                    uploader=principal.actor)
+                                    uploader=principal.actor, move=True)
+        success = True
     finally:
         # 读取/超限/落盘任一阶段失败都删除临时文件（Starlette spool 由框架自行关闭）
         if tmp_path is not None:
             tmp_path.unlink(missing_ok=True)
+        if not success:
+            # 回滚为写临时文件而新建的空父目录（自底向上，非空则停止）
+            for d in created_dirs:
+                try:
+                    d.rmdir()
+                except OSError:
+                    break
 
     storage.audit("upload", bucket, key, principal.actor, _client_ip(request),
                   size=result["size"], sha256=result["sha256"],
@@ -484,14 +511,99 @@ async def revoke_link(link_id: str, request: Request,
 CHUNK_SIZE = 8 * 1024 * 1024  # 兼容旧调用；实际值以 config.upload.chunk_size_mb 为准
 
 
+def _initiate_bool(raw) -> bool:
+    return str(raw if raw is not None else "").strip().lower() in ("1", "true", "yes", "on")
+
+
+async def _initiate_params(request: Request) -> dict:
+    """initiate 参数同时支持 query 与 form（multipart / urlencoded），允许空 body。
+
+    旧客户端 `POST /api/objects/initiate`（无 body）必须继续可用；新客户端既能放
+    query，也能放 FormData 字段。同名时以表单值优先。
+    """
+    params = {k: str(v) for k, v in request.query_params.items()}
+    ctype = (request.headers.get("content-type") or "").lower()
+    if (ctype.startswith("multipart/form-data")
+            or ctype.startswith("application/x-www-form-urlencoded")):
+        try:
+            form = await request.form()
+        except Exception:
+            return params
+        for k, v in form.items():
+            if isinstance(v, str):
+                params[k] = v
+    return params
+
+
+def _parse_optional_int(raw, field: str):
+    text = str(raw).strip() if raw is not None else ""
+    if text == "":
+        return None
+    try:
+        val = int(text)
+    except (TypeError, ValueError):
+        raise HTTPException(400, detail=f"非法 {field}：{text!r}（必须是整数）")
+    if val < 0:
+        raise HTTPException(400, detail=f"非法 {field}：{val}（不能为负数）")
+    return val
+
+
 @router.post("/initiate")
 async def initiate_upload(request: Request,
                           actor: Principal = Depends(require_scope("upload:initiate"))):
-    """创建分片上传会话，返回 upload_id 与上传配置（chunk_size/并发/超时）"""
-    upload_id = storage.create_chunk_session(owner=actor.actor)
+    """创建/恢复分片上传会话，返回 upload_id、上传配置与续传信息。
+
+    参数（query 与 multipart form 均可，允许空 body 向后兼容）：
+      `bucket`/`key`（提供时会话落在目标文件父目录 `.artifactdepot-uploads/<id>/`，
+      并追加资源范围校验）、`size`（总字节数）、`resume`（默认 false）、
+      `upload_id`（resume=true 时指定复用）。
+
+    续传信息（`resumed`/`uploaded`/`received_bytes`/`total_chunks`/`size`/
+    `chunk_size`/`staging`）以服务端磁盘为准；会话失效返回 400 且 detail 含
+    「分片会话」，客户端按会话丢失处理。**不提供** GET upload/{id}（不新增权限点）。
+    """
+    params = await _initiate_params(request)
+    bucket = (params.get("bucket") or "").strip()
+    key = (params.get("key") or "").strip()
+    upload_id = (params.get("upload_id") or "").strip()
+    size = _parse_optional_int(params.get("size"), "size")
+    resume = _initiate_bool(params.get("resume"))
+    if bool(bucket) != bool(key):
+        raise HTTPException(400, detail="bucket 与 key 必须同时提供")
+    if bucket:
+        ensure_scope(actor, "upload:initiate", bucket=bucket, key=key)
+
+    resumed = False
+    info = None
+    if resume:
+        if upload_id:
+            info = storage.validate_resume_session(
+                upload_id, owner=actor.actor, bucket=bucket, key=key,
+                size=size or 0, is_admin=actor.is_admin)
+            resumed = True
+        elif bucket:
+            found = storage.find_resumable_session(
+                actor.actor, bucket, key, size or 0, actor.is_admin)
+            if found:
+                info = storage.session_info(found)
+                resumed = True
+    if info is None:
+        new_id = storage.create_chunk_session(
+            owner=actor.actor, bucket=bucket, key=key, size=size or 0)
+        info = storage.session_info(new_id)
+
     # 前端/CLI 以服务端返回为准：分片大小、并发、请求超时（默认 24h）都可从 config.json 调整
-    return {"code": 0, "message": "success",
-            "data": {"upload_id": upload_id, **public_upload_settings()}}
+    return {"code": 0, "message": "success", "data": {
+        "upload_id": info["upload_id"],
+        **public_upload_settings(),
+        "chunk_size": info["chunk_size"],
+        "resumed": resumed,
+        "uploaded": info["uploaded"],
+        "received_bytes": info["received_bytes"],
+        "total_chunks": info["total_chunks"],
+        "size": info["size"],
+        "staging": info["staging"],
+    }}
 
 
 @router.post("/chunk")
@@ -502,15 +614,22 @@ async def upload_chunk(
     chunk: UploadFile = File(...),
     token: str = Form(""),
 ):
-    """上传一个分片（multipart：upload_id + index + chunk 文件）。权限 upload:chunk"""
+    """上传一个分片（multipart：upload_id + index + chunk 文件）。权限 upload:chunk
+
+    请求体临时文件写在会话目录 `.incoming/<rand>.tmp`（与分片同文件系统，随后
+    `store_chunk` 直接 os.replace，省一次拷贝；不再落 /tmp）。
+    """
     tok = await extract_form_token(request) or token.strip()
     principal = await resolve_principal(tok)
     ensure_scope(principal, "upload:chunk")
     storage.touch_token(tok)
-    suffix = Path(chunk.filename or "").suffix or ".bin"
+    # 先校验会话存在/归属，再读请求体；临时文件落在会话 .incoming（失败清理）
+    incoming = storage.open_session_incoming(
+        upload_id, actor=principal.actor, is_admin=principal.is_admin)
     tmp_path = None
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".tmp",
+                                         dir=str(incoming)) as tmp:
             tmp_path = Path(tmp.name)
             while part := await chunk.read(1024 * 1024):
                 tmp.write(part)
@@ -520,6 +639,10 @@ async def upload_chunk(
         # 读取失败 / 配额失败 / 落盘失败都删除本次请求的临时文件
         if tmp_path is not None:
             tmp_path.unlink(missing_ok=True)
+        try:
+            incoming.rmdir()          # 无并发分片时顺手清掉空 .incoming（非空失败忽略）
+        except OSError:
+            pass
     return {"code": 0, "message": "success", "data": result}
 
 

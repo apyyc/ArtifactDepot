@@ -392,3 +392,15 @@ def test_range_auth_scope_enforced(ctx, files):
     r = c.get(DOWNLOAD, params={"bucket": "b", "key": "big.bin", "token": tok},
               headers={"Range": "bytes=0-9"})
     assert r.status_code == 403
+
+
+def test_oversized_key_rejected_not_500(ctx):
+    """超长 key 必须 400（底层 stat 会抛 ENAMETOOLONG，历史表现为 500）；HEAD/GET 一致。"""
+    c, _, _, _ = ctx
+    key = "x" * 5000
+    for method in ("GET", "HEAD"):
+        r = c.request(method, DOWNLOAD,
+                      params={"bucket": "b", "key": key, "token": ADMIN})
+        assert r.status_code == 400, f"{method} 超长 key 应 400，实际 {r.status_code}"
+        if method == "GET":          # HEAD 响应无 body
+            assert "过长" in r.text

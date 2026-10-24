@@ -23,12 +23,19 @@
 
 说明：
   - 大文件按服务端返回的 chunk_size（默认 8MB）顺序上传；单片失败最多重试 3 次。
-  - 每传完一片把 upload_id + 已传分片写入 ~/.artifactdepot_upload_state.json；
-    下次选择同一个文件、同一目标、文件大小/mtime 未变时自动续传。
+  - 伴随文件本地化：上传断点状态写在**源文件同目录**
+    `.<文件名>.artifactdepot-upload.json`（0600 原子写），不再放用户 home；
+    源目录不可写时回退 `~/.artifactdepot/upload-state/<sha1>.json` 并提示。
+    成功/会话失效删除，失败/暂停/取消保留；下次选择同一文件、同一目标、
+    文件大小/mtime 未变时自动续传（以服务端返回的 uploaded 为唯一事实源）。
+  - 支持暂停/恢复：分片边界检查 pause_event（set=暂停）；失败不 abort，
+    保留会话与状态，再次开始上传即从断点续传。
   - 下载参数优先取 GET /api/auth/permissions 的 data.download
     （chunk_size / chunk_concurrency / request_timeout_seconds），失败回退
     8MiB / 4 路 / 1h，并夹紧到 1–64MiB / 1–16 / 60s–7d。
-  - 下载先写同名 .part，成功后 os.replace；失败或取消会清理 .part。
+  - 下载先写同名 .part，成功后 os.replace；分片并发下载另有伴随状态文件
+    `.<目标名>.artifactdepot-download.json` 记录已完成分片（0600）：
+    暂停/失败保留、取消删除；恢复时校验 size/ETag 后只补缺失分片。
   - Token 只保存在内存，不写入磁盘；状态文件权限 0600。
   - 所需的 token 权限点：upload:initiate / upload:chunk / upload:complete / upload:abort
     （object:head 可选，用于完成后的核对）；管理员共享 token 或 uploader/operator 角色均可。
@@ -77,8 +84,17 @@ DOWNLOAD_TIMEOUT_MAX = 7 * 24 * 3600.0
 DOWNLOAD_CHUNK_RETRIES = 3                      # 单片失败最多重试 3 次（指数退避）
 DOWNLOAD_READ_SIZE = 256 * 1024                 # 单次读取/写入块
 
-STATE_PATH = Path.home() / ".artifactdepot_upload_state.json"
-UI_STATE_PATH = Path.home() / ".artifactdepot_client_ui.json"
+# 伴随文件（都放在目标/源文件所在目录，0600 原子写）：
+#   上传断点：<源文件目录>/.<文件名>.artifactdepot-upload.json
+#   下载断点：<目标文件目录>/.<目标名>.artifactdepot-download.json
+# 源目录不可写时，上传断点回退到 ~/.artifactdepot/upload-state/<sha1>.json 并提示。
+UPLOAD_STATE_VERSION = 1
+DOWNLOAD_STATE_VERSION = 1
+UPLOAD_STATE_SUFFIX = ".artifactdepot-upload.json"
+DOWNLOAD_STATE_SUFFIX = ".artifactdepot-download.json"
+LEGACY_STATE_PATH = Path.home() / ".artifactdepot_upload_state.json"  # 旧版全局状态（仅做一次迁移）
+UPLOAD_STATE_DIR = Path.home() / ".artifactdepot" / "upload-state"
+UI_STATE_PATH = Path.home() / ".artifactdepot_client_ui.json"  # 应用配置，不属于伴随文件
 USER_AGENT = "ArtifactDepotUpload/1.0"
 
 ProgressCB = Callable[[int, int, float, str], None]
@@ -93,6 +109,57 @@ def normalize_server(server: str) -> str:
     if "://" not in s:
         s = "http://" + s
     return s.rstrip("/")
+
+
+def upload_state_path(file_path) -> Path:
+    """上传断点状态路径：与源文件同目录的隐藏伴随文件。"""
+    path = Path(file_path)
+    return path.parent / f".{path.name}{UPLOAD_STATE_SUFFIX}"
+
+
+def fallback_upload_state_path(server: str, bucket: str, key: str) -> Path:
+    """源目录不可写时的回退状态路径（按 server|bucket|key 的 SHA-1 命名）。"""
+    raw = f"{(server or '').rstrip('/')}|{bucket}|{key}".encode("utf-8")
+    return UPLOAD_STATE_DIR / (hashlib.sha1(raw).hexdigest() + ".json")
+
+
+def download_state_path(dest) -> Path:
+    """下载断点状态路径：与目标文件同目录的隐藏伴随文件。"""
+    dest = Path(dest)
+    return dest.parent / f".{dest.name}{DOWNLOAD_STATE_SUFFIX}"
+
+
+def _atomic_write_json(path: Path, data: dict) -> None:
+    """0600 权限原子写 JSON（同目录 .tmp + os.replace）；失败抛 OSError。"""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(data, ensure_ascii=False))
+            fh.flush()
+            os.fsync(fh.fileno())
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def _read_json_dict(path: Path) -> dict:
+    """读取 JSON 对象；不存在/损坏/非对象时返回 {}。"""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
 
 
 def load_ui_state() -> dict:
@@ -113,14 +180,7 @@ def save_ui_state(**updates) -> None:
         if value is not None:
             data[key] = value
     try:
-        UI_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        tmp = UI_STATE_PATH.with_name(UI_STATE_PATH.name + ".tmp")
-        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-        try:
-            os.chmod(tmp, 0o600)
-        except OSError:
-            pass
-        os.replace(tmp, UI_STATE_PATH)
+        _atomic_write_json(UI_STATE_PATH, data)
     except OSError:
         pass
 
@@ -306,11 +366,13 @@ def _sleep_or_cancel(delay: float, cancel: Optional[threading.Event],
 
 
 # ---------------------------------------------------------------------------
-# 续传状态
+# 伴随文件：上传/下载断点状态
 # ---------------------------------------------------------------------------
 
 @dataclass
 class ResumeState:
+    """上传断点状态（落在源文件同目录的伴随文件里；本地只做缓存，服务端 uploaded 为准）。"""
+
     server: str
     bucket: str
     key: str
@@ -321,6 +383,9 @@ class ResumeState:
     upload_id: str
     uploaded: list = field(default_factory=list)
     updated_at: float = 0.0
+    total_chunks: int = 0
+    staging: str = ""
+    version: int = UPLOAD_STATE_VERSION
 
     def matches(self, server: str, bucket: str, key: str, path: Path, stat: os.stat_result) -> bool:
         return (
@@ -332,33 +397,46 @@ class ResumeState:
             and self.file_mtime_ns == stat.st_mtime_ns
         )
 
-    def save(self) -> None:
-        """尽力保存续传状态；目录只读等情况不应阻断上传。"""
+    def _candidates(self) -> list:
+        """首选源文件目录；源目录不可写时回退用户 home 下的状态目录。"""
+        primary = upload_state_path(Path(self.file_path))
+        fallback = fallback_upload_state_path(self.server, self.bucket, self.key)
+        return [primary] if primary == fallback else [primary, fallback]
+
+    def save(self, log: Optional[LogCB] = None) -> Optional[Path]:
+        """0600 原子保存续传状态；成功返回实际路径，失败返回 None（不阻断上传）。
+
+        优先写源文件目录的伴随文件；目录不可写时自动回退并提示一次。
+        """
+        self.version = UPLOAD_STATE_VERSION
         self.updated_at = time.time()
-        tmp = None
-        try:
-            STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-            tmp = STATE_PATH.with_name(STATE_PATH.name + ".tmp")
-            tmp.write_text(json.dumps(asdict(self), ensure_ascii=False), encoding="utf-8")
+        target = getattr(self, "state_path", None)
+        candidates = [target] if target is not None else self._candidates()
+        last_error: Optional[OSError] = None
+        for idx, candidate in enumerate(candidates):
             try:
-                os.chmod(tmp, 0o600)
-            except OSError:
-                pass
-            os.replace(tmp, STATE_PATH)
-        except OSError:
-            if tmp is not None:
-                try:
-                    tmp.unlink(missing_ok=True)
-                except OSError:
-                    pass
+                _atomic_write_json(candidate, asdict(self))
+            except OSError as e:
+                last_error = e
+                if target is not None:
+                    break
+                continue
+            self.state_path = candidate
+            if log and idx > 0:
+                log(f"源目录不可写（{last_error}），续传状态回退到 {candidate}")
+            return candidate
+        if log and not getattr(self, "_save_warned", False):
+            self._save_warned = True
+            log(f"警告：续传状态保存失败：{last_error}")
+        return None
 
     @classmethod
-    def load(cls) -> Optional["ResumeState"]:
+    def load(cls, path: Path) -> Optional["ResumeState"]:
+        raw = _read_json_dict(path)
+        if not raw:
+            return None
         try:
-            raw = json.loads(STATE_PATH.read_text(encoding="utf-8"))
-            if not isinstance(raw, dict):
-                return None
-            return cls(
+            state = cls(
                 server=str(raw["server"]),
                 bucket=str(raw["bucket"]),
                 key=str(raw["key"]),
@@ -369,16 +447,104 @@ class ResumeState:
                 upload_id=str(raw["upload_id"]),
                 uploaded=[int(x) for x in (raw.get("uploaded") or [])],
                 updated_at=float(raw.get("updated_at") or 0),
+                total_chunks=int(raw.get("total_chunks") or 0),
+                staging=str(raw.get("staging") or ""),
+                version=int(raw.get("version") or UPLOAD_STATE_VERSION),
+            )
+        except Exception:
+            return None
+        state.state_path = Path(path)
+        return state
+
+    def clear(self) -> None:
+        """删除本文件的续传状态（源目录与回退目录都尝试清理）。"""
+        for path in self._candidates():
+            for candidate in (path, Path(str(path) + ".tmp")):
+                try:
+                    candidate.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+
+def _migrate_legacy_state(server: str, bucket: str, key: str, path: Path,
+                          stat: os.stat_result,
+                          log: Optional[LogCB] = None) -> Optional[ResumeState]:
+    """读取旧版全局 ~/.artifactdepot_upload_state.json 做一次兼容迁移。
+
+    只有状态与当前文件/目标完全匹配时才迁移并删除旧文件；不匹配的旧状态
+    可能属于另一个文件，保留给那次上传自己处理。
+    """
+    if not LEGACY_STATE_PATH.exists():
+        return None
+    state = ResumeState.load(LEGACY_STATE_PATH)
+    if state is None:
+        try:
+            LEGACY_STATE_PATH.unlink()
+        except OSError:
+            pass
+        return None
+    if not state.matches(server, bucket, key, path, stat):
+        return None
+    if state.total_chunks <= 0:
+        state.total_chunks = max(1, (stat.st_size + state.chunk_size - 1) // state.chunk_size)
+    # 旧文件不是新位置：清掉缓存路径，save() 会重新选择源目录（或回退目录）
+    state.state_path = None
+    saved = state.save(log=log)
+    try:
+        LEGACY_STATE_PATH.unlink()
+    except OSError:
+        pass
+    if log:
+        log(f"已迁移旧版全局续传状态到 {saved or '（保存失败）'} 并删除旧文件")
+    return state
+
+
+@dataclass
+class DownloadState:
+    """下载断点状态（落在目标文件同目录的伴随文件里，记录已完成分片索引）。"""
+
+    size: int = 0
+    etag: str = ""
+    chunk_size: int = 0
+    done: list = field(default_factory=list)
+    updated_at: float = 0.0
+    version: int = DOWNLOAD_STATE_VERSION
+
+    def save(self, path: Path, log: Optional[LogCB] = None) -> bool:
+        self.version = DOWNLOAD_STATE_VERSION
+        self.updated_at = time.time()
+        try:
+            _atomic_write_json(path, asdict(self))
+            return True
+        except OSError as e:
+            if log:
+                log(f"警告：下载断点状态保存失败：{e}")
+            return False
+
+    @classmethod
+    def load(cls, path: Path) -> Optional["DownloadState"]:
+        raw = _read_json_dict(path)
+        if not raw:
+            return None
+        try:
+            return cls(
+                size=int(raw.get("size") or 0),
+                etag=str(raw.get("etag") or ""),
+                chunk_size=int(raw.get("chunk_size") or 0),
+                done=[int(x) for x in (raw.get("done") or [])],
+                updated_at=float(raw.get("updated_at") or 0),
+                version=int(raw.get("version") or DOWNLOAD_STATE_VERSION),
             )
         except Exception:
             return None
 
     @classmethod
-    def clear(cls) -> None:
-        try:
-            STATE_PATH.unlink()
-        except OSError:
-            pass
+    def clear(cls, path: Path) -> None:
+        for candidate in (Path(path), Path(str(path) + ".tmp")):
+            try:
+                candidate.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -613,8 +779,9 @@ class ArtifactDepotClient:
                     progress: Optional[Callable[[int, int], None]] = None,
                     timeout: float = 3600,
                     concurrency: Optional[int] = None,
-                    cancel: Optional[threading.Event] = None) -> Path:
-        """下载 URL 到本地（大文件自动分块并发；可重试、可取消）。
+                    cancel: Optional[threading.Event] = None,
+                    pause_event: Optional[threading.Event] = None) -> Path:
+        """下载 URL 到本地（大文件自动分块并发；可重试、可取消/暂停）。
 
         行为约定：
         - dest 为目录时用 Content-Disposition（其次 URL 的 key）取名，重名自动加 (n)；
@@ -622,8 +789,11 @@ class ArtifactDepotClient:
           写临时 .part 后 os.replace；否则回退原有单流实现（含 download-bulk ZIP）；
         - 每片失败最多重试 DOWNLOAD_CHUNK_RETRIES 次（指数退避）；
         - progress(done, total)：total 未知（如 ZIP 流）时为 0，并发下载最终 done == total；
-        - cancel（threading.Event）置位时尽快停止、删除 .part 并抛 Cancelled；
-        - ETag 为对象 SHA-256 时，并发下载完成后校验内容，不一致报错并清理。
+        - cancel（threading.Event）置位时尽快停止、删除 .part/断点状态并抛 Cancelled；
+        - pause_event（threading.Event，set=暂停）在分片边界暂停，保留 .part + 断点状态；
+          再次下载时校验 size/ETag/分片一致后只补缺失分片（仅并发下载支持）；
+        - 失败保留 .part + 断点状态（可重试续传）；ETag 为对象 SHA-256 时完成后校验内容，
+          不一致说明本地数据已损坏，删除 .part/状态并报错。
         """
         timeout = float(timeout or 0) or float(DEFAULT_DOWNLOAD_TIMEOUT)
         settings = self.download_settings()
@@ -641,7 +811,7 @@ class ArtifactDepotClient:
         if (probe is not None and workers > 1 and probe["size"] > chunk_size
                 and probe["accept_ranges"]):
             return self._download_parallel(path, dest, probe, chunk_size, workers,
-                                           progress, timeout, cancel)
+                                           progress, timeout, cancel, pause_event)
         return self._download_stream(path, dest, progress, timeout, cancel)
 
     def _download_stream(self, path: str, dest: Path,
@@ -698,26 +868,67 @@ class ArtifactDepotClient:
                            workers: int,
                            progress: Optional[Callable[[int, int], None]],
                            timeout: float,
-                           cancel: Optional[threading.Event] = None) -> Path:
-        """多线程 Range 分块下载：预分配 .part，按区间并发拉取并写入对应偏移。"""
+                           cancel: Optional[threading.Event] = None,
+                           pause_event: Optional[threading.Event] = None) -> Path:
+        """多线程 Range 分块下载：预分配 .part，按区间并发拉取并写入对应偏移。
+
+        伴随状态文件 `.<目标名>.artifactdepot-download.json` 每完成一片即更新：
+        - 暂停（pause_event）在分片边界生效，保留 .part + 状态；
+        - 失败保留 .part + 状态（再次下载可续传，只补缺失分片）；
+        - 取消或数据校验失败（本地数据不可信）删除 .part + 状态。
+        """
         total = int(probe["size"])
         name = _safe_local_name(
             _filename_from_disposition(probe.get("disposition") or "")
             or _key_from_path(path), "download.bin")
         dest = _prepare_dest(Path(dest), name)
         tmp = dest.with_name(dest.name + ".part")
+        state_file = download_state_path(dest)
         url = self.server + path
         base_headers = self._headers()
+        etag = (probe.get("etag") or "").strip()
 
         chunk_count = max(1, (total + chunk_size - 1) // chunk_size)
         ranges = [(i * chunk_size, min(total, (i + 1) * chunk_size) - 1)
                   for i in range(chunk_count)]
+        chunk_bytes = [end - start + 1 for start, end in ranges]
+
+        # ---- 断点：size/ETag/分片大小一致且 .part 大小正确才续传，否则丢弃重下 ----
+        done_chunks: set = set()
+        state = DownloadState.load(state_file)
+        if state is not None:
+            try:
+                part_size = tmp.stat().st_size
+            except OSError:
+                part_size = -1
+            if (int(state.size) == total and int(state.chunk_size) == chunk_size
+                    and state.etag == etag and part_size == total):
+                done_chunks = {i for i in state.done if 0 <= i < chunk_count}
+            else:
+                # 对象已变化（size/ETag）或 .part 不可信：丢弃后从头下载
+                DownloadState.clear(state_file)
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                done_chunks = set()
+        pending = [(i, ranges[i][0], ranges[i][1])
+                   for i in range(chunk_count) if i not in done_chunks]
+        resumed_bytes = sum(chunk_bytes[i] for i in done_chunks)
 
         lock = threading.Lock()
+        state_lock = threading.Lock()
         abort = threading.Event()
-        done = [0]
+        done = [resumed_bytes]
         errors: list = []
         next_index = [0]
+
+        def _persist_state() -> None:
+            """把已完成分片写入伴随状态文件（0600 原子写；失败不阻断下载）。"""
+            with state_lock:
+                snapshot = DownloadState(size=total, etag=etag, chunk_size=chunk_size,
+                                         done=sorted(done_chunks))
+                snapshot.save(state_file)
 
         def _stopped() -> bool:
             return bool((cancel is not None and cancel.is_set()) or abort.is_set())
@@ -795,6 +1006,9 @@ class ArtifactDepotClient:
                 except Exception as e:
                     raise ApiError(0, f"下载分片 {pos}-{end} 失败：{e}", url)
 
+        def _paused() -> bool:
+            return pause_event is not None and pause_event.is_set()
+
         def _worker() -> None:
             try:
                 fh = open(tmp, "r+b")
@@ -805,10 +1019,15 @@ class ArtifactDepotClient:
                 return
             try:
                 while not _stopped():
-                    with lock:
-                        if next_index[0] >= len(ranges):
+                    if _paused():
+                        # 分片边界暂停：等待「继续」或取消（已下载的分片保持不动）
+                        if _sleep_or_cancel(0.2, cancel, abort):
                             return
-                        start, end = ranges[next_index[0]]
+                        continue
+                    with lock:
+                        if next_index[0] >= len(pending):
+                            return
+                        idx, start, end = pending[next_index[0]]
                         next_index[0] += 1
                     try:
                         _fetch(fh, start, end)
@@ -817,18 +1036,24 @@ class ArtifactDepotClient:
                             errors.append(e)
                         abort.set()
                         return
+                    if _stopped():
+                        return
+                    with state_lock:
+                        done_chunks.add(idx)
+                    _persist_state()
             finally:
                 try:
                     fh.close()
                 except OSError:
                     pass
 
+        discard = [False]
         try:
-            # 预分配到目标大小，各 worker 直接写到自己的偏移
-            with open(tmp, "wb") as prep:
+            # 预分配到目标大小，各 worker 直接写到自己的偏移；续传时保留已下载分片
+            with open(tmp, "r+b" if done_chunks else "wb") as prep:
                 prep.truncate(total)
             threads = [threading.Thread(target=_worker, daemon=True)
-                       for _ in range(min(workers, chunk_count))]
+                       for _ in range(min(workers, len(pending)))]
             for t in threads:
                 t.start()
             for t in threads:
@@ -845,21 +1070,29 @@ class ArtifactDepotClient:
             except OSError:
                 actual = -1
             if actual != total:
+                discard[0] = True
                 raise ApiError(0, f"下载大小校验失败：期望 {total}，实际 {actual} 字节", url)
-            expected_sha = _etag_sha256(probe.get("etag") or "")
+            expected_sha = _etag_sha256(etag)
             if expected_sha:
                 actual_sha = _sha256_file(tmp)
                 if actual_sha != expected_sha:
+                    discard[0] = True
                     raise ApiError(
                         0, f"下载校验失败：SHA-256 不一致（期望 {expected_sha}，"
                            f"实际 {actual_sha}）", url)
             os.replace(tmp, dest)
-        except BaseException:
-            try:
-                tmp.unlink(missing_ok=True)
-            except OSError:
-                pass
+        except BaseException as exc:
+            # 取消 / 本地数据不可信 → 删除 .part+状态；网络或服务端失败 → 保留可续传
+            if discard[0] or isinstance(exc, Cancelled) \
+                    or (cancel is not None and cancel.is_set()):
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                DownloadState.clear(state_file)
             raise
+        else:
+            DownloadState.clear(state_file)
         if progress:
             try:
                 progress(total, total)
@@ -868,21 +1101,41 @@ class ArtifactDepotClient:
         return dest
 
     # ---- 分片 ----
-    def initiate(self) -> tuple:
-        data = self._json("POST", "/api/objects/initiate").get("data") or {}
+    def initiate(self, bucket: str = "", key: str = "", size: int = 0, *,
+                 resume: bool = False, upload_id: str = "") -> dict:
+        """创建/复用分片上传会话，返回服务端 data。
+
+        始终带 bucket/key/size（让服务端把分片暂存到目标文件目录）；续传时
+        resume=true + upload_id（本地有状态）或只看 bucket/key/size 找回会话；
+        返回 uploaded（服务端磁盘上的真实分片索引）作为续传唯一事实源。
+        """
+        fields: dict = {}
+        if bucket:
+            fields["bucket"] = bucket
+        if key:
+            fields["key"] = key
+        if int(size or 0) > 0:
+            fields["size"] = str(int(size))
+        if resume:
+            fields["resume"] = "true"
+        if upload_id:
+            fields["upload_id"] = upload_id
+        data = self._post_form("/api/objects/initiate", fields).get("data") or {}
         upload_id = str(data.get("upload_id") or "")
         if not upload_id:
             raise ApiError(0, "服务端未返回 upload_id")
-        chunk_size = int(data.get("chunk_size") or CHUNK_SIZE)
+        data["upload_id"] = upload_id
+        chunk_size = _int_or(data.get("chunk_size"), CHUNK_SIZE)
         if chunk_size <= 0:
             chunk_size = CHUNK_SIZE
+        data["chunk_size"] = chunk_size
         try:
             server_timeout = float(data.get("request_timeout_seconds") or 0)
         except (TypeError, ValueError):
             server_timeout = 0
         if server_timeout > 0:
             self.request_timeout = server_timeout
-        return upload_id, chunk_size
+        return data
 
     @staticmethod
     def _multipart(fields: dict, file_field: Optional[str],
@@ -1017,36 +1270,79 @@ def _upload_chunked(client: ArtifactDepotClient, path: Path, stat: os.stat_resul
                     bucket: str, key: str, overwrite: bool, resume: bool,
                     progress: Optional[ProgressCB], log: Optional[LogCB],
                     cancel_event: Optional[threading.Event],
+                    pause_event: Optional[threading.Event] = None,
                     source_url: str = "") -> dict:
     size = stat.st_size
-    state: Optional[ResumeState] = ResumeState.load() if resume else None
-    if state and not state.matches(client.server, bucket, key, path, stat):
-        state = None
 
-    if state:
-        upload_id = state.upload_id
-        chunk_size = state.chunk_size
-        total_chunks = max(1, (size + chunk_size - 1) // chunk_size)
-        uploaded = {i for i in state.uploaded if 0 <= i < total_chunks}
-        if log:
-            log(f"发现未完成上传：已传 {len(uploaded)}/{total_chunks} 片，尝试续传")
+    def chunk_len(index: int, chunk_size_: int) -> int:
+        return max(0, min(chunk_size_, size - index * chunk_size_))
+
+    def _wait_if_paused() -> None:
+        """暂停：在分片边界阻塞等待「继续」；取消优先。"""
+        if pause_event is None:
+            return
+        while pause_event.is_set():
+            if cancel_event is not None and cancel_event.is_set():
+                raise Cancelled("用户取消")
+            pause_event.wait(0.2)
+        if cancel_event is not None and cancel_event.is_set():
+            raise Cancelled("用户取消")
+
+    # ---- 1) 读本地续传状态（含旧版全局状态的一次性兼容迁移）----
+    state: Optional[ResumeState] = None
+    if resume:
+        state = ResumeState.load(upload_state_path(path))
+        if state is None:
+            state = _migrate_legacy_state(client.server, bucket, key, path, stat, log)
+        if state is not None and not state.matches(client.server, bucket, key, path, stat):
+            state = None
+
+    # ---- 2) initiate：始终带 bucket/key/size；续传以服务端 uploaded 为事实源 ----
+    if resume and state is not None:
+        try:
+            data = client.initiate(bucket, key, size, resume=True,
+                                   upload_id=state.upload_id)
+        except ApiError as e:
+            if not _is_session_error(e):
+                raise
+            if log:
+                log("服务端分片会话已失效；本地续传状态已清除，将重新开始上传。")
+            state.clear()
+            state = None
+            # 契约 C2：会话失效 → 清状态、新建会话重传
+            data = client.initiate(bucket, key, size, resume=False)
+    elif resume:
+        # 本地没有状态，但服务端可能仍有会话（状态文件被删/换机器）：按 bucket/key/size 找回
+        data = client.initiate(bucket, key, size, resume=True)
     else:
-        upload_id, chunk_size = client.initiate()
-        total_chunks = max(1, (size + chunk_size - 1) // chunk_size)
-        state = ResumeState(
-            server=client.server, bucket=bucket, key=key,
-            file_path=str(path.resolve()), file_size=size,
-            file_mtime_ns=stat.st_mtime_ns, chunk_size=chunk_size,
-            upload_id=upload_id, uploaded=[])
-        state.save()
-        uploaded = set()
-        if log:
-            log(f"分片上传：{format_bytes(size)}，{total_chunks} 片 × {format_bytes(chunk_size)}")
+        data = client.initiate(bucket, key, size, resume=False)
 
-    def chunk_len(i: int) -> int:
-        return max(0, min(chunk_size, size - i * chunk_size))
+    upload_id = str(data["upload_id"])
+    chunk_size = int(data["chunk_size"])
+    total_chunks = max(1, (size + chunk_size - 1) // chunk_size)
+    uploaded = {i for i in (_int_or(x, -1) for x in (data.get("uploaded") or []))
+                if 0 <= i < total_chunks}
+    staging = str(data.get("staging") or ("target" if bucket and key else "legacy"))
+    resumed = bool(data.get("resumed")) and bool(uploaded)
 
-    loaded = sum(chunk_len(i) for i in uploaded)
+    if resumed and log:
+        log(f"续传：服务端已有 {len(uploaded)}/{total_chunks} 片"
+            f"（{format_bytes(sum(chunk_len(i, chunk_size) for i in uploaded))}），只补缺失分片")
+    elif log:
+        log(f"分片上传：{format_bytes(size)}，{total_chunks} 片 × {format_bytes(chunk_size)}")
+
+    # 用服务端状态刷新本地缓存（新建或续传）
+    state = ResumeState(
+        server=client.server, bucket=bucket, key=key,
+        file_path=str(path.resolve()), file_size=size,
+        file_mtime_ns=stat.st_mtime_ns, chunk_size=chunk_size,
+        upload_id=upload_id, uploaded=sorted(uploaded),
+        total_chunks=total_chunks, staging=staging)
+    saved = state.save(log=log)
+    if saved is not None and log and not resumed:
+        log(f"续传状态：{saved}")
+
+    loaded = sum(chunk_len(i, chunk_size) for i in uploaded)
     sent = 0
     started = time.monotonic()
     _notify(progress, loaded, size, 0, f"准备上传（{len(uploaded)}/{total_chunks} 已传）")
@@ -1055,35 +1351,33 @@ def _upload_chunked(client: ArtifactDepotClient, path: Path, stat: os.stat_resul
         for i in range(total_chunks):
             if cancel_event is not None and cancel_event.is_set():
                 raise Cancelled("用户取消")
+            _wait_if_paused()
             if i in uploaded:
                 continue
             fh.seek(i * chunk_size)
-            data = fh.read(chunk_size)
-            if not data:
+            payload = fh.read(chunk_size)
+            if not payload:
                 raise ApiError(0, f"读取分片 {i} 为空（文件可能被修改）")
 
-            def _send(idx=i, payload=data):
-                return client.upload_chunk(upload_id, idx, payload)
+            def _send(idx=i, data=payload):
+                return client.upload_chunk(upload_id, idx, data)
 
             try:
                 _retry(_send, what=f"分片 {i + 1}/{total_chunks} ", log=log)
             except ApiError as e:
                 if _is_session_error(e):
-                    ResumeState.clear()
+                    state.clear()
                     raise SessionLost(
                         "服务端分片会话已失效（可能超过 24 小时、服务重启或被清理）；"
                         "本地续传状态已清除，请重新开始上传。")
+                # 其他失败：不 abort，保留会话与续传状态（异常上抛，后续可续传）
                 raise
 
             uploaded.add(i)
             state.uploaded = sorted(uploaded)
-            try:
-                state.save()
-            except OSError as e:
-                if log:
-                    log(f"警告：续传状态保存失败：{e}")
-            sent += len(data)
-            loaded += len(data)
+            state.save(log=log)
+            sent += len(payload)
+            loaded += len(payload)
             elapsed = max(0.001, time.monotonic() - started)
             _notify(progress, loaded, size, sent / elapsed,
                     f"分片 {i + 1}/{total_chunks}")
@@ -1103,13 +1397,14 @@ def _upload_chunked(client: ArtifactDepotClient, path: Path, stat: os.stat_resul
                 log("complete 响应异常，但服务端已存在同大小对象，按成功处理")
             result = remote
         elif _is_session_error(e):
-            ResumeState.clear()
+            state.clear()
             raise SessionLost(
                 "服务端分片会话已失效或分片不完整；本地续传状态已清除，请重新开始上传。")
         else:
+            # 合并失败（如配额/磁盘）：保留状态以便重试，不 abort
             raise
 
-    ResumeState.clear()
+    state.clear()
     _notify(progress, size, size, 0, "上传完成")
     if log:
         log(f"上传成功：{key}（{format_bytes(size)}）")
@@ -1121,8 +1416,13 @@ def upload_file(client: ArtifactDepotClient, file_path: str, bucket: str, key: s
                 progress: Optional[ProgressCB] = None,
                 log: Optional[LogCB] = None,
                 cancel_event: Optional[threading.Event] = None,
+                pause_event: Optional[threading.Event] = None,
                 source_url: str = "") -> dict:
-    """上传一个文件。小文件直传；>8MB 分片（支持续传/重试）。返回服务端 data。"""
+    """上传一个文件。小文件直传；>8MB 分片（支持续传/暂停/重试）。返回服务端 data。
+
+    pause_event（threading.Event，set=暂停）在分片边界暂停；失败不 abort，
+    保留服务端会话与本地续传状态，再次调用（同文件/目标）即从断点续传。
+    """
     path = Path(file_path).expanduser().resolve()
     if not path.is_file():
         raise FileNotFoundError(f"文件不存在：{path}")
@@ -1131,7 +1431,7 @@ def upload_file(client: ArtifactDepotClient, file_path: str, bucket: str, key: s
         return _upload_direct(client, path, stat, bucket, key, overwrite, progress, log,
                               source_url)
     return _upload_chunked(client, path, stat, bucket, key, overwrite, resume,
-                           progress, log, cancel_event, source_url)
+                           progress, log, cancel_event, pause_event, source_url)
 
 
 # ---------------------------------------------------------------------------
@@ -1174,11 +1474,20 @@ def _cli(args: argparse.Namespace) -> int:
         print("上传成功：", json.dumps(result, ensure_ascii=False))
         return 0
     except KeyboardInterrupt:
-        print("\n已中断；已上传分片保留，可下次续传。", file=sys.stderr)
+        print("\n已中断；已上传分片与续传状态保留，重跑同一命令将从断点继续。",
+              file=sys.stderr)
         return 130
     except Exception as e:
         sys.stdout.write("\r" + " " * 110 + "\r")
         print(f"上传失败：{e}", file=sys.stderr)
+        try:
+            chunked = Path(args.file).expanduser().resolve().stat().st_size > CHUNK_SIZE
+        except OSError:
+            chunked = False
+        if chunked and not args.no_resume:
+            print("已保留续传状态，重跑同一命令将从断点继续"
+                  "（分片会话在服务端保留；加 --no-resume 可放弃续传重新开始）。",
+                  file=sys.stderr)
         return 1
 
 
@@ -1573,7 +1882,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--source-url", default="", help="可选：来源 URL（写入对象元数据）")
     p.add_argument("--file", default="", help="要上传的本地文件；提供则走 CLI 模式")
     p.add_argument("--no-overwrite", action="store_true", help="不覆盖同名对象")
-    p.add_argument("--no-resume", action="store_true", help="不续传上次未完成的分片会话")
+    p.add_argument("--no-resume", action="store_true",
+                   help="不续传上次未完成的分片会话（忽略本地续传状态，新建会话重传）")
     return p
 
 

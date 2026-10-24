@@ -1,75 +1,17 @@
 # Changelog
 
-ArtifactDepot v0.10.0 — 所有对本项目的重要更改都将记录在此文件中。
+ArtifactDepot v0.9.0 — 所有对本项目的重要更改都将记录在此文件中。
 
 本日志格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本号遵循 [语义化版本规范](https://semver.org/lang/zh-CN/)。
 
 ---
 
-## [0.10.0] - 2026-10-24
-
-### 目录一键下载（单文件直下 / 流式 ZIP）
-
-#### Added
-
-- **一键下载目录接口** `GET /api/objects/download-bulk`（DownloadBulk）：下载当前浏览目录的全部内容；
-  **复用权限点 `object:download`（不新增权限点、角色预设不变）**，token 可走 query `?token=` 或
-  `Authorization: Bearer`，并校验 bucket/prefix 资源范围（越界 `403`）；不接入签名链接。
-- **直下 vs ZIP 规则**：目录内只有 1 个可见文件且无可见子目录 → 直下原文件（原文件名、`Content-Type`、
-  Range/206、ETag/304）；其他非空情况 → 打包 ZIP；空目录 / 不存在 / 不是目录 → `404`
-  （不返回 0 字节 ZIP）。
-- **ZIP 结构**：顶层为与目录同名的文件夹（bucket 根用 bucket 名），内含相对路径的文件与子目录条目；
-  空目录也保留条目（名称以 `/` 结尾）；**文件条目保留源文件 mtime**（目录条目为当前时间）；跳过隐藏文件/目录
-  （含 `.keep`、`.warehouse.json`）与符号链接（不跟随、不打包）；每层先子目录（深度优先）再文件、名称排序，输出稳定。
-- **流式与内存**：`zipstream.py` 用后台线程 + 非 seekable 队列 writer + 有界队列（8 块 × 256 KiB）实现背压，
-  `ZIP_STORED` + `allowZip64`，无 `Content-Length`、**不落临时文件、不整包进内存**；文件按 256 KiB 分块读取；
-  客户端中断时停止遍历/读取、线程退出，审计仍写一条并标记 `aborted=true`。
-- **响应头**：`Content-Disposition: attachment; filename="<ascii 回退>.zip"; filename*=UTF-8''<percent-encoded>`，
-  中文目录名走 RFC 5987（ASCII 回退为 `download.zip`）。
-- **安全与上限**：`prefix` 解析（含符号链接）后必须仍在本 bucket 内（否则 `400`）；隐藏项一律跳过；
-  单次 `files + dirs` 上限 `MAX_BULK_DOWNLOAD_ITEMS = 100000`，超限 `400`；失败请求不写审计、不计指标。
-- **网页 UI**：目录浏览页面包屑卡片新增 **「下载本目录」** 按钮（`data-action="download-dir"`，只读、
-  无确认弹窗），仅选中 bucket 后可用，bucket 根即下载整个 bucket；读取令牌框，空则提示先填写；
-  用隐藏 `<a>` 触发浏览器原生下载（不把 ZIP 读进内存），toast 提示单文件直下 / 多文件或含子目录自动打包 ZIP。
-- **审计与指标**：直下写 `download`（`extra` 含 `bulk=true`、`mode=file`）；ZIP 在流结束（含中断）写
-  `download_bulk`（`key` 为规范化 prefix、`size` 为实际发送字节数、`extra` 含 `mode/files/dirs/aborted`）；
-  `DOWNLOADS` 指标成功请求 +1（失败与 `304` 不计）。
-- **测试**：新增 `tests/test_bulk_download.py`（13 个测试函数，覆盖契约 §2.4 的 11 项要求），覆盖单文件直下
-  （Range/ETag）、流式 ZIP 结构与空目录、隐藏项/符号链接跳过、顶层命名、401/403/400/404 矩阵、审计与指标、
-  项数上限、中断审计、UI 标记。
-- **文档**：`docs/api_rules.md` 新增 §2.13（端点 / 鉴权 / 直下与 ZIP 规则 / ZIP 结构 / 流式 / 错误码 / 安全 /
-  审计），并同步 §1.6、§7、§8、§10、§11.5；`docs/architecture.md` 补 API 契约、流式 ZIP 可靠性与安全要点；
-  `README.md` 补核心特性、权限口径、API 参考、网页 UI 与测试清单。
-
-#### Changed
-
-- **版本号统一提升到 `0.10.0`**（`VERSION` / `main.py` 兜底 / `build_image.conf` / `deploy_container.sh` /
-  `README` / `docs`）。
-- **权限模型未变**：一键下载复用 `object:download`，不新增权限点，`viewer` / `downloader` / `operator`
-  等角色预设保持不变。
-
-#### Fixed
-
-- **`upload.session_ttl_seconds` 绝对有效期生效**：新增 `cleanup_expired_chunk_sessions()`，按
-  `.session.json.created_at` 清理绝对过期会话；新建会话和后台任务同时执行“空闲 TTL + 绝对 TTL”清理。
-- **OBJ-003/OBJ-005 修复**：直接上传目标 key 已是目录/父路径是文件、complete 目标 key
-  已是目录时返回 `409`（不再 500）；complete 失败清理本次分片会话，并同步移除对应已知缺陷标记。
-- **key 控制字符加固**：`validate_key()` 拒绝 CR/LF/TAB 等控制字符；下载响应头文件名做安全替换，
-  防止日志污染/header 注入。
-- **上传临时文件清理**：`finalize_chunk_upload` 在成功或进入合并/落盘阶段后的硬失败（I/O、磁盘满等）时
-  删除本次 `/tmp/dw_chunks/<upload_id>` 与合并临时文件；**校验类失败（缺片、超限、权限、409）保留会话**，
-  允许补齐/调整后重试或续传；`store_chunk` 复制失败清理 `.part.tmp`；直传/分片请求读取异常也会清理本次请求的
-  临时文件；服务启动时清理所有遗留分片会话（容器/进程重启即释放历史残留，避免几十 GB 分片长期占盘）；
-  后台任务每 10 分钟清理超过 upload.session_idle_ttl_seconds（默认 24h）没有分片写入的会话（浏览器被杀/断网无 abort 的兜底）。
-  `abort` 路径保持原清理行为。
-- **测试**：新增 `tests/test_upload_cleanup.py`（7 个用例：成功/落盘硬失败/缺片保留/`.part.tmp`
-  失败清理/启动清理/lifespan 启动清理/空闲清理不误删活跃会话）。
-- **文档**：`docs/api_rules.md` §3.3、`docs/architecture.md` 可靠性要点、`README.md` 上传特性同步说明。
-
----
-
 ## [0.9.0] - 2026-10-24
+
+> 本次发布**合并此前 0.9.0 及以上的全部更新**（目录批量删除、目录一键下载、
+> 分块并发下载、伴随文件本地化与上传暂停/恢复），均为同一轮更新，统一按 **0.9.0** 发布。
+
 
 ### 目录批量删除（一键清空）
 
@@ -109,6 +51,241 @@ ArtifactDepot v0.10.0 — 所有对本项目的重要更改都将记录在此文
   等其余预设保持不变），运营方无需单独勾选即可使用批量删除。
 - **版本号统一提升到 `0.9.0`**（`VERSION` / `main.py` 兜底 / `build_image.conf` / `deploy_container.sh` /
   `README` / `docs`）。
+
+
+### 目录一键下载（单文件直下 / 流式 ZIP）
+
+#### Added
+
+- **一键下载目录接口** `GET /api/objects/download-bulk`（DownloadBulk）：下载当前浏览目录的全部内容；
+  **复用权限点 `object:download`（不新增权限点、角色预设不变）**，token 可走 query `?token=` 或
+  `Authorization: Bearer`，并校验 bucket/prefix 资源范围（越界 `403`）；不接入签名链接。
+- **直下 vs ZIP 规则**：目录内只有 1 个可见文件且无可见子目录 → 直下原文件（原文件名、`Content-Type`、
+  Range/206、ETag/304）；其他非空情况 → 打包 ZIP；空目录 / 不存在 / 不是目录 → `404`
+  （不返回 0 字节 ZIP）。
+- **ZIP 结构**：顶层为与目录同名的文件夹（bucket 根用 bucket 名），内含相对路径的文件与子目录条目；
+  空目录也保留条目（名称以 `/` 结尾）；**文件条目保留源文件 mtime**（目录条目为当前时间）；跳过隐藏文件/目录
+  （含 `.keep`、`.warehouse.json`）与符号链接（不跟随、不打包）；每层先子目录（深度优先）再文件、名称排序，输出稳定。
+- **流式与内存**：`zipstream.py` 用后台线程 + 非 seekable 队列 writer + 有界队列（8 块 × 256 KiB）实现背压，
+  `ZIP_STORED` + `allowZip64`，无 `Content-Length`、**不落临时文件、不整包进内存**；文件按 256 KiB 分块读取；
+  客户端中断时停止遍历/读取、线程退出，审计仍写一条并标记 `aborted=true`。
+- **响应头**：`Content-Disposition: attachment; filename="<ascii 回退>.zip"; filename*=UTF-8''<percent-encoded>`，
+  中文目录名走 RFC 5987（ASCII 回退为 `download.zip`）。
+- **安全与上限**：`prefix` 解析（含符号链接）后必须仍在本 bucket 内（否则 `400`）；隐藏项一律跳过；
+  单次 `files + dirs` 上限 `MAX_BULK_DOWNLOAD_ITEMS = 100000`，超限 `400`；失败请求不写审计、不计指标。
+- **网页 UI**：目录浏览页面包屑卡片新增 **「下载本目录」** 按钮（`data-action="download-dir"`，只读、
+  无确认弹窗），仅选中 bucket 后可用，bucket 根即下载整个 bucket；读取令牌框，空则提示先填写；
+  用隐藏 `<a>` 触发浏览器原生下载（不把 ZIP 读进内存），toast 提示单文件直下 / 多文件或含子目录自动打包 ZIP。
+- **审计与指标**：直下写 `download`（`extra` 含 `bulk=true`、`mode=file`）；ZIP 在流结束（含中断）写
+  `download_bulk`（`key` 为规范化 prefix、`size` 为实际发送字节数、`extra` 含 `mode/files/dirs/aborted`）；
+  `DOWNLOADS` 指标成功请求 +1（失败与 `304` 不计）。
+- **测试**：新增 `tests/test_bulk_download.py`（13 个测试函数，覆盖契约 §2.4 的 11 项要求），覆盖单文件直下
+  （Range/ETag）、流式 ZIP 结构与空目录、隐藏项/符号链接跳过、顶层命名、401/403/400/404 矩阵、审计与指标、
+  项数上限、中断审计、UI 标记。
+- **文档**：`docs/api_rules.md` 新增 §2.13（端点 / 鉴权 / 直下与 ZIP 规则 / ZIP 结构 / 流式 / 错误码 / 安全 /
+  审计），并同步 §1.6、§7、§8、§10、§11.5；`docs/architecture.md` 补 API 契约、流式 ZIP 可靠性与安全要点；
+  `README.md` 补核心特性、权限口径、API 参考、网页 UI 与测试清单。
+
+#### Changed
+
+- **权限模型未变**：一键下载复用 `object:download`，不新增权限点，`viewer` / `downloader` / `operator`
+  等角色预设保持不变。
+
+#### Fixed
+
+- **`upload.session_ttl_seconds` 绝对有效期生效**：新增 `cleanup_expired_chunk_sessions()`，按
+  `.session.json.created_at` 清理绝对过期会话；新建会话和后台任务同时执行“空闲 TTL + 绝对 TTL”清理。
+- **OBJ-003/OBJ-005 修复**：直接上传目标 key 已是目录/父路径是文件、complete 目标 key
+  已是目录时返回 `409`（不再 500）；complete 失败清理本次分片会话，并同步移除对应已知缺陷标记。
+- **key 控制字符加固**：`validate_key()` 拒绝 CR/LF/TAB 等控制字符；下载响应头文件名做安全替换，
+  防止日志污染/header 注入。
+- **上传临时文件清理**：`finalize_chunk_upload` 在成功或进入合并/落盘阶段后的硬失败（I/O、磁盘满等）时
+  删除本次 `/tmp/dw_chunks/<upload_id>` 与合并临时文件；**校验类失败（缺片、超限、权限、409）保留会话**，
+  允许补齐/调整后重试或续传；`store_chunk` 复制失败清理 `.part.tmp`；直传/分片请求读取异常也会清理本次请求的
+  临时文件；服务启动时清理所有遗留分片会话（容器/进程重启即释放历史残留，避免几十 GB 分片长期占盘）；
+  后台任务每 10 分钟清理超过 upload.session_idle_ttl_seconds（默认 24h）没有分片写入的会话（浏览器被杀/断网无 abort 的兜底）。
+  `abort` 路径保持原清理行为。
+- **测试**：新增 `tests/test_upload_cleanup.py`（7 个用例：成功/落盘硬失败/缺片保留/`.part.tmp`
+  失败清理/启动清理/lifespan 启动清理/空闲清理不误删活跃会话）。
+- **文档**：`docs/api_rules.md` §3.3、`docs/architecture.md` 可靠性要点、`README.md` 上传特性同步说明。
+
+
+### 分块并发下载（HEAD / Range）+ 共享令牌默认 admin
+
+#### Added
+
+- **服务端下载参数 `download.*`**：`config/__init__.py` 的 `DEFAULT["download"]` 内置
+  `chunk_size_mb=8`、`chunk_concurrency=4`、`request_timeout_seconds=3600`（1h）；
+  `get_download_settings()` 归一化并按合法区间**自动夹紧**（分片 1–64MB、并发 1–16、超时 60s–7d），
+  `public_download_settings()` 以「字节 / 整数 / 秒」下发（不含任何密钥）；
+  `GET /api/auth/permissions` 的 `data` 新增 `download` 段（与既有 `upload` 并列）；
+  `config.json` / `config.production.json` / `.env.example` 同步补齐；`.env` 支持点号写法
+  （`download.chunk_size_mb=8`），真实环境变量为 `ARTIFACT_DEPOT_DOWNLOAD_*`；
+  每次调用都读当前配置，`POST /api/config/reload` 后**即时生效、无需重启**。
+- **`HEAD /api/objects/download` 元信息探测**：返回 `Content-Length` / `Accept-Ranges: bytes` /
+  `ETag` / `Content-Disposition`，响应体为空；路由以 `include_in_schema=False` 注册，
+  **OpenAPI 操作数仍为 35、不新增权限点**（`GET /api/auth/permissions` 仍 22 条）；
+  鉴权与 GET 相同（token / `Authorization: Bearer` / 签名链接），对象不存在或无效 token 分别 `404` / `401`。
+- **Range 下载语义与审计口径**：单区间 `Range: bytes=a-b` 返回 `206 + Content-Range`（首段 / 中段 /
+  尾段 / 后缀 `bytes=-n` 均支持），不可满足返回 `416`（带 `Content-Range: bytes */<total>`），多区间
+  全部可满足时返回 `206 multipart/byteranges`（任一段越界则 `416`，不 500）；**每个 Range 请求写一条 `download` 审计**（并发下载会产生多条），
+  `extra` 与记录根层合并后含 `partial=true`、`range=<请求头原文>`，`size` 为**实际区间字节数**；
+  可解析的单区间计一次 `DOWNLOADS` 指标，多区间 / 不可解析区间不计。
+- **桌面客户端分块并发下载**（`client/artifactdepot_upload.py`）：新增 `download_settings()`（读取
+  `data.download`，异常回退 8MiB / 4 路 / 1h 并夹紧）与 `download_to(path, dest, progress, timeout,
+  concurrency, cancel)`——先 `HEAD` 探测大小 / `Accept-Ranges` / `ETag` / 文件名，文件大于分片且服务端支持
+  Range 时按区间**并行 GET**，预分配 `.part` 后各线程按偏移写入；单片失败最多重试 **3 次指数退避**
+  （仅网络错误 / 超时 / 408 / 429 / 5xx；4xx 含 416 不重试，从已写入偏移续传不重复计数）；完成校验总大小，
+  `ETag` 为 `"<64 位 hex>"` 时用 SHA-256 校验后再 `os.replace`；取消（`threading.Event`）会停止各分片、
+  清理 `.part` 并抛 `Cancelled`；**签名链接（`link`/`tk`/`expires`/`sig`）与 `download-bulk` ZIP 强制单流**
+  （避免消耗签名次数、ZIP 无 `Content-Length`）。GUI 动作栏新增「下载并发」1–16、「取消下载」，
+  状态栏显示已下载字节 / 百分比 / 实时速度（≥150ms 合并刷新）。
+- **网页端分块并发下载**（`resources/static/app.js`）：`loadUploadConfig()` 用同一个
+  `GET /api/auth/permissions` 请求读取 `data.download`；文件行下载改为 `data-action="download-file"`
+  `data-key="..."`（**token 只走 `Authorization` 头**，不再拼进 `href`）；点击手势内优先
+  `showSaveFilePicker` + `createWritable` 边下边写盘（内存只保留并发数个分片），无该 API 时并发 Range →
+  按序拼 `Blob` → `a.click()`；**>1GiB 或服务端忽略 Range（返回 200）时回退浏览器原生单流**；
+  `#dlModal` 显示进度 / 速度 / 重试次数并支持「取消下载」（`AbortController` 中止全部在途请求）；
+  每片最多 3 次尝试（首试 + 2 次重试）；`ETag` 为 `"<64 位 hex>"` 且文件 ≤256MiB 时用
+  `crypto.subtle.digest('SHA-256')` 校验；服务端 `HEAD` 返回 405/501 时用 `GET bytes=0-0` 兜底探测。
+- **测试**：新增 `tests/test_download_chunked.py`（18 个测试函数：默认 `admin`、`download.*` 下发/夹紧/
+  点号写法/热重载、HEAD 头与审计、Range 206/416/多区间、并发多 Range、权限目录不新增 scope）、
+  `tests/test_web_download_chunked.py`（14 个静态契约测试：配置读取、无 token-in-URL、HEAD 探测、并行分片、
+  FS/Blob/原生回退、取消、SHA-256、进度弹窗、CSP 与语法）、
+  `client/test_parallel_download.py`（10 个测试：真实 uvicorn 子进程 + 真实 HTTP，覆盖并行下载与 SHA-256、
+  小文件/`concurrency=1` 单流回退、取消清理 `.part`、404、多 Range 审计、重试不重复计数、
+  ETag 校验失败清理、目录 ZIP 单流）。
+- **文档**：`README.md`、`docs/api_rules.md`（新增 §2.14「分块并发下载」并同步 §1.3 / §1.6 / §2.3 / §7 /
+  §8 / §9 / §10 / §11.5 / §12.1）、`docs/architecture.md` 按实现补充分块下载流、可靠性与安全要点。
+
+#### Changed
+
+- **`access_token` 默认值改为 `admin`**（内置 `DEFAULT`、`config.json`、`config/.env`）：开箱即可用管理员
+  共享令牌联调，无需先配置；`config.production.json` 同步补齐 `download` 段（模板仍建议部署时替换令牌）。
+  **弱口令告警保留**：`config_warnings()` 仍把 `admin` 判为弱口令并告警（长度 <12），
+  设 `ARTIFACT_DEPOT_STRICT_CONFIG=1` 时该告警会**直接拒绝启动**——生产/公网部署必须先改成
+  ≥16 位随机串（`--token` / `ARTIFACT_DEPOT_ACCESS_TOKEN` / `config.json` / `.env`）。
+- **权限模型与接口数量不变**：分块下载复用 `object:download`，`HEAD` 不进 OpenAPI schema，
+  权限点仍 22 条、OpenAPI 操作仍 35 条，角色预设不变。
+- **部署与文档**：镜像 tag / 导出 tar 文件名随版本变为 `0.9.0`（`build_image.conf`、
+  `deploy_container.sh` 兜底同步）；`README.md` 与 `docs/` 补充分块下载的**可靠性**（并行切分、重试、
+  取消清理、大小/SHA-256 校验、单流回退）、**安全**（`HEAD` 不新增权限点、签名链接按次数限制、
+  默认 `admin` 必须替换）与**部署**说明。
+
+#### Fixed
+
+- **Range / HEAD 审计 `size` 口径**：HEAD 记 `head=true`、`size=0`；Range 记 `partial=true`、
+  `range=<请求头原文>`、`size=实际区间字节数`（不再记整文件大小）；完整 GET 仍记整文件大小。
+- **HEAD 不计 `DOWNLOADS` 指标**：探测请求只写审计、不计下载数；分块下载按「每个可解析 Range 请求 +1」
+  计数，完整 GET 仍 +1；`304 Not Modified` 记 `not_modified=true`（HEAD 时另带 `head=true`）且不计指标。
+- **超长 key 返回 400 而非 500**（业务验收发现）：`validate_key` 增加 ≤1024 字符上限；此前 5000 字符 key 会让
+  下载接口在 `Path.is_file()` 处抛 `ENAMETOOLONG` → 500，现 HEAD/GET 下载与其余对象接口统一返回
+  `400 {"detail": "key 过长..."}`；新增 `tests/test_download_chunked.py::test_oversized_key_rejected_not_500` 回归。
+
+### 伴随文件本地化 + 上传暂停/恢复
+
+#### Added
+
+- **服务端伴随文件本地化（不再写 `/tmp`）**：分片会话在目标明确时落到
+  `<depot>/<bucket>/<key 父目录>/.artifactdepot-uploads/<upload_id>/`（内部目录名常量
+  `INTERNAL_UPLOAD_DIR`），内含 `.session.json`（`owner/created_at/updated_at/received_bytes/
+  bucket/key/size/chunk_size/total_chunks/staging`）、`chunk_<i>.part`、请求体临时目录
+  `.incoming/<rand>.tmp` 与合并临时文件 `.merged`；旧客户端（`initiate` 不带 `bucket/key`）
+  仍新建 legacy 会话，但改落 `<staging>/<upload_id>/`。宿主 `/tmp` 常是小容量 tmpfs，
+  72GB 级上传不再因临时空间不足失败。
+- **配置 `upload.staging_dir`**（默认 `""`）：留空 = `<depot_dir>/.staging`；相对路径按
+  `depot_dir` 解析（与 `meta_dir` 一致）；允许绝对路径（容器可挂独立数据卷）。用途：① legacy
+  会话根目录；② 启动时把 `tempfile.tempdir` 指向该目录，让 Starlette multipart 解析的 **spool
+  文件也落数据盘**（退出 lifespan 时恢复原值，测试安全）。启动日志打印位置，`config_warnings()`
+  对不可写目录告警；`.env` 支持点号写法，环境变量 `ARTIFACT_DEPOT_UPLOAD_STAGING_DIR`；
+  `config.json` / `config.production.json` / `.env.example` 同步补齐。`upload.*` 热重载即时生效，
+  但 `staging_dir` 改动在 `config/reload` 的 `needs_restart` 中提示（框架级 spool 只在启动设置）。
+- **`initiate` 续传能力（复用 `upload:initiate`，不新增权限点）**：请求同时支持 query 与 multipart
+  form（允许空 body，向后兼容），参数 `bucket`/`key`（可选，提供时追加资源范围校验）、`size`
+  （可选 int）、`resume`（默认 false）、`upload_id`（resume 时指定复用）。响应在保留原
+  `public_upload_settings()` 全部字段的基础上新增 `resumed`、`uploaded`（磁盘上真实存在且
+  `< total_chunks` 的分片索引）、`received_bytes`、`total_chunks`、`size`、`chunk_size`、
+  `staging`（`"target"`/`"legacy"`），**不回显服务端绝对路径**。`resume=true` 且不传 `upload_id`
+  时按 owner + bucket/key + size 在目标目录 `.artifactdepot-uploads` 中自动找回最新会话；找不到
+  则新建（`resumed=false`）。会话失效 / 参数不一致返回 `400` 且 `detail` 含「分片会话」，
+  客户端据此清状态重传；他人会话 `403`（admin 例外）。**不实现 `GET /upload/{id}`**（避免新增权限点）。
+- **服务端清理与重启续传**：启动时先清理旧版 `/tmp/dw_chunks` 残留（趁 `tempfile.tempdir` 仍是
+  系统临时目录），再删除 legacy staging 根下全部历史会话，并**扫描 depot 内
+  `.artifactdepot-uploads`**：超绝对 TTL / 空闲 TTL 的删除，其余注册进进程内 registry
+  （`{upload_id: Path}`）；会话在数据盘不丢，**服务重启后客户端仍可续传**。后台每 10 分钟只遍历
+  registry + legacy staging 根（成本与仓库大小无关）；新建会话时同步清理。单进程假设
+  （uvicorn 未开 `--workers`），磁盘（`.session.json` + 分片）才是唯一事实源。
+- **内部目录保护**：`.artifactdepot-uploads` 为隐藏目录，列表 / 目录递归大小 / ZIP 打包本就跳过；
+  **`bulk_delete(mode="all")` 与 `rename_object` 额外显式跳过**，避免清空/搬走活跃上传会话；
+  会话删除后若内部目录变空则 `rmdir`（失败忽略）。客户端无法以隐藏路径段作为 key，故无法直接操作。
+- **直传 / 分片 / 合并的伴随临时文件**：`POST /api/objects` 临时文件写目标父目录
+  `.<name>.artifactdepot-incoming-<rand>.tmp`；`chunk` 请求体写会话 `.incoming/<rand>.tmp` 后
+  `os.replace` 为分片（同文件系统零拷贝）；`complete` 合并到会话内 `.merged`，`put_object(move=True)`
+  算完 SHA-256 后原子落盘（避免「临时 + 目标」2× 峰值，跨文件系统回退流式拷贝）。
+- **桌面客户端断点续传与暂停/恢复**：上传断点状态写**源文件同目录**的
+  `.<文件名>.artifactdepot-upload.json`（0600 原子写；成功 / 会话失效删除，失败 / 暂停 / 取消保留），
+  源目录不可写时回退 `~/.artifactdepot/upload-state/<sha1(server|bucket|key)>.json` 并明确提示；
+  **移除全局 `~/.artifactdepot_upload_state.json`**（读旧文件做一次兼容迁移后删除），多文件并发各自
+  独立状态互不覆盖。上传始终 `initiate(bucket/key/size)`，续传时带 `resume=true`（有状态带
+  `upload_id`，无状态按 bucket/key/size 找回），**以服务端 `uploaded` 为唯一事实源**；`upload_file()`
+  新增 `pause_event`（默认 None，向后兼容），分片边界检查、已传分片不重传；失败**不 abort**，
+  异常上抛并保留会话与状态，GUI 标记「失败（可续传）」；CLI 失败/中断提示
+  「已保留续传状态，重跑同一命令将从断点继续」（`--no-resume` 保持）。
+- **桌面客户端下载断点续传与暂停/恢复**：并发分片下载每完成一片即更新
+  `.<目标名>.artifactdepot-download.json`（`size`/`etag`/`chunk_size`/`done`，0600）；暂停在分片
+  边界生效、保留 `.part` + 状态，恢复时校验 `size`/ETag 后只补缺失分片（ETag 不一致丢弃重下）；
+  失败保留两者（可续传），取消仍删除两者。GUI 新增「暂停上传」「继续上传」「暂停下载」「继续下载」按钮。
+- **网页端暂停/续传**：上传队列 `initiate` 始终带 `bucket/key/size/resume/upload_id`，每项记录
+  `upload_id/chunk_size/uploaded`；新增 `#upPause` / `#upResume` 按钮（`data-action="pause-upload"` /
+  `"resume-upload"`），失败行显示**「失败（可续传）」**并提供 `data-action="retry-upload"` 的「继续」
+  （事件委托、严格 CSP、无内联脚本）；失败**不再 `abortUpload`**，继续时 `initiate(resume=true)` 取
+  `uploaded` 后只补缺失分片；页面刷新后重新选择同一文件再点上传可按 `bucket/key/size` 找回会话
+  （浏览器无法自动恢复文件列表，界面已说明）；token 变更 / 文件大小或 mtime 变化时自动新建会话。
+- **测试**：新增 `tests/test_upload_resume.py`（12 个用例：目标目录布局、legacy staging、spool 指向与
+  还原、按 `upload_id` / 自动找回续传、`chunk` 落点与 `complete` 原子清理、直传临时文件、内部目录
+  保护、重启续传、TTL 清理、无 `/tmp` 残留、initiate 参数校验）、`tests/test_upload_resume_ui.py`
+  （14 个静态契约用例：按钮 id/`data-action`、`resume` 参数、「失败（可续传）」文案、不 abort、
+  分片边界暂停、只补缺失分片、CSP 无内联脚本、JS 语法）、`client/test_upload_resume.py`
+  （11 个用例：真实 uvicorn 子进程 + 真实 HTTP，覆盖状态文件位置/0600/成功删除、暂停→继续只补缺失分片、
+  失败后续传 SHA-256 一致、多文件独立状态、下载暂停/续传、源目录不可写回退、旧全局状态迁移）。
+  同步更新 `tests/test_upload_cleanup.py`（8 个用例）与 `client/test_parallel_download.py`（13 个用例）
+  适配新布局；全量 `pytest tests -q` 322 passed / 5 xfailed。
+- **文档**：`README.md`（核心特性、`upload.staging_dir` 配置、`initiate` 参数/响应/续传语义、FAQ、
+  目录与磁盘布局、客户端行为）、`docs/api_rules.md`（§3.1–§3.5 initiate/续传/会话布局/清理、§1.6 错误码、
+  §8 速查表、§9 配置表、§10 安全）、`docs/architecture.md`（伴随文件布局、续传状态机、重启续传、
+  单进程 registry、spool 落 staging）、`client/README.md`（状态文件位置/回退、暂停/恢复、失败续传、CLI、测试）
+
+#### Changed
+
+- **上传临时文件路径**：`/tmp/dw_chunks/<upload_id>` → 目标父目录 `.artifactdepot-uploads/<upload_id>/`
+  （legacy 客户端 → `<staging>/<upload_id>/`）；合并临时文件、请求体临时文件、直传临时文件同步迁移。
+  旧版 `/tmp/dw_chunks` 仅在启动时清理一次，不再新建。
+- **启动清理语义**：`cleanup_all_chunk_sessions()` 只清 legacy staging 根下的历史会话；目标目录会话
+  改为按 TTL 清理并注册（`scan_upload_sessions()`），以支持**跨服务重启续传**（此前启动即全删）。
+- **后台清理成本**：从「遍历整个 depot」改为「只遍历进程内 registry + legacy staging 根」，
+  与仓库文件数无关；启动时的一次性全树扫描负责重建 registry。
+- **桌面客户端状态文件位置**：由全局 `~/.artifactdepot_upload_state.json` 改为跟随源文件的伴随文件
+  （可写时）或 `~/.artifactdepot/upload-state/`（回退），0600 原子写，支持多文件并发。
+- **客户端续传事实源**：本地状态只作缓存，服务端 `initiate(resumed/uploaded)` 为唯一事实源；
+  `complete` 失败不再一律丢弃状态，会话未失效时保留以便重试。
+- **权限模型与接口数量不变**：续传复用 `upload:initiate`，**不新增权限点**（权限点仍 22 条、
+  OpenAPI 操作仍 35 条、角色预设不变，**旧 token 无需变更**）；`initiate` 的响应字段只增不改。
+
+#### Fixed
+
+- **`initiate` 父路径是文件**：`bucket/key` 的父路径不可创建目录时返回 `409`
+  （`父路径不是目录，无法创建上传会话`），不再 500 / 不落盘；直传同场景同样 `409`（0.9.0 起）。
+- **直传失败零副作用**：读取/超限/落盘任一阶段失败都会删除目标目录下的临时文件，并回滚为写临时文件
+  而新建的空父目录；`put_object(move=True)` 的失败不再残留源临时文件。
+- **`chunk` 临时文件清理**：`.incoming` 下本次请求的临时文件在读取失败 / 配额失败 / 落盘失败时删除，
+  空 `.incoming` 顺手 `rmdir`，不积累残留。
+- **`complete` 清理口径**：成功或进入合并 / 落盘阶段后的硬失败（磁盘满、I/O 异常）清理会话与
+  `.merged`；校验类失败（缺片、`total_chunks` 越界、超限、权限、`overwrite=false` 的 409）
+  **保留会话**，可补齐分片后重试；目标本身是目录的 409 属不可恢复冲突，仍清理。
+- **会话归属校验**：`resume` / `chunk` / `complete` / `abort` 均校验 owner（admin 例外），
+  历史无 owner 的会话按「无主」放行（向后兼容）。
+- **旧版全局续传状态迁移**：仅当旧状态与当前文件/目标完全匹配时迁移并删除，不匹配的保留给其所属
+  上传自行处理；损坏的旧文件直接清理。
 
 ---
 

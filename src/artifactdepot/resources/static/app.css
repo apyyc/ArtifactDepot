@@ -35,6 +35,10 @@
   .up-item .st { flex: 0 0 130px; text-align: right; color: #888; }
   .up-item .st.ok { color: #67c23a; }
   .up-item .st.bad { color: #f56c6c; }
+  /* 上传暂停/继续 + 失败续传：暂停态文案橙色，失败行内「继续 / 放弃」按钮与全局按钮禁用态 */
+  .up-item .st.paused { color: #e6a23c; }
+  .up-item .up-act { padding: 2px 8px; font-size: 12px; line-height: 1.4; }
+  #upPause:disabled, #upResume:disabled { opacity: .55; cursor: not-allowed; }
   .doc-link { align-self: center; margin-left: 6px; padding: 5px 10px; border: 1px solid #dcdfe6; border-radius: 4px; color: #606266; font-size: 12px; text-decoration: none; }
   .doc-link:hover { color: #409eff; border-color: #409eff; }
   .modal-mask { position: fixed; inset: 0; background: rgba(0,0,0,.4); display: flex; align-items: center; justify-content: center; z-index: 1000; }

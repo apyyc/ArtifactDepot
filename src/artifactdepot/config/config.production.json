@@ -28,7 +28,8 @@
     "max_chunks": 100000,
     "max_session_gb": 200,
     "session_ttl_seconds": 86400,
-    "session_idle_ttl_seconds": 86400
+    "session_idle_ttl_seconds": 86400,
+    "staging_dir": ""
   },
   "download": {
     "chunk_size_mb": 8,

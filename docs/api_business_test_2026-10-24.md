@@ -1,10 +1,10 @@
 # ArtifactDepot 本次新增功能接口业务验收报告
 
 - 日期：2026-10-24
-- 代码基线：`ArtifactDepot` 工作区（未提交），`VERSION=0.10.0`
+- 代码基线：`ArtifactDepot` 工作区（未提交），`VERSION=0.9.0`
 - 测试方式：真实 `uvicorn` + `httpx` HTTP 请求，独立 `depot_dir` 与 `TMPDIR`
 - 测试数据：全部在 `.api-test/run` 临时目录；未接触生产数据；测试后已清理
-- 参考契约：`docs/api_rules.md` §2.12、§2.13、三、§9；`CHANGELOG.md` 0.10.0
+- 参考契约：`docs/api_rules.md` §2.12、§2.13、三、§9；`CHANGELOG.md` 0.9.0
 
 ## 1. 测试范围
 

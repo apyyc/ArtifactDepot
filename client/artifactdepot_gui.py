@@ -8,6 +8,9 @@
   - 文件浏览：bucket、目录导航、上传（多文件/并发/分片）、下载文件（分块并发、进度/速度、
     可取消、下载并发 1–16）、下载本目录（ZIP 单流）、新建目录、删除文件/空目录、
     批量删除（files/all）、签名链接；
+  - 暂停/恢复：上传可暂停/继续、下载可分片暂停/继续；失败后再次开始从断点续传
+    （上传状态在源文件目录 `.<文件名>.artifactdepot-upload.json`，
+    下载状态与 `.part` 在目标文件目录，均 0600 原子写）；
   - 签名链接：查看、复制、作废；
   - Token 管理：注册表、显示明文、移除、DataHub 同步、配置重载、按权限点生成 Token、
     bucket/前缀资源范围、角色预设；
@@ -502,15 +505,20 @@ class BrowseTab(ttk.Frame):
         self.cancel_event = threading.Event()
         self.uploading = False
         self.queue_lock = threading.Lock()
-        self.queue = []  # {path, name, size, pct, status}
+        self.queue = []  # {path, name, size, pct, status, error}
+        self.pause_event = threading.Event()   # 上传暂停（set=暂停，分片边界生效）
+        self._upload_has_chunked = False       # 本批是否有分片大文件（决定暂停按钮是否可用）
         self.source_var = tk.StringVar()
         self.concurrency_var = tk.StringVar(value="3")
         self.overwrite_var = tk.BooleanVar(value=True)
         self.resume_var = tk.BooleanVar(value=True)
-        # 下载：并发可调、可取消；进度/速度由 root.after 合并刷新（>=150ms 一次）
+        # 下载：并发可调、可取消/暂停；进度/速度由 root.after 合并刷新（>=150ms 一次）
         saved_dl = core.load_ui_state().get("download_concurrency")
         self.downloading = False
         self.download_cancel = threading.Event()
+        self.download_pause = threading.Event()  # 下载暂停（set=暂停，分片边界生效）
+        self._dl_parallel = False                # 当前下载是否分片并发（暂停/续传只对它生效）
+        self._dl_paused = False
         self.download_concurrency_var = tk.StringVar(
             value=str(clamp_download_concurrency(saved_dl)))
         self._dl_lock = threading.Lock()
@@ -570,17 +578,25 @@ class BrowseTab(ttk.Frame):
         ttk.Button(up, text="选择文件…", command=self.choose_files).grid(row=0, column=4)
         ttk.Button(up, text="开始上传", style="Accent.TButton",
                    command=self.start_upload).grid(row=0, column=5, padx=6)
+        self.pause_upload_btn = ttk.Button(
+            up, text="暂停上传", style="Ghost.TButton",
+            command=self.pause_upload, state="disabled")
+        self.pause_upload_btn.grid(row=0, column=6)
+        self.resume_upload_btn = ttk.Button(
+            up, text="继续上传", style="Ghost.TButton",
+            command=self.resume_upload, state="disabled")
+        self.resume_upload_btn.grid(row=0, column=7, padx=6)
         ttk.Button(up, text="取消", style="Ghost.TButton",
-                   command=self.cancel_upload).grid(row=0, column=6)
+                   command=self.cancel_upload).grid(row=0, column=8)
         ttk.Button(up, text="清空队列", style="Ghost.TButton",
-                   command=self.clear_queue).grid(row=0, column=7, padx=(6, 0))
+                   command=self.clear_queue).grid(row=0, column=9, padx=(6, 0))
         opts = ttk.Frame(up, style="Panel.TFrame")
-        opts.grid(row=1, column=0, columnspan=8, sticky="w", pady=(6, 4))
+        opts.grid(row=1, column=0, columnspan=10, sticky="w", pady=(6, 4))
         ttk.Checkbutton(opts, text="覆盖同名文件", variable=self.overwrite_var,
                         style="Panel.TCheckbutton").pack(side="left")
         ttk.Checkbutton(opts, text="断点续传", variable=self.resume_var,
                         style="Panel.TCheckbutton").pack(side="left", padx=14)
-        self.upload_hint = ttk.Label(opts, text="支持多选；大文件自动分片",
+        self.upload_hint = ttk.Label(opts, text="支持多选；大文件自动分片；失败/暂停可续传",
                                      style="PanelMuted.TLabel")
         self.upload_hint.pack(side="left", padx=12)
         self.queue_tree = ttk.Treeview(up, columns=("name", "size", "progress", "status"),
@@ -589,9 +605,9 @@ class BrowseTab(ttk.Frame):
                                  ("progress", "进度", 80), ("status", "状态", 220)):
             self.queue_tree.heading(col, text=text)
             self.queue_tree.column(col, width=width, anchor="w")
-        self.queue_tree.grid(row=2, column=0, columnspan=8, sticky="ew")
+        self.queue_tree.grid(row=2, column=0, columnspan=10, sticky="ew")
         self.upload_progress = ttk.Progressbar(up, mode="determinate", maximum=100)
-        self.upload_progress.grid(row=3, column=0, columnspan=8, sticky="ew", pady=(6, 0))
+        self.upload_progress.grid(row=3, column=0, columnspan=10, sticky="ew", pady=(6, 0))
 
         table_box = ttk.Frame(self, style="Panel.TFrame")
         table_box.grid(row=3, column=0, sticky="nsew")
@@ -627,6 +643,14 @@ class BrowseTab(ttk.Frame):
             actions, from_=1, to=16, width=4,
             textvariable=self.download_concurrency_var)
         self.download_conc_spin.pack(side="left", padx=(4, 8))
+        self.download_pause_btn = ttk.Button(
+            actions, text="暂停下载", style="Ghost.TButton",
+            command=self.pause_download, state="disabled")
+        self.download_pause_btn.pack(side="left", padx=(0, 4))
+        self.download_resume_btn = ttk.Button(
+            actions, text="继续下载", style="Ghost.TButton",
+            command=self.resume_download, state="disabled")
+        self.download_resume_btn.pack(side="left", padx=(0, 6))
         self.download_cancel_btn = ttk.Button(
             actions, text="取消下载", style="Ghost.TButton",
             command=self.cancel_download, state="disabled")
@@ -894,7 +918,11 @@ class BrowseTab(ttk.Frame):
         self._download(path, Path(directory), self.prefix or bucket, parallel=False)
 
     def _download(self, path, dest: Path, label: str, parallel: bool = True):
-        """启动下载线程：单文件可分块并发，目录 ZIP 单流；可取消、进度合并刷新。"""
+        """启动下载线程：单文件可分块并发，目录 ZIP 单流；可取消/暂停、进度合并刷新。
+
+        分片并发下载会写目标目录的伴随状态文件；暂停/失败保留 `.part`+状态，
+        再次下载同一目标时校验 size/ETag 后只补缺失分片。
+        """
         if self.downloading:
             messagebox.showwarning(
                 "正在下载", "已有下载任务在进行，请先等待完成或点击「取消下载」。",
@@ -912,9 +940,14 @@ class BrowseTab(ttk.Frame):
 
         client = self.client()
         cancel = threading.Event()
+        pause_event = threading.Event()
         self.downloading = True
         self.download_cancel = cancel
+        self.download_pause = pause_event
+        self._dl_parallel = parallel
+        self._dl_paused = False
         self.download_cancel_btn.config(state="normal")
+        self._refresh_download_pause_buttons()
         self._update_actions()
         self._dl_reset(label)
         self.app.set_status(f"开始下载：{label}")
@@ -926,7 +959,8 @@ class BrowseTab(ttk.Frame):
             try:
                 saved = client.download_to(
                     path, dest, progress=progress, cancel=cancel,
-                    concurrency=concurrency if parallel else 1)
+                    concurrency=concurrency if parallel else 1,
+                    pause_event=pause_event if parallel else None)
             except core.Cancelled:
                 self.app.root.after(0, self._download_cancelled, label)
             except Exception as e:
@@ -935,6 +969,34 @@ class BrowseTab(ttk.Frame):
                 self.app.root.after(0, self._download_done, saved)
 
         threading.Thread(target=work, daemon=True).start()
+
+    def _refresh_download_pause_buttons(self) -> None:
+        """按「下载中 / 是否分片并发 / 是否已暂停」切换暂停与继续按钮。"""
+        running = bool(self.downloading)
+        paused = running and self.download_pause.is_set()
+        can_pause = running and self._dl_parallel and not paused
+        self.download_pause_btn.config(state="normal" if can_pause else "disabled")
+        self.download_resume_btn.config(
+            state="normal" if (running and paused) else "disabled")
+
+    def pause_download(self) -> None:
+        """暂停分片下载：已下载分片保留，当前分片结束后不再取新分片。"""
+        if not self.downloading or not self._dl_parallel:
+            return
+        self.download_pause.set()
+        self._dl_paused = True
+        self._refresh_download_pause_buttons()
+        self.app.set_status(
+            "已暂停下载（当前分片结束后停止）；.part 与断点状态已保留，点「继续下载」恢复。")
+
+    def resume_download(self) -> None:
+        """继续下载：从暂停处继续，只下载缺失分片。"""
+        if not self.downloading:
+            return
+        self.download_pause.clear()
+        self._dl_paused = False
+        self._refresh_download_pause_buttons()
+        self.app.set_status("继续下载…")
 
     # -- 下载进度（worker 线程只更新共享状态，UI 线程合并刷新）--
     def _dl_reset(self, label: str) -> None:
@@ -964,7 +1026,7 @@ class BrowseTab(ttk.Frame):
         with self._dl_lock:
             latest = self._dl_latest
             self._dl_scheduled = False
-        if latest is None or not self.downloading or self._dl_cancelling:
+        if latest is None or not self.downloading or self._dl_cancelling or self._dl_paused:
             return
         done, total = latest
         now = time.monotonic()
@@ -984,7 +1046,15 @@ class BrowseTab(ttk.Frame):
     def _download_finish_ui(self) -> None:
         self.downloading = False
         self._dl_cancelling = False
+        self._dl_paused = False
+        self._dl_parallel = False
+        try:
+            self.download_pause.clear()
+        except Exception:
+            pass
         self.download_cancel_btn.config(state="disabled")
+        self.download_pause_btn.config(state="disabled")
+        self.download_resume_btn.config(state="disabled")
         self._update_actions()
 
     def _download_done(self, saved: Path) -> None:
@@ -994,21 +1064,28 @@ class BrowseTab(ttk.Frame):
 
     def _download_cancelled(self, label: str) -> None:
         self._download_finish_ui()
-        self.app.set_status(f"已取消下载：{label}（临时文件已清理）")
+        self.app.set_status(f"已取消下载：{label}（.part 与断点状态已清理）")
 
     def _download_failed(self, exc: Exception) -> None:
+        was_parallel = self._dl_parallel
         self._download_finish_ui()
         self.app.show_error(exc)
+        if was_parallel:
+            self.app.set_status(
+                f"下载失败：{exc}（已保留 .part 与断点状态，再次下载同一目标可续传）")
 
     def cancel_download(self) -> None:
         if not self.downloading:
             return
         self._dl_cancelling = True
+        self._dl_paused = False
         try:
+            self.download_pause.clear()
             self.download_cancel.set()
         except Exception:
             pass
         self.download_cancel_btn.config(state="disabled")
+        self._refresh_download_pause_buttons()
         self.app.set_status("正在取消下载（等待当前分片结束）…")
 
     # ---------------- 上传 ----------------
@@ -1042,7 +1119,10 @@ class BrowseTab(ttk.Frame):
         if self.uploading:
             return
         with self.queue_lock:
-            self.queue = [q for q in self.queue if q["status"] not in ("成功", "失败", "已取消")]
+            self.queue = [
+                q for q in self.queue
+                if not (q["status"] == "成功" or str(q["status"]).startswith("失败")
+                        or q["status"] == "已取消")]
         self._render_queue()
 
     def _render_queue(self):
@@ -1059,6 +1139,14 @@ class BrowseTab(ttk.Frame):
         except Exception:
             self._render_queue()
 
+    def _refresh_upload_pause_buttons(self) -> None:
+        """按「上传中 / 是否分片 / 是否已暂停」切换暂停与继续按钮。"""
+        running = bool(self.uploading)
+        paused = running and self.pause_event.is_set()
+        can_pause = running and self._upload_has_chunked and not paused
+        self.pause_upload_btn.config(state="normal" if can_pause else "disabled")
+        self.resume_upload_btn.config(state="normal" if paused else "disabled")
+
     def start_upload(self):
         if self.uploading:
             return
@@ -1070,8 +1158,10 @@ class BrowseTab(ttk.Frame):
         if not token:
             messagebox.showwarning("缺少令牌", "请先在顶部填写访问令牌", parent=self)
             return
+        # 「失败（可续传）」「已暂停」「已取消」再次开始上传都会从断点续传
         with self.queue_lock:
-            pending = [q for q in self.queue if q["status"] in ("排队中", "失败", "已取消")]
+            pending = [q for q in self.queue
+                       if q["status"] in ("排队中", "失败（可续传）", "已取消", "已暂停")]
         if not pending:
             messagebox.showinfo("上传队列", "没有待上传文件", parent=self)
             return
@@ -1081,6 +1171,10 @@ class BrowseTab(ttk.Frame):
             concurrency = 3
         self.uploading = True
         self.cancel_event.clear()
+        self.pause_event.clear()
+        self._upload_has_chunked = any(
+            int(q.get("size") or 0) > core.CHUNK_SIZE for q in pending)
+        self._refresh_upload_pause_buttons()
         self.upload_progress["value"] = 0
         self.app.set_status(f"开始上传 {len(pending)} 个文件，目标 {bucket} / {self.prefix or '/'}")
 
@@ -1098,8 +1192,11 @@ class BrowseTab(ttk.Frame):
                     key = core.make_key(self.prefix, q["name"])
                     futures.append(pool.submit(self._upload_one, client, q, bucket, key,
                                                source_url, overwrite, resume))
-                for _ in futures:
-                    pass
+                for future in futures:
+                    try:
+                        future.result()
+                    except Exception:
+                        pass
             self.app.root.after(0, self._upload_finished)
 
         threading.Thread(target=work, daemon=True).start()
@@ -1108,7 +1205,9 @@ class BrowseTab(ttk.Frame):
         def progress(done, total, speed, msg):
             pct = int(done * 100 / total) if total else 0
             q["pct"] = pct
-            q["status"] = msg
+            # 暂停期间保持「已暂停」状态，不被分片进度覆盖
+            if not self.pause_event.is_set():
+                q["status"] = msg
             self.app.root.after(0, self._queue_update, q)
         q["status"] = "上传中"
         self.app.root.after(0, self._queue_update, q)
@@ -1117,28 +1216,70 @@ class BrowseTab(ttk.Frame):
                              overwrite=overwrite, resume=resume,
                              progress=progress, log=None,
                              cancel_event=self.cancel_event,
+                             pause_event=self.pause_event,
                              source_url=source_url)
             q["pct"] = 100
             q["status"] = "成功"
         except core.Cancelled:
             q["status"] = "已取消"
         except Exception as e:
-            q["status"] = f"失败：{e}"
+            # 失败不 abort：服务端会话与本地断点状态保留，再次开始上传即续传
+            q["status"] = "失败（可续传）"
+            q["error"] = str(e)
         self.app.root.after(0, self._queue_update, q)
 
     def _upload_finished(self):
         self.uploading = False
+        self.pause_event.clear()
+        self._upload_has_chunked = False
         self.upload_progress["value"] = 0
+        self._refresh_upload_pause_buttons()
         with self.queue_lock:
             ok = sum(1 for q in self.queue if q["status"] == "成功")
-            bad = sum(1 for q in self.queue if str(q["status"]).startswith("失败"))
-        self.app.set_status(f"上传结束：成功 {ok}，失败 {bad}")
+            bad = [q for q in self.queue if str(q["status"]).startswith("失败")]
+            cancelled = sum(1 for q in self.queue if q["status"] == "已取消")
+        text = f"上传结束：成功 {ok}，失败（可续传）{len(bad)}"
+        if cancelled:
+            text += f"，已取消 {cancelled}"
+        if bad and bad[-1].get("error"):
+            text += f"；最后一次失败：{bad[-1]['error']}"
+        self.app.set_status(text)
         self.refresh()
+
+    def pause_upload(self):
+        """暂停上传：分片边界生效；已传分片与断点状态保留。"""
+        if not self.uploading or not self._upload_has_chunked:
+            return
+        self.pause_event.set()
+        with self.queue_lock:
+            for q in self.queue:
+                if q["status"] in ("上传中", "等待中"):
+                    q["status"] = "已暂停"
+        self._render_queue()
+        self._refresh_upload_pause_buttons()
+        self.app.set_status("已暂停上传（当前分片完成后停止）；已传分片保留，点「继续上传」恢复")
+
+    def resume_upload(self):
+        """继续上传：从暂停/断点处继续，只补缺失分片。"""
+        if not self.uploading:
+            # 没有在跑的任务（例如失败后已结束）：重新开始队列，按断点续传
+            self.start_upload()
+            return
+        self.pause_event.clear()
+        with self.queue_lock:
+            for q in self.queue:
+                if q["status"] == "已暂停":
+                    q["status"] = "上传中"
+        self._render_queue()
+        self._refresh_upload_pause_buttons()
+        self.app.set_status("继续上传…")
 
     def cancel_upload(self):
         if self.uploading:
+            self.pause_event.clear()
             self.cancel_event.set()
-            self.app.set_status("已请求取消上传（当前分片完成后停止）")
+            self._refresh_upload_pause_buttons()
+            self.app.set_status("已请求取消上传（当前分片完成后停止；已传分片保留可续传）")
 
 
 class LinksTab(ttk.Frame):

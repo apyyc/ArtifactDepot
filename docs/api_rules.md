@@ -1,6 +1,8 @@
 # ArtifactDepot 接口文档
 
-> 版本 0.10.0 · FastAPI 服务 · 默认端口 8004
+> 版本 0.9.0 · FastAPI 服务 · 默认端口 8004
+>
+> 0.9.0 变更：**分块并发下载**（`HEAD /api/objects/download` 探测 + 并行 `Range`，配置 `download.*`，见 2.3 / 2.14）；**伴随文件本地化 + 上传暂停/恢复**（分片会话随目标文件落盘 `.artifactdepot-uploads/`、配置 `upload.staging_dir`、`initiate(resume=true)` 断点续传，见 §3.1–§3.5 / §9 / §10；**不新增权限点**）；`access_token` 默认改为 `admin`（弱口令告警保留，见 1.3 / 9 / 10）；`GET /api/auth/permissions` 的 `data` 新增 `download`（与 `upload` 并列，见 12.1）；权限点仍 22 条、OpenAPI 操作仍 35 条（HEAD 不进 schema）。
 >
 > **文档勘误（本次按实现逐条校对）**：修正 `public_ip`（客户端自报值一律忽略）、`ETag` 回退规则、错误码表（补 `503`、修正「未配置 access_token → 401」、补「删除非空目录 → 400」）、`auth/check` 成功/失败字段差异、`config/reload` 失败为 `400`、`head`/`health/ready` 返回字段、`Token` 注册表返回结构、`§8` 总表补全并统一 `{link_id}`、`user` 角色补 `link:list`/`link:revoke`；并登记 4 个**已知缺陷**（`OBJ-001/002/003~005/006`，证据见 `reports/final_test_report.md`）。
 >
@@ -50,7 +52,7 @@ http://<主机IP>:8004
 
 | 身份 | 来源 | actor 记录 |
 |---|---|---|
-| 管理员 / 工具 | 配置 `access_token`（共享令牌） | `系统/工具` |
+| 管理员 / 工具 | 配置 `access_token`（共享令牌，默认 `admin`） | `系统/工具` |
 | 用户 | `tokens.json` 注册表（可经 DataHub `users.json` 惰性同步） | 用户名 |
 
 token 的传递方式（**推荐请求头**）：
@@ -64,6 +66,8 @@ token 校验规则：
 
 - 管理员 token 用 **常量时间比较**（`hmac.compare_digest`）与 `access_token` 比对。
 - 用户 token 在 `tokens.json` 注册表命中；本地未命中时先从 DataHub 拉一次再判定（惰性同步）。
+
+> **默认共享令牌 `admin`（0.9.0 起）**：内置 `DEFAULT`、`config.json`、`config/.env` 默认都是 `admin`，开箱即用（便于内网联调）。`admin` 属弱口令（长度 <12），启动时 `config_warnings()` 会打印告警；设 `ARTIFACT_DEPOT_STRICT_CONFIG=1` 时该告警会导致**拒绝启动**。生产/公网部署必须改为 ≥16 位随机串（`--token` / `ARTIFACT_DEPOT_ACCESS_TOKEN` / `config.json` / `.env`）。
 
 ### 1.4 权限模型（0.7.0）
 
@@ -80,6 +84,8 @@ token 校验规则：
 | 公开（默认，可收紧） | 知道地址即可调，内网设计；`require_read_token=true` 时读接口也需 scope | `/health`、`/health/live`、`/health/ready`、`/metrics`、`/api/auth/check`、`/api/auth/permissions`、`/api/docs`、`/api/docs/{name}`、`/api/objects/signed-links/config`、`/`，以及默认公开的 `GET /api/buckets`、`GET /api/objects/list` |
 | 按 scope 授权 | 生成 token 时勾选对应权限点 | 上传/下载/建目录/改名/删除/签名链接/分片/审计/token 管理等 |
 | 管理员 | 共享 `access_token` | 全部 |
+
+> **0.9.0 续传不新增权限点**：分片上传的暂停/继续与断点续传复用 `upload:initiate`（`initiate(resume=true)` 返回真实 `uploaded`），权限点仍 **22 条**、OpenAPI 操作仍 **35 条**、角色预设不变，**旧 token 无需变更**。会话归属校验（owner，admin 例外）在 `initiate` / `chunk` / `complete` / `abort` 均生效，资源范围（bucket/key）照旧校验。
 
 > **资源范围（bucket / 路径前缀）是硬边界（本版硬化）**：用户 token 可携带 `allow_buckets` / `allow_prefixes`（字段见 12.4）。设置后该 token 只能访问范围内的 bucket 与路径前缀：
 >
@@ -107,6 +113,7 @@ token 校验规则：
 
 - 不允许含 `\`；前后 `/` 会被自动去除，去除后不能为空。
 - 不允许 CR/LF/TAB 等控制字符（会污染审计/日志、响应头），返回 `400`。
+- 长度 ≤ 1024 字符；超长返回 `400`（避免底层 `stat/open` 抛 `ENAMETOOLONG` 变成 500）。
 - 不允许出现空段、`.`、`..`（防路径穿越）。
 - 任意路径段都不允许以 `.` 开头（避免与 `.warehouse.json`、`.keep` 等隐藏约定冲突）。
 - 支持多级目录，如 `carryvideo/20260815/tranvideo-1_20260815/tranvideo-1_20260815.mp4`。
@@ -116,18 +123,19 @@ token 校验规则：
 
 | HTTP 状态码 | 含义 |
 |---|---|
-| 400 | 参数非法（bucket/key 非法、prefix 越界、**删除非空目录**、签名链接 `count`/`expires` 越界、`allow_prefixes` 规范化或范围自洽校验失败、批量删除 `mode` 非法 / `confirm` 缺失或不匹配 / 项数超上限） |
+| 400 | 参数非法（bucket/key 非法、prefix 越界、**删除非空目录**、签名链接 `count`/`expires` 越界、`allow_prefixes` 规范化或范围自洽校验失败、批量删除 `mode` 非法 / `confirm` 缺失或不匹配 / 项数超上限、`initiate` 的 bucket/key 只给一个或 `size` 非整数、**分片会话失效或参数不一致（`detail` 含「分片会话」，客户端据此清状态重传）**） |
 | 401 | 缺少/无效令牌、token 无效/过期/禁用、签名无效或过期 |
-| 403 | 已认证但权限不足（缺权限点、token 资源范围越界、非创建者作废他人链接、非共享 token 越权创建/修改/删除 token） |
+| 403 | 已认证但权限不足（缺权限点、token 资源范围越界、非创建者作废他人链接、非共享 token 越权创建/修改/删除 token、**访问他人的分片会话**） |
 | 404 | 对象/目录不存在（token 不存在时 `DELETE`/`PUT` 也返回 404）；一键下载空目录（无可见内容） |
-| 409 | 对象已存在（`overwrite=false` 时） |
+| 409 | 对象已存在（`overwrite=false` 时）；**上传 / 分片会话的目标父路径是文件、目标 key 已是目录** |
 | 413 | 超过单文件上传上限 `max_upload_mb`（分片单块超限亦同） |
+| 416 | `Range` 区间不可满足（越界 / 文件大小已变化），响应带 `Content-Range: bytes */<total>`；多区间中**任一段**越界同样返回 `416`，全部可满足时返回 `206 multipart/byteranges` |
 | 422 | 请求参数校验失败（字段缺失、类型错误等），`detail` 为数组 |
 | 500 | 服务端异常。**注意**：未配置 `access_token` 时为 `401`（fail-closed），不是 500 |
 | 503 | `/health/ready` 就绪检查失败（depot 目录不存在或不可写） |
 
 > **已知缺陷（待修，证据见 `reports/final_test_report.md`）**
-> - `OBJ-004`：`mkdir` 的 key 或父路径已是文件时仍返回 **500**（应为 `400`/`409`）；上传与分片合并的目标类型冲突已在 0.10.0 修复为 `409`。
+> - `OBJ-004`：`mkdir` 的 key 或父路径已是文件时仍返回 **500**（应为 `400`/`409`）；上传与分片合并的目标类型冲突已在 0.9.0 修复为 `409`。
 > - `OBJ-001`：`rename` 的文件↔目录类型冲突 → **500**；目录移动**中途失败不回滚**（可能留下部分移动 + 清单不一致）。
 > - `OBJ-002`：`rename` 以 `overwrite=true` 覆盖既有文件后，清单与 `ETag` 仍为旧值，旧 `ETag` 条件下载会返回 `304`。
 > - `OBJ-006`：`presign` 返回的 `url` 未做 URL 编码，key 含 `&`、`#`、`+` 时该链接不可直接使用（改用显式 `bucket`/`key`/`link`/`tk` 参数即可）。
@@ -177,6 +185,13 @@ curl -X POST "http://<IP>:8004/api/objects" \
   -F "overwrite=true"
 ```
 
+> **伴随文件本地化（0.9.0）**：直传的请求体临时文件写在目标文件父目录
+> `.<name>.artifactdepot-incoming-<rand>.tmp`，读取 / 超限 / 落盘任一阶段失败都会删除，
+> 并回滚为写临时文件而新建的空父目录；成功后 `put_object(move=True)` 用 `os.replace` 原子落盘
+> （不再经 `/tmp` 中转，避免大文件 2× 磁盘峰值）。Starlette multipart 解析的 spool 文件由
+> `upload.staging_dir` 决定（默认 `<depot_dir>/.staging`，见 §9），同属框架级临时文件。
+> 目标父路径是文件时返回 `409`（不再 500）。
+
 ### 2.2 列出对象 / 目录（ListObjects）
 
 ```
@@ -218,7 +233,8 @@ curl "http://<IP>:8004/api/objects/list?bucket=voicevideo&prefix=carryvideo/2026
 ### 2.3 下载对象（GetObject）
 
 ```
-GET /api/objects/download
+GET  /api/objects/download
+HEAD /api/objects/download   # 元信息探测（include_in_schema=false，不进入 OpenAPI）
 ```
 
 **鉴权**：三种方式，按优先级：
@@ -240,9 +256,35 @@ GET /api/objects/download
 | `token` | string | 否 | 访问令牌（非签名方式时必填）；也支持 `Authorization: Bearer` |
 | `public_ip` | string | 否 | 已废弃/忽略；审计公网 IP 由服务端按 `trusted_proxies` 解析 XFF |
 
-**响应**：文件流，支持 **Range（206）** 视频拖动，`Content-Type` 按扩展名推断。
+**响应**：文件流，`Content-Type` 按扩展名推断。支持 **Range / 206**（视频拖动、断点续传、客户端分块并发，见 2.14）。
+
+**HEAD 探测（0.9.0 新增）**：`HEAD /api/objects/download` 与 GET 同路径、同鉴权，返回
+`Content-Length` / `Accept-Ranges: bytes` / `ETag` / `Content-Disposition`，**响应体为空**；
+对象不存在 `404`、无有效凭证 `401`。该路由以 `include_in_schema=False` 注册：**不进入 OpenAPI、
+不新增权限点**（OpenAPI 操作数仍 35、权限点仍 22）。客户端据此决定是否走并行 `Range` 分块。
+
+**Range 语义**：
+
+- 单区间 `Range: bytes=a-b` / `bytes=a-` / `bytes=-n` → **`206`** + `Content-Range: bytes a-b/total`；
+- 区间不可满足（起点 ≥ 文件大小等）→ **`416`**，响应带 `Content-Range: bytes */<total>`；
+- 多区间（逗号列表）：全部区间可满足 → **`206`** + `Content-Type: multipart/byteranges`（不 500）；任一段越界 → **`416`**；
+- `If-None-Match` 命中当前 `ETag` → **`304`**，不传文件体。
 
 **ETag / 条件请求**：响应带 `ETag`——有清单记录时为强 ETag（SHA-256）；手工放入、无 `.warehouse.json` 记录的文件回退为 `"<size>-<mtime>"`。请求头 `If-None-Match` 命中时返回 **304**，不传输文件体。
+
+**审计与指标**（`storage.audit()` 的 `extra` 会 `update` 到审计记录**根层**，不是嵌套字段）：
+
+| 请求 | 审计字段 | `DOWNLOADS` 指标 |
+|---|---|---|
+| `HEAD` | `action=download`、`head=true`、`size=0` | **不计** |
+| 单区间 `Range` | `partial=true`、`range=<请求头原文>`、`size=实际区间字节数` | 可解析区间 +1 |
+| 多区间 / 不可解析区间 | `partial=true`、`range=<请求头原文>`、`size=0` | 不计 |
+| 完整 GET | `size=整文件大小` | +1 |
+| `304` | `not_modified=true`（HEAD 时另带 `head=true`）、`size=0` | 不计 |
+
+> **每个 Range 请求各写一条审计**：客户端并行分块下载会产生多条 `download` 记录（`partial=true`），
+> 每条 `size` 是该区间实际字节数，不是整文件大小。签名链接按次数计费时每个 Range 请求都会消耗一次，
+> 分块下载建议使用 token（客户端对签名链接强制单流）。
 
 > 对象不存在时返回 `404`；签名链接会先检查对象存在，再扣减次数，避免无效消费。
 
@@ -533,7 +575,7 @@ curl -X POST "http://<IP>:8004/api/objects/bulk-delete" \
   -d '{"bucket":"project_1","prefix":"task_5/交付物","mode":"all","confirm":"交付物"}'
 ```
 
-### 2.13 一键下载目录内容（DownloadBulk）—— 0.10.0 新增
+### 2.13 一键下载目录内容（DownloadBulk）—— 0.9.0 新增
 
 ```
 GET /api/objects/download-bulk?bucket=<bucket>&prefix=<prefix>&token=<token>
@@ -591,6 +633,7 @@ GET /api/objects/download-bulk?bucket=<bucket>&prefix=<prefix>&token=<token>
 - 遍历绝不跟随符号链接；隐藏项（含 `.keep`、`.warehouse.json`）全部跳过；
 - 单次 `files + dirs` 上限 `MAX_BULK_DOWNLOAD_ITEMS = 100000`（防御性），超限 `400` 并提示缩小范围；普通目录远低于此值；
 - ZIP 内名称由真实相对路径生成，不做用户输入拼接；UTF-8 文件名保留（zipfile 自动置 UTF-8 标志）；
+- **ZIP 无 `Content-Length`、不支持 Range 分块**：网页与桌面客户端对 `download-bulk` 一律走单流（见 2.14）；
 - 客户端中断：停止遍历/读取、后台线程退出，审计仍会写一条且标记 `aborted=true`；
 - 失败请求（400/401/403/404）不写审计、不计 `DOWNLOADS` 指标。
 
@@ -610,27 +653,131 @@ curl -fL -o project_1.zip \
   "http://<IP>:8004/api/objects/download-bulk?bucket=project_1&prefix=&token=<token>"
 ```
 
+### 2.14 分块并发下载（0.9.0 新增）
+
+> 服务端**不新增分块下载端点**：仍使用 `GET /api/objects/download`，由客户端按 `Range` 自行切分并发；
+> `HEAD /api/objects/download` 只用于探测元信息。服务端负责下发参数、按 Range 返回 `206/416` 并如实记账。
+
+**配置下发**：客户端读取 `GET /api/auth/permissions` 的 `data.download`：
+
+```json
+{
+  "chunk_size": 8388608,               // 每片字节数（默认 8MiB）
+  "chunk_concurrency": 4,              // 同时下载几片（1–16）
+  "request_timeout_seconds": 3600      // 单次分片请求超时（秒，默认 1h）
+}
+```
+
+- 来源 `config.json` 的 `download.*`（`chunk_size_mb` / `chunk_concurrency` / `request_timeout_seconds`，见 §9）；
+- 服务端归一化并**自动夹紧**：分片 1–64MB、并发 1–16、超时 60s–7d；非法值回退默认值；
+- `.env` 支持点号写法（`download.chunk_size_mb=8`）；真实环境变量为 `ARTIFACT_DEPOT_DOWNLOAD_*`；
+- `POST /api/config/reload` 后**即时生效**，无需重启。
+
+**HEAD 语义**：见 2.3——返回 `Content-Length` / `Accept-Ranges: bytes` / `ETag` / `Content-Disposition`，
+无响应体；写一条 `head=true`、`size=0` 的 `download` 审计，**不计 `DOWNLOADS`**。客户端在 HEAD 不可用
+（`405/501`）时回退单流；网页端会先用 `GET` + `Range: bytes=0-0` 兜底探测。
+
+**Range 206 / 416**：单区间 → `206` + `Content-Range: bytes a-b/total`；越界 → `416`
+（`Content-Range: bytes */<total>`）；多区间全部可满足 → `206 multipart/byteranges`，任一段越界 → `416`。
+客户端必须校验 `206`、`Content-Range` 起点与总大小，否则视为失败并重试。
+
+**客户端切分策略**（网页与桌面一致）：
+
+1. 读取 `data.download`（缺失时回退 8MiB / 4 路 / 1h，并夹紧到合法区间）；
+2. `HEAD` 探测大小 / `Accept-Ranges` / `ETag` / 文件名；
+3. 当 `Accept-Ranges: bytes`、`size > chunk_size` 且并发 > 1 时，切成
+   `[i*chunk_size, min(size, (i+1)*chunk_size)-1]` 的闭区间**并行 GET**；否则单流；
+4. 每片校验 `206` + `Content-Range` 起点 + 分片长度；失败重试（桌面：每片最多重试 3 次指数退避，
+   仅网络/超时/408/429/5xx，4xx 含 416 不重试；网页：每片最多 3 次尝试）；
+5. 写盘：桌面预分配 `.part` 后按偏移写入；网页优先 File System Access（按字节位置边下边写盘），
+   无该 API 时按顺序拼 `Blob` 再保存；`>1GiB` 或服务端忽略 Range（返回 200）时回退原生单流；
+6. 完成后校验总大小；`ETag` 为 `"<64 位 hex>"` 时校验 SHA-256（网页对 >256MiB 跳过并提示）；
+7. 取消：桌面用 `threading.Event`（清理 `.part`）、网页用 `AbortController`（中止全部在途请求）。
+
+**审计与指标**：每个 Range 请求一条 `download` 审计（`partial=true`、`range` 为请求头原文、
+`size` 为区间字节数）；HEAD 一条（`head=true`、`size=0`）；并发下载因此会产生多条记录。
+可解析的单区间计一次 `DOWNLOADS`，HEAD / `304` / 多区间不计。
+
+**限制**：
+
+- **签名链接**（`link`/`tk`/`expires`/`sig`）按次数计费时每个请求都消耗一次 → **不要用多请求分块并发**；
+  网页/桌面客户端对签名链接强制单流；分块下载请改用 token。
+- **`download-bulk` ZIP 不支持 Range**：流式 ZIP 无 `Content-Length`，客户端保持单流。
+- 服务端不做下载并发限速；每个 Range 独立鉴权、独立审计。
+- 下载期间文件被替换 / 大小变化 → 客户端会得到 `416` 或大小校验失败，需重新 `HEAD` 后重下。
+
 ---
 
 ## 三、分片上传（大文件多路并发）
 
-适用于超大文件，分 4 步：initiate → chunk（多次）→ complete → abort。
+适用于超大文件，分 4 步：initiate → chunk（多次）→ complete → abort。0.9.0 起**分片会话与临时文件随目标文件落盘**（不再写宿主 `/tmp`），并支持**暂停/继续与失败后断点续传**；续传复用现有权限点，**不新增权限点**。
 
-### 3.1 发起上传会话
+### 3.1 发起 / 恢复上传会话
 
 ```
 POST /api/objects/initiate
 ```
 
-**鉴权**：权限点 `upload:initiate`
+**鉴权**：权限点 `upload:initiate`。提供 `bucket` + `key` 时追加 bucket/key 资源范围校验（越界 `403`）。
 
-返回 `{ "upload_id", "chunk_size", "chunk_concurrency", "file_concurrency",
-"request_timeout_seconds", "max_chunk_size", "max_chunks", "max_session_gb", "max_upload_mb" }`：
+**请求**：参数**同时支持 query 与 multipart form**（`multipart/form-data` / `application/x-www-form-urlencoded`），**允许空 body**（旧客户端兼容）；同名时表单值优先。
 
-- 默认 `chunk_size=8MB`、`chunk_concurrency=4`、`file_concurrency=3`、
-  `request_timeout_seconds=86400`（24h）；
-- 全部来自 `config.json` 的 `upload.*`（见 §9），`POST /api/config/reload` 后即时生效；
-- 浏览器/CLI 应以服务端返回值为准（`chunk_size` 不再固定 8MB）。
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `bucket` | string | 可选 | 目标 bucket；与 `key` 必须**同时提供或都不提供** |
+| `key` | string | 可选 | 目标 key；提供时会话落目标文件父目录 `.artifactdepot-uploads/<upload_id>/` |
+| `size` | int | 可选 | 文件总字节数；给出时 `total_chunks = ceil(size / chunk_size)` |
+| `resume` | bool | 可选 | 是否复用已有会话，默认 `false`（接受 `1/true/yes/on`） |
+| `upload_id` | string | 可选 | `resume=true` 时指定要复用的会话（须服务端生成并校验字符集） |
+
+**成功响应**（200）：保留原有字段，并新增续传信息：
+
+```json
+{
+  "code": 0,
+  "message": "success",
+  "data": {
+    "upload_id": "……",
+    "chunk_size": 8388608,
+    "chunk_concurrency": 4,
+    "file_concurrency": 3,
+    "request_timeout_seconds": 86400,
+    "max_chunk_size": 67108864,
+    "max_chunks": 100000,
+    "max_session_gb": 200,
+    "max_upload_mb": 0,
+    "resumed": true,
+    "uploaded": [0, 1, 2],
+    "received_bytes": 25165824,
+    "total_chunks": 9,
+    "size": 75497472,
+    "staging": "target"
+  }
+}
+```
+
+| 字段 | 说明 |
+|---|---|
+| `upload_id` | 会话 ID（新建或复用） |
+| `resumed` | 本次是否复用了已有会话 |
+| `uploaded` | 磁盘上**真实存在**且 `< total_chunks` 的分片索引（升序）；**客户端唯一事实源** |
+| `received_bytes` | 上述分片的实际字节数之和 |
+| `total_chunks` | 总片数（`size` 未知时 `0`） |
+| `size` | 文件总字节数（未知时 `0`） |
+| `chunk_size` | 本会话分片大小（字节）；以服务端返回为准 |
+| `staging` | `"target"`（目标目录会话）/ `"legacy"`（staging 根会话） |
+
+> 响应**不回显服务端绝对路径**；其余上传参数（`chunk_concurrency` 等）来自 `config.json` 的 `upload.*`（见 §9），
+> `POST /api/config/reload` 后即时生效。**不提供** `GET /api/objects/upload/{id}`（避免新增权限点），续传信息统一由本接口返回。
+
+**续传语义**（`resume=true`）：
+
+1. **带 `upload_id`**：校验会话存在、owner 匹配（admin 例外）、`bucket`/`key`/`size`（若请求给出）与 `.session.json` 一致 → 复用并返回真实 `uploaded`；**失效 / 参数不一致 → `400` 且 `detail` 含「分片会话」**（客户端按会话丢失处理：清本地状态、重新开始上传）。会话属于他人 → `403`（admin 例外）。
+2. **不带 `upload_id` 但带 `bucket/key/size`**：在目标目录 `.artifactdepot-uploads` 中按 owner + `bucket/key/size` 找**最新**会话复用；找不到则新建（`resumed=false`）。
+3. **`resume=false`**：总是新建会话。
+4. 旧客户端（不带 `bucket/key`）：新建 legacy 会话，落 `<staging>/<upload_id>/`（等价旧行为，但已不在 `/tmp`）。
+
+**错误**：`400` bucket/key 只给一个、`size` 非整数/负数、`upload_id` 非法、会话失效或参数不一致；`403` 资源范围越界 / 他人会话；`409` 目标父路径是文件（`父路径不是目录，无法创建上传会话`）。
 
 ### 3.2 上传分片
 
@@ -642,6 +789,8 @@ POST /api/objects/chunk
 
 **请求**（multipart）：`upload_id`、`index`（分片序号）、`chunk`（文件）。
 
+请求体先落到会话目录的 `.incoming/<rand>.tmp`，再由 `store_chunk` `os.replace` 为 `chunk_<i>.part`（同一文件系统，省一次拷贝）；读取 / 配额 / 落盘失败都会清理本次临时文件。单分片上限 `upload.max_chunk_mb`（默认 64MB，超出 `413`）。
+
 ### 3.3 合并分片完成上传
 
 ```
@@ -652,9 +801,11 @@ POST /api/objects/complete
 
 **请求**（multipart）：`upload_id`、`bucket`、`key`、`total_chunks`，可选 `source_url`、`overwrite`。审计公网 IP 由服务端按 `trusted_proxies` 解析（`public_ip` 字段仅为兼容占位，值被忽略）。
 
-**清理**：成功或 `abort` 时删除本次 `/tmp/dw_chunks/<upload_id>` 与合并临时文件；进入合并/落盘阶段后的硬失败（磁盘满、I/O 异常等）同样删除，避免大文件残留。校验类失败（缺片、`total_chunks` 越界、超出 `max_upload_mb`、权限不足、409 冲突）**保留会话**，允许补齐分片或调整参数后重试/续传。服务启动时清理所有历史遗留会话（容器重启即释放）；后台任务每 10 分钟清理**超过 `upload.session_idle_ttl_seconds`（默认 24h，且不小于请求超时）没有分片写入**的会话（浏览器被杀/断网、无法发送 abort 时的兜底）。
+**落盘**：分片按序合并到会话目录内 `.merged`（与目标同盘），随后 `put_object(move=True)` 在算完 SHA-256 后用 `os.replace` 原子落盘（避免「临时 + 目标」2× 峰值；跨文件系统回退流式拷贝）。
 
-> **类型冲突处理（0.10.0 修复 OBJ-005）**：若目标 key 已是**目录**，返回 `409`（不再 500）；失败会清理本次会话，不落盘、不残留分片。
+**清理口径**：成功或 `abort` 时删除本次**会话目录**（含 `.merged`）；进入合并 / 落盘阶段后的硬失败（磁盘满、I/O 异常等）同样删除，避免大文件残留。校验类失败（缺片、`total_chunks` 越界、超出 `max_upload_mb`、权限不足、`overwrite=false` 的 `409`）**保留会话**，允许补齐分片或调整参数后重试/续传。目标 key 本身是**目录**属不可恢复冲突（`409`），会清理会话。
+
+> **类型冲突处理（0.9.0 修复 OBJ-005）**：若目标 key 已是**目录**，返回 `409`（不再 500）；失败会清理本次会话，不落盘、不残留分片。
 
 ### 3.4 取消分片上传
 
@@ -665,6 +816,27 @@ POST /api/objects/abort
 **鉴权**：权限点 `upload:abort`
 
 **请求**：`upload_id`（multipart 表单）。
+
+**行为**：校验会话存在与归属后删除会话目录（幂等：不存在返回 `existed=false`）。桌面客户端「取消上传」按产品语义**保留分片以便续传、不主动 abort**；确实要放弃并释放磁盘时调用本接口（网页端「放弃/移除」会 abort）。
+
+### 3.5 会话目录布局、清理与重启续传
+
+**布局**（目标明确时）：
+
+```
+<depot_dir>/<bucket>/<key 的父目录>/.artifactdepot-uploads/<upload_id>/
+- .session.json         # owner / created_at / updated_at / received_bytes / bucket / key /
+                        #   size / chunk_size / total_chunks / staging
+- chunk_<i>.part        # 已上传分片
+- .incoming/<rand>.tmp  # 单次 chunk 请求体临时文件（提交后 os.replace，失败清理）
+- .merged               # complete 的合并临时文件（落盘后删除）
+```
+
+- 内部目录名常量 `INTERNAL_UPLOAD_DIR = ".artifactdepot-uploads"`（隐藏目录）。legacy 会话在 `<staging>/<upload_id>/`；`staging` 由 `upload.staging_dir` 决定（§9）。
+- **内部目录保护**：列表、目录递归大小统计、ZIP 打包均跳过隐藏目录；**批量删除 `mode=all` 与 `rename_object` 显式跳过 `.artifactdepot-uploads`**，避免清空/搬走活跃上传；会话删除后若内部目录为空则 `rmdir`（失败忽略）。客户端 key 不允许隐藏路径段，无法直接操作内部目录。
+- **清理**：启动时清理 legacy staging 根下全部历史会话、并清理旧版 `<系统临时目录>/dw_chunks` 残留；随后扫描 depot 内 `.artifactdepot-uploads`，超过 `upload.session_ttl_seconds`（绝对 TTL）/ `upload.session_idle_ttl_seconds`（空闲 TTL）的删除，其余注册进进程内 registry。后台每 10 分钟再清理一次（只遍历 registry + legacy staging 根，成本与仓库大小无关）；新建会话时同步清理。
+- **重启续传**：会话元数据与分片在数据盘，进程重启不丢；启动扫描重建 registry 后客户端继续 `initiate(resume=true)` 即可续传。**单进程假设**：uvicorn 未开 `--workers`；进程内 registry 只是索引，磁盘（`.session.json` + 分片文件）才是唯一事实源。
+- **安全**：会话绑定 owner，`resume` / `chunk` / `complete` / `abort` 均校验归属（admin 例外）；`upload_id` 严格字符集校验、会话目录二次确认落在 depot 内、删除清理不跟随符号链接。
 
 ---
 
@@ -850,9 +1022,12 @@ GET /
 
 **鉴权**：公开（可设 `ui_enabled=false` 禁用）。
 
-单页控制台：目录浏览 + 上传（拖拽/分片）+ 下载 + **一键下载目录** + 新建目录 + 批量删除（一键清空目录内容）+ 签名链接管理 + Token 管理 + 审计。
+单页控制台：目录浏览 + 上传（拖拽/分片，**可暂停/继续、失败可续传**）+ 下载 + **一键下载目录** + 新建目录 + 批量删除（一键清空目录内容）+ 签名链接管理 + Token 管理 + 审计。
+
+- 上传队列提供 **「暂停上传」**（`#upPause`，`data-action="pause-upload"`）与 **「继续上传」**（`#upResume`，`data-action="resume-upload"`）：暂停在分片边界生效（当前分片传完后不再发新分片），已传分片保留；`initiate` 始终带 `bucket/key/size`，续传再带 `resume=true`（可带 `upload_id`），继续时以服务端返回的 `uploaded` 为准只补缺失分片。失败**不再 `abortUpload`**，失败行显示**「失败（可续传）」**并提供 `data-action="retry-upload"` 的「继续」；页面刷新后重新选择同一文件再点上传可按 `bucket/key/size` 找回会话（浏览器无法自动恢复文件列表）；token 变更或文件大小/mtime 变化时自动新建会话。事件委托 + `data-action`，严格 CSP、无内联脚本；
 
 - 目录浏览页在面包屑卡片提供 **「下载本目录」**（`data-action="download-dir"`，只读、无确认弹窗）：读取页面令牌框，为空则提示先填写；点击后用隐藏 `<a>` 触发浏览器原生下载 `GET /api/objects/download-bulk?bucket=&prefix=&token=`（交给浏览器下载管理，不把 ZIP 读进内存）；仅选中 bucket 后可用，**在 bucket 根时即下载整个 bucket**；目录内**只有 1 个可见文件时直接下载该文件**，多文件或含子目录时自动打包 ZIP（toast 提示）；
+- 文件行 **「下载」** 按钮（`data-action="download-file"` + `data-key`）改为**分块并发下载**（0.9.0）：页面加载时同一个 `GET /api/auth/permissions` 请求读取 `data.download`；点击后先 `HEAD /api/objects/download` 探测（405/501 时用 `GET bytes=0-0` 兜底），满足条件则按分片并行 `Range`；支持 File System Access 边下边写盘、无该 API 时按序拼 Blob、`>1GiB` 或服务端返回 200 时回退原生单流；`#dlModal` 显示进度/速度/重试次数，**「取消下载」**中止全部在途请求；分片大小/并发/超时由 `config.json` 的 `download.*` 决定。下载 token 只走 `Authorization` 头，不再拼进 `href`（原生单流兜底除外）；
 - 目录浏览页在面包屑卡片提供两个危险操作按钮：**「清空本目录文件」**（`mode=files`，只删当前目录的直接文件）与**「删除本目录全部内容」**（`mode=all`，递归删除文件与子目录）；点击后弹窗先调用 `dry_run=true` 预览「文件数 / 目录数 / 总大小」，并提示删除不可恢复、`files` 模式会保留子目录及其内容；
 - 执行前必须在弹窗输入框输入**目录名**（bucket 根目录输入 bucket 名），输入匹配前确认按钮禁用；服务端会二次校验该名称（见 2.12）。成功后关闭弹窗、刷新列表并 toast 汇总删除数量；`errors` 非空时用红色 toast 提示「部分失败」；
 - 标签栏右侧提供 **Swagger**（`/docs`）/ **ReDoc**（`/redoc`）入口，由 FastAPI 依据实际路由自动生成；前端资源（`/static/swagger-ui-bundle.js` 等）**自托管**，内网/离线可用；
@@ -899,16 +1074,16 @@ GET /api/docs/{name}?raw=1 # 直接返回 text/plain 原文
 | POST | `/api/objects/rename` | `object:rename` | 目录/对象重命名·移动 |
 | GET | `/api/objects/head` | `object:head` | 元信息探测 |
 | POST | `/api/objects/presign` | `link:create` | 生成共享链接 |
-| GET | `/api/objects/download` | `object:download` / 签名 | 下载（Range） |
+| GET / HEAD | `/api/objects/download` | `object:download` / 签名 | 下载：`HEAD` 探测 + `Range` 206 分块并发（HEAD 以 `include_in_schema=false` 注册，不计入 OpenAPI 操作数） |
 | GET | `/api/objects/download-bulk` | `object:download` | 一键下载目录（单文件直下 / 多文件或含子目录流式 ZIP） |
 | DELETE | `/api/objects` | `object:delete` | 删除对象/空目录 |
 | POST | `/api/objects/bulk-delete` | `object:delete_bulk` | 批量删除目录内容（保留目录本身，需输入名称确认） |
 | GET | `/api/objects/signed-links` | `link:list` | 列签名链接 |
 | POST | `/api/objects/signed-links/{link_id}/revoke` | `link:revoke` | 作废签名链接 |
-| POST | `/api/objects/initiate` | `upload:initiate` | 发起分片上传 |
-| POST | `/api/objects/chunk` | `upload:chunk` | 上传分片 |
-| POST | `/api/objects/complete` | `upload:complete` | 合并分片 |
-| POST | `/api/objects/abort` | `upload:abort` | 取消分片 |
+| POST | `/api/objects/initiate` | `upload:initiate` | 发起/恢复分片上传会话（query 或 form，允许空 body；`resume`/`upload_id` 续传，返回 `resumed`/`uploaded`/`staging`） |
+| POST | `/api/objects/chunk` | `upload:chunk` | 上传分片（请求体临时文件写会话 `.incoming`，再原子改名为 `chunk_<i>.part`） |
+| POST | `/api/objects/complete` | `upload:complete` | 合并分片（`.merged` + `put_object(move=True)` 原子落盘） |
+| POST | `/api/objects/abort` | `upload:abort` | 取消分片（删除会话目录，幂等） |
 | GET | `/api/tokens` | `token:read` | 查看 token 注册表 |
 | POST | `/api/tokens` | `token:write` | 生成/登记 token |
 | PUT | `/api/tokens/{value}` | `token:write` | 更新 token 权限 |
@@ -930,7 +1105,7 @@ ArtifactDepot 配置优先级：内置默认 < `config/config.json`（或 `ARTIF
 | 配置 | 默认 | 说明 |
 |---|---|---|
 | `port` | 8004 | 服务端口（环境变量 `ARTIFACT_DEPOT_PORT`） |
-| `access_token` | — | 管理员共享令牌，生产必须修改（`ARTIFACT_DEPOT_ACCESS_TOKEN`） |
+| `access_token` | `admin` | 管理员共享令牌；内置 / `config.json` / `.env` 默认 `admin`（开箱即用），**生产必须改为 ≥16 位随机串**；弱口令会告警，`ARTIFACT_DEPOT_STRICT_CONFIG=1` 时拒绝启动（`ARTIFACT_DEPOT_ACCESS_TOKEN`） |
 | `max_upload_mb` | 0（不限） | 单文件上传上限 |
 | `upload.chunk_size_mb` | 8 | 分片大小（1–64MB），服务端下发给浏览器/CLI |
 | `upload.chunk_concurrency` | 4 | 浏览器每个文件同时上传的分片数（1–16） |
@@ -941,6 +1116,10 @@ ArtifactDepot 配置优先级：内置默认 < `config/config.json`（或 `ARTIF
 | `upload.max_session_gb` | 200 | 会话总量上限（`max_upload_mb=0` 时生效，上限 200GB） |
 | `upload.session_ttl_seconds` | 86400（24h） | 分片会话绝对有效期 |
 | `upload.session_idle_ttl_seconds` | 86400（24h） | 无分片写入的空闲清理阈值（默认不小于请求超时，浏览器被杀兜底） |
+| `upload.staging_dir` | `""` | **伴随文件/staging 根目录**：留空 = `<depot_dir>/.staging`；相对路径按 `depot_dir` 解析；可填绝对路径（容器挂独立数据卷；`ARTIFACT_DEPOT_UPLOAD_STAGING_DIR`）。用途：① legacy 分片会话根 `<staging>/<upload_id>/`；② 启动时把 `tempfile.tempdir` 指向它，让 **Starlette multipart spool 落数据盘**。启动创建并打印，不可写时告警；**改后需重启才完整生效**（`config/reload` 在 `needs_restart` 提示） |
+| `download.chunk_size_mb` | 8 | 下载分片大小（1–64MB）；客户端按此切 `Range`（`ARTIFACT_DEPOT_DOWNLOAD_CHUNK_SIZE_MB`） |
+| `download.chunk_concurrency` | 4 | 单个文件同时下载的分片数（1–16；`ARTIFACT_DEPOT_DOWNLOAD_CHUNK_CONCURRENCY`） |
+| `download.request_timeout_seconds` | 3600（1h） | 单次分片请求超时（60s–7d；`ARTIFACT_DEPOT_DOWNLOAD_REQUEST_TIMEOUT_SECONDS`） |
 | `datahub_url` | `http://127.0.0.1:8002/api/data` | 用户 token 权威源 |
 | `ui_enabled` | true | 是否启用网页 UI |
 | `require_read_token` | false | 读接口（`GET /api/objects/list`、`GET /api/buckets`）是否强制要求携带有效 token 且具备对应 scope；`true` 时无 token → `401` |
@@ -960,7 +1139,7 @@ ArtifactDepot 配置优先级：内置默认 < `config/config.json`（或 `ARTIF
 2. 管理员 `access_token` 与用户 token 属敏感凭据，不得写入 git / 文档 / 日志；**推荐用 `Authorization: Bearer` 传递**，避免 `?token=` 落访问日志/浏览器历史。服务端已对 access log 中的 `token`/`tk`/`sig` 脱敏。
 3. key/bucket 有路径穿越防护，但调用方仍应避免传不可信输入。
 4. 删除接口需要权限点 `object:delete`（管理员共享 token 默认拥有全部），且目录仅空可删。
-5. `access_token` 默认空（无管理员）；启动时会对空/弱 token 告警，设 `ARTIFACT_DEPOT_STRICT_CONFIG=1` 可直接拒绝启动。生产请用 >=16 位随机串。
+5. `access_token` 默认 `admin`（内置 / `config.json` / `.env`），**仅用于内网开箱即用/联调**。`admin` 属弱口令，启动时会对空/弱 token 告警，设 `ARTIFACT_DEPOT_STRICT_CONFIG=1` 会因告警直接拒绝启动。生产请用 >=16 位随机串。
 6. 分片上传的 `upload_id` 由服务端生成并严格校验字符集，会话绑定创建者；客户端不得自行构造/猜测 `upload_id`。
 7. 网页 UI 使用事件委托（`data-*` 属性）渲染文件名等不可信数据，不再把用户输入拼进内联 `onclick`。
 8. 审计的 `public_ip` 只在 `config.trusted_proxies` 命中直连代理时才由 `X-Forwarded-For` 解析；未配置时为空，客户端自报的 `public_ip` 参数一律忽略。
@@ -971,6 +1150,8 @@ ArtifactDepot 配置优先级：内置默认 < `config/config.json`（或 `ARTIF
 13. 网页 UI 脚本/样式已外置到 `/static/app.js`、`/static/app.css`，应用页 CSP 为 `script-src 'self'`（不允许内联脚本）；Swagger/ReDoc 因自带内联初始化脚本，单独放行 `'unsafe-inline'`。
 14. 批量删除（`POST /api/objects/bulk-delete`）在 `object:delete_bulk` 权限点与 bucket/前缀范围之外，还要求：**执行必须输入名称确认**（目录名；根目录为 bucket 名）并由服务端二次校验；**只清理目录内容、目录本身保留**；**bucket 根 `.warehouse.json` 永不删除**；单次最多处理 50000 项（`dry_run` 预览同样受限）；`dry_run=true` 只预览、不落盘、不写审计。前端禁用确认按钮只是体验，不能替代服务端校验。
 15. 一键下载（`GET /api/objects/download-bulk`）：复用 `object:download` 权限点与 bucket/前缀范围；**只打包可见内容**——隐藏项（`.keep`、`.warehouse.json` 等）与符号链接一律跳过、不跟随；`prefix` 解析（含符号链接）后必须仍在本 bucket 内（否则 `400`，防跨 bucket 读取）；ZIP 条目名来自真实相对路径，中文名走 RFC 5987 `filename*`；流式生成不落临时文件，单次最多 100000 项。
+16. 分块并发下载（0.9.0）复用 `GET /api/objects/download` 的 `Range`：每个 Range 请求独立鉴权、独立写 `download` 审计（`partial=true`，`size` 为区间字节数），并各计一次 `DOWNLOADS`（仅可解析单区间）；`HEAD` 探测写审计（`head=true`、`size=0`）但**不计下载指标**。签名链接按次数计费时每个 Range 都消耗次数，分块下载应改用 token；`download-bulk` ZIP 无 `Content-Length`，不支持分块。
+17. **伴随文件本地化（0.9.0）**：上传/下载自动创建的临时与断点文件都落「文件所在目录」——服务端分片会话 `<目标父目录>/.artifactdepot-uploads/<upload_id>/`（`.session.json` / `chunk_<i>.part` / `.incoming` / `.merged`）、直传临时 `.<name>.artifactdepot-incoming-*.tmp`、框架 multipart spool（`upload.staging_dir`，默认 `<depot_dir>/.staging`）；客户端上传断点 `.<源文件名>.artifactdepot-upload.json`、下载 `.part` 与 `.<目标名>.artifactdepot-download.json`（均 0600；源目录不可写时上传状态回退 `~/.artifactdepot/upload-state/`）。**内部目录保护**：`.artifactdepot-uploads` 为隐藏目录，列表 / 目录递归大小 / ZIP 打包跳过，`bulk_delete(mode="all")` 与 `rename_object` 额外显式跳过，避免清空或搬走活跃上传；会话删除后空目录自动 `rmdir`。**续传复用 `upload:initiate`，不新增权限点**（权限点仍 22 条、OpenAPI 操作仍 35 条、旧 token 无需变更），`initiate` 响应只返回 `uploaded` 等相对信息、**不回显服务端绝对路径**；服务端**单进程假设**（不要开 `--workers`），进程内 registry 只是索引、磁盘才是唯一事实源，重启扫描 `.artifactdepot-uploads` 后仍可续传。
 
 ## 十一、其他项目接入指南（bucket / 目录 / 文件 push-pull）
 
@@ -1058,6 +1239,7 @@ curl -o result.mp4 "http://<IP>:8004/api/objects/download?bucket=myproject&key=t
 
 - 下载完成后用 push 时记录的 `sha256` 做完整性校验。
 - 支持 `Range` 头断点续传（返回 206）。
+- **分块并发下载（推荐）**：先 `GET /api/auth/permissions` 读取 `data.download`，再 `HEAD` 探测大小 / `Accept-Ranges`，按 `download.chunk_size_mb`（默认 8MB）切分并行 `Range`（默认 4 路，见 2.14）；完成后校验总大小，并以 `ETag`（SHA-256）校验内容；可参考 `client/` 的实现。签名链接（`link`/`tk`/`expires`/`sig`）按次数计费，**不要**用多请求并发下载，改用 token。
 
 **方式 B：接收方无 token 时，先 presign 再分发链接：**
 
@@ -1091,7 +1273,7 @@ POST /api/objects/presign（bucket, key, mode=count/time/permanent）
 GET /api/auth/permissions
 ```
 
-返回四部分，供「逐接口勾选 → 生成 token」的前端渲染：
+返回以下部分，供「逐接口勾选 → 生成 token」的前端渲染：
 
 - `permissions`：受保护接口清单，每项 `{key, group, label, method, path, write}`；
 - `public`：公开接口清单（不可勾选）；
@@ -1099,6 +1281,8 @@ GET /api/auth/permissions
 - `upload`：上传参数（`chunk_size` / `chunk_concurrency` / `file_concurrency` /
   `request_timeout_seconds` / `max_chunk_size` / `max_chunks` / `max_session_gb` / `max_upload_mb`），
   网页启动时读取（见 §9 `upload.*`）。
+- `download`：下载参数（`chunk_size` / `chunk_concurrency` / `request_timeout_seconds`，字节/整数/秒），
+  网页与桌面客户端读取（见 §9 `download.*`、2.14）。
 
 ### 12.2 权限点总表
 

@@ -145,13 +145,20 @@ def _sha(data: bytes) -> str:
 
 
 _SNAP_EXCLUDE = {"tokens.json", "audit.log", "signed_links.json", ".state.lock"}
+# 0.9.0 起 depot 根有内部 .staging（伴随文件本地化），上传目标父目录内会有
+# .artifactdepot-uploads；它们不属于业务数据，磁盘快照/空 depot 断言统一排除。
+_SNAP_INTERNAL_DIRS = {".staging", ".artifactdepot-uploads"}
+
+
+def _is_internal_path(rel: str) -> bool:
+    return any(part in _SNAP_INTERNAL_DIRS for part in rel.split("/"))
 
 
 def _disk(depot: Path) -> dict:
     out = {}
     for p in sorted(depot.rglob("*")):
         rel = p.relative_to(depot).as_posix()
-        if rel in _SNAP_EXCLUDE:
+        if rel in _SNAP_EXCLUDE or _is_internal_path(rel):
             continue
         if p.is_dir():
             out[rel + "/"] = None

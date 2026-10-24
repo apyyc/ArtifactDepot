@@ -74,6 +74,10 @@ document.addEventListener('click', (e) => {
   else if (a === 'list-buckets') listBuckets()
   else if (a === 'open-bucket') openBucket()
   else if (a === 'do-upload') doUpload()
+  else if (a === 'pause-upload') pauseUploads()
+  else if (a === 'resume-upload') resumeUploads()
+  else if (a === 'retry-upload') retryUpload(el.dataset.uid)
+  else if (a === 'cancel-upload') cancelUpload(el.dataset.uid)
   else if (a === 'open-mkdir') openMkdirModal()
   else if (a === 'do-mkdir') doMkdir()
   else if (a === 'close-mkdir') closeMkdirModal()
@@ -1230,9 +1234,96 @@ async function downloadFile(key) {
   }
 }
 
-// 上传（拖拽 / 多选 / 先审核 token / 并发 / 大文件分片）
-const upItems = []   // { file, pct, status }
+// 上传（拖拽 / 多选 / 先审核 token / 并发 / 大文件分片 / 失败续传 / 暂停继续）
+//
+// 断点续传模型（与服务端契约 §B3/§D 一致）：
+//  - 每个队列项记录 upload_id / chunk_size / uploaded（服务端已确认的分片索引，唯一事实源）；
+//  - initiate 带 bucket/key/size；续传再带 resume=true（可选 upload_id 指定复用会话）；
+//  - 失败不 abort：保留服务端分片会话，状态置「失败（可续传）」，继续时只补缺失分片；
+//  - 暂停在分片边界生效（不再发新分片），已传分片不重传；「继续上传」从断点继续；
+//  - 页面刷新后浏览器无法自动恢复文件列表：重新选择同一文件再点上传时，会带
+//    resume=true + bucket/key/size 由服务端自动找回未完成会话（本地只缓存文件指纹，
+//    绝不存 token；指纹不一致 → 新建会话，避免把旧分片拼进被改过的文件）。
+const upItems = []   // { uid, file, pct, loaded, phase, reason, resumable, retryable, upload_id, chunk_size, uploaded }
 let upInFlight = 0
+let upPaused = false        // true=暂停上传（分片边界生效：不再发新分片）
+let upPauseWaiters = []     // 暂停期间等待恢复的 worker；「继续上传」时逐个唤醒
+let upSeq = 0               // 队列项唯一 id（data-uid 用，避免按数组下标取项因移除而错位）
+
+// 浏览器侧断点指纹（localStorage）：bucket|key → { size, lastModified, upload_id, chunk_size }
+const UP_RESUME_STORE = 'artifactdepot.uploadResume.v1'
+
+function upResumeKey(bucket, key) { return bucket + '|' + key }
+
+function upResumeMap() {
+  try {
+    const raw = window.localStorage.getItem(UP_RESUME_STORE)
+    const m = raw ? JSON.parse(raw) : null
+    return m && typeof m === 'object' ? m : {}
+  } catch (e) { return {} }   // 隐私模式/存储禁用：缓存失效不影响上传
+}
+
+function upResumeGet(bucket, key) {
+  const rec = upResumeMap()[upResumeKey(bucket, key)]
+  return rec && typeof rec === 'object' ? rec : null
+}
+
+function upResumePut(bucket, key, rec) {
+  try {
+    const m = upResumeMap()
+    m[upResumeKey(bucket, key)] = rec
+    window.localStorage.setItem(UP_RESUME_STORE, JSON.stringify(m))
+  } catch (e) { /* 忽略：缓存失败只是不能跨页面刷新续传 */ }
+}
+
+function upResumeDel(bucket, key) {
+  try {
+    const m = upResumeMap()
+    delete m[upResumeKey(bucket, key)]
+    window.localStorage.setItem(UP_RESUME_STORE, JSON.stringify(m))
+  } catch (e) { /* 忽略 */ }
+}
+
+function makeUploadItem(file) {
+  return {
+    uid: ++upSeq,
+    file: file,
+    pct: 0,
+    loaded: 0,
+    phase: 'queued',       // queued 排队 / running 上传中 / failed 失败 / done 成功
+    reason: '',
+    resumable: false,      // 失败时服务端分片会话是否保留（可断点续传）
+    retryable: false,      // 是否显示该行的「继续」按钮
+    upload_id: '',
+    chunk_size: 0,
+    uploaded: new Set(),   // 服务端已确认的分片索引
+  }
+}
+
+// 上传目标 key；未选 bucket 时返回空串（退化为旧版 legacy 会话）
+function uploadTargetKey(file) {
+  if (!state.bucket) return ''
+  return state.prefix ? state.prefix + '/' + file.name : file.name
+}
+
+function upChunkBytes(item, index) {
+  const start = index * item.chunk_size
+  const end = Math.min(item.file.size, start + item.chunk_size)
+  return Math.max(0, end - start)
+}
+
+// 暂停边界：worker 在发下一分片前 await；已发出的分片照常收尾，不重传
+function upWaitResume() {
+  if (!upPaused) return Promise.resolve()
+  return new Promise((resolve) => { upPauseWaiters.push(resolve) })
+}
+
+function upWakePauseWaiters() {
+  const waiters = upPauseWaiters
+  upPauseWaiters = []
+  waiters.forEach(fn => fn())
+}
+
 // 默认值与 config.json 的 upload.* 一致；页面加载/initiate 时用服务端配置覆盖
 const DEFAULT_UPLOAD_CFG = {
   chunk_size: 8 * 1024 * 1024,
@@ -1300,7 +1391,7 @@ function enqueueFiles(fileList) {
   if (!tok) { toast('请先填写你的 api_token', false); return }
   const files = Array.from(fileList || [])
   if (!files.length) return
-  for (const f of files) upItems.push({ file: f, pct: 0, status: '排队中' })
+  for (const f of files) upItems.push(makeUploadItem(f))
   renderUpQueue()
   processQueue()
 }
@@ -1310,36 +1401,142 @@ function doUpload() {
   $('upFile').value = ''   // 允许重复选同一文件
 }
 
+// 队列状态文案：失败项区分「可续传」（服务端会话保留）与普通失败（直传/token 问题）
+function upItemLabel(item) {
+  if (item.phase === 'done') return '成功'
+  if (item.phase === 'failed') {
+    return item.resumable
+      ? '失败（可续传）' + (item.reason ? '：' + item.reason : '')
+      : '失败：' + (item.reason || '未知错误')
+  }
+  if (item.phase === 'queued') return upPaused ? '排队中（已暂停）' : '排队中'
+  if (upPaused) return '已暂停 ' + fmtSize(item.loaded) + ' / ' + fmtSize(item.file.size)
+  return '上传中 ' + fmtSize(item.loaded) + ' / ' + fmtSize(item.file.size)
+}
+
+function updateUpButtons() {
+  const pauseBtn = $('upPause')
+  const resumeBtn = $('upResume')
+  if (!pauseBtn || !resumeBtn) return
+  const active = upItems.some(it => it.phase === 'queued' || it.phase === 'running')
+  const hasFailed = upItems.some(it => it.phase === 'failed' && it.retryable)
+  pauseBtn.disabled = upPaused || !active
+  resumeBtn.disabled = !(upPaused && active) && !hasFailed
+}
+
+// 暂停上传：当前在途分片传完后不再发新分片；会话与已传分片全部保留
+function pauseUploads() {
+  if (upPaused) return
+  upPaused = true
+  renderUpQueue()
+  toast('已暂停上传：当前分片传完后不再发新分片，已传分片保留')
+}
+
+// 继续上传：① 唤醒被暂停的 worker 从断点继续；② 失败的项重新排队，
+// 由 initiate(resume=true) 取回服务端真实 uploaded 后只补缺失分片
+function resumeUploads() {
+  const wasPaused = upPaused
+  upPaused = false
+  upWakePauseWaiters()
+  let retried = 0
+  upItems.forEach(it => {
+    if (it.phase === 'failed' && it.retryable) {
+      it.phase = 'queued'
+      it.reason = ''
+      it.resumable = false
+      retried++
+    }
+  })
+  renderUpQueue()
+  if (retried) toast('继续上传：' + retried + ' 个文件将从断点续传')
+  else if (wasPaused) toast('已继续上传')
+  processQueue()
+}
+
+// 每项「继续」：保留 upload_id，重跑 initiate(resume=true) 后只补缺失分片
+function retryUpload(uid) {
+  const item = upItems.find(it => String(it.uid) === String(uid))
+  if (!item || item.phase !== 'failed') return
+  item.phase = 'queued'
+  item.reason = ''
+  item.resumable = false
+  renderUpQueue()
+  processQueue()
+}
+
+// 每项「放弃」：显式 abort 服务端会话并清理本地断点记录（失败/暂停不会自动 abort）
+async function cancelUpload(uid) {
+  const idx = upItems.findIndex(it => String(it.uid) === String(uid))
+  if (idx < 0) return
+  const item = upItems[idx]
+  if (item.phase === 'running') { toast('正在上传，请先「暂停上传」再放弃', false); return }
+  const token = $('upToken').value.trim()
+  if (item.upload_id && token) await abortUpload(item.upload_id, token)
+  if (state.bucket && item.upload_id) upResumeDel(state.bucket, uploadTargetKey(item.file))
+  upItems.splice(idx, 1)
+  renderUpQueue()
+  toast('已放弃 ' + item.file.name + '，断点记录已清理')
+}
+
 async function processQueue() {
+  if (upPaused) return
   const max = parseInt($('upConcurrency').value) || uploadCfg.file_concurrency || 3
   while (upInFlight < max) {
     const token = $('upToken').value.trim()
     if (!token) break
-    const item = upItems.find(i => i.status === '排队中')
+    const item = upItems.find(i => i.phase === 'queued')
     if (!item) break
     const actor = await checkToken(token)
     if (!actor) {
-      item.status = '失败：token 无效'
+      item.phase = 'failed'
+      item.retryable = true
+      item.resumable = false
+      item.reason = 'token 无效'
       renderUpQueue()
       toast('token 无效，跳过 ' + item.file.name, false)
       continue
     }
+    if (upPaused) break   // 校验 token 期间可能刚点了暂停
     upInFlight++
-    item.status = '上传中'
+    item.phase = 'running'
+    item.reason = ''
     const isBig = item.file.size > uploadCfg.chunk_size
     const runner = isBig ? uploadOneChunked(item, token) : uploadOne(item, token)
-    runner.then(ok => {
-      item.pct = ok ? 100 : 0
-      item.status = ok ? '成功' : '失败'
+    runner.then((res) => {
       upInFlight--
+      res = res || {}
+      if (res.ok) {
+        item.phase = 'done'
+        item.pct = 100
+        item.loaded = item.file.size
+        item.reason = ''
+        item.upload_id = ''
+        item.uploaded = new Set()
+        refresh()
+      } else {
+        // 失败不 abort：分片会话保留，可点该行「继续」或「继续上传」从断点续传
+        item.phase = 'failed'
+        item.retryable = true
+        item.resumable = !!res.resumable
+        item.reason = res.reason || '上传失败'
+      }
       renderUpQueue()
-      if (ok) refresh()
+      processQueue()
+    }).catch((e) => {
+      upInFlight--
+      item.phase = 'failed'
+      item.retryable = true
+      item.resumable = !!item.upload_id
+      item.reason = (e && e.message) || String(e)
+      renderUpQueue()
       processQueue()
     })
   }
+  updateUpButtons()
 }
 
 function uploadOne(item, token) {
+  // 小文件直传：单个请求无法在中间暂停（暂停只在开始前生效），失败可重试但无断点
   return new Promise((resolve) => {
     const file = item.file
     const key = state.prefix ? state.prefix + '/' + file.name : file.name
@@ -1354,18 +1551,20 @@ function uploadOne(item, token) {
     xhr.timeout = uploadTimeoutMs()   // 默认 24h（config.upload.request_timeout_seconds）
     xhr.upload.onprogress = (e) => {
       if (e.lengthComputable) {
+        item.loaded = e.loaded
         item.pct = Math.round(e.loaded / e.total * 100)
-        item.status = '上传中 ' + fmtSize(e.loaded) + ' / ' + fmtSize(e.total)
         renderUpQueue()
       }
     }
+    const fail = (reason) => resolve({ ok: false, resumable: false, reason: reason })
     xhr.onload = () => {
       let body = null
       try { body = JSON.parse(xhr.responseText) } catch (e) { body = null }
-      resolve(xhr.status >= 200 && xhr.status < 300 && body && body.code === 0)
+      if (xhr.status >= 200 && xhr.status < 300 && body && body.code === 0) resolve({ ok: true })
+      else fail((body && body.detail) || ('HTTP ' + xhr.status))
     }
-    xhr.onerror = () => resolve(false)
-    xhr.ontimeout = () => resolve(false)
+    xhr.onerror = () => fail('网络错误')
+    xhr.ontimeout = () => fail('请求超时')
     xhr.send(fd)
   })
 }
@@ -1378,32 +1577,103 @@ async function abortUpload(upload_id, token) {
   } catch (e) { /* 忽略 */ }
 }
 
-async function uploadOneChunked(item, token) {
-  // 1. initiate
-  let upload_id, chunk_size
-  try {
-    const r = await api('/api/objects/initiate', { method: 'POST' }, token)
-    const d = r.data || {}
-    upload_id = d.upload_id
-    // 服务端配置优先：分片大小/并发/超时（config.json 的 upload.*）
-    applyUploadConfig(d, false)
-    chunk_size = d.chunk_size || uploadCfg.chunk_size
-    if (!upload_id) throw new Error('服务端未返回 upload_id')
-  } catch (e) {
-    item.status = '失败：' + e.message
-    return false
-  }
+// 发起 / 恢复分片会话：initiate 带 bucket/key/size；续传再带 resume=true（可再带 upload_id 指定复用）。
+// 不传 upload_id 时由服务端按 owner+bucket+key+size 自动找回未完成会话（页面刷新后重新选文件也可续传）。
+async function initiateUpload(item, token) {
   const file = item.file
-  const totalChunks = Math.max(1, Math.ceil(file.size / chunk_size))
-  const bucket = state.bucket
-  const key = state.prefix ? state.prefix + '/' + file.name : file.name
+  const bucket = state.bucket || ''
+  const key = bucket ? uploadTargetKey(file) : ''
+  const fd = new FormData()
+  if (bucket) {
+    fd.append('bucket', bucket)
+    fd.append('key', key)
+  }
+  fd.append('size', String(file.size))
+  let upload_id = item.upload_id || ''
+  let resume = true
+  if (!upload_id && bucket) {
+    const rec = upResumeGet(bucket, key)
+    if (rec) {
+      if (Number(rec.size) === Number(file.size) &&
+          Number(rec.lastModified) === Number(file.lastModified)) {
+        upload_id = rec.upload_id || ''
+      } else {
+        // 文件变了（size/lastModified）→ 丢弃旧记录并新建会话，绝不把旧分片拼进新文件
+        upResumeDel(bucket, key)
+        resume = false
+      }
+    }
+  }
+  // token 变了（可能换了操作者）→ 不复用旧会话，按新身份重新发起
+  if (upload_id && item.tokenSig && item.tokenSig !== token) upload_id = ''
+  if (resume) fd.append('resume', 'true')
+  if (upload_id) fd.append('upload_id', upload_id)
+  let data
+  try {
+    const r = await api('/api/objects/initiate', { method: 'POST', body: fd }, token)
+    data = (r && r.data) || {}
+  } catch (e) {
+    // 会话失效/参数不一致（HTTP 400，detail 含「分片会话」）→ 按会话丢失处理，新建会话重传
+    if (upload_id && e && e.status === 400) {
+      upResumeDel(bucket, key)
+      item.upload_id = ''
+      item.tokenSig = ''
+      return initiateUpload(item, token)
+    }
+    throw e
+  }
+  const sessionId = data.upload_id
+  if (!sessionId) throw new Error('服务端未返回 upload_id')
+  // 服务端配置优先：分片大小/并发/超时（config.json 的 upload.*）
+  applyUploadConfig(data, false)
+  const chunk_size = Number(data.chunk_size) || uploadCfg.chunk_size
+  const totalChunks = Number(data.total_chunks) || Math.max(1, Math.ceil(file.size / chunk_size))
+  const uploaded = new Set()
+  ;(data.uploaded || []).forEach((i) => {
+    const idx = Number(i)
+    if (Number.isInteger(idx) && idx >= 0 && idx < totalChunks) uploaded.add(idx)
+  })
+  item.upload_id = sessionId
+  item.chunk_size = chunk_size
+  item.uploaded = uploaded
+  item.tokenSig = token
+  if (bucket) {
+    upResumePut(bucket, key, {
+      size: Number(file.size) || 0,
+      lastModified: Number(file.lastModified) || 0,
+      upload_id: sessionId,
+      chunk_size: chunk_size,
+    })
+  }
+  return { upload_id: sessionId, chunk_size: chunk_size, totalChunks: totalChunks, uploaded: uploaded, resumed: !!data.resumed }
+}
+
+async function uploadOneChunked(item, token) {
+  const file = item.file
+  const bucket = state.bucket || ''
+  const key = uploadTargetKey(file)
   const source_url = $('upSource').value.trim()
-  const chunkProgress = new Array(totalChunks).fill(0)
-  function updatePct() {
-    const loaded = chunkProgress.reduce((a, b) => a + b, 0)
-    item.pct = Math.round(loaded / file.size * 100)
-    item.status = '上传中 ' + fmtSize(loaded) + ' / ' + fmtSize(file.size)
-    renderUpQueue()
+  let sess
+  try {
+    sess = await initiateUpload(item, token)
+  } catch (e) {
+    return { ok: false, resumable: !!item.upload_id, reason: '建立会话失败 ' + ((e && e.message) || e) }
+  }
+  const totalChunks = sess.totalChunks
+  const chunk_size = item.chunk_size
+  // 进度：已确认分片直接计入，断点续传后百分比不会回到 0
+  const chunkLoaded = new Array(totalChunks).fill(0)
+  item.uploaded.forEach((idx) => { chunkLoaded[idx] = upChunkBytes(item, idx) })
+  function recalc() {
+    let loaded = 0
+    for (let i = 0; i < totalChunks; i++) loaded += chunkLoaded[i]
+    item.loaded = Math.min(loaded, file.size)
+    item.pct = file.size ? Math.round(item.loaded / file.size * 100) : 0
+  }
+  recalc()
+  renderUpQueue()
+  if (sess.resumed && item.uploaded.size) {
+    toast('从断点继续 ' + file.name + '：已完成 ' + item.uploaded.size + '/' + totalChunks + ' 片')
   }
   function sendChunk(index) {
     return new Promise((resolve) => {
@@ -1411,7 +1681,7 @@ async function uploadOneChunked(item, token) {
       const end = Math.min(file.size, start + chunk_size)
       const blob = file.slice(start, end)
       const fd = new FormData()
-      fd.append('upload_id', upload_id)
+      fd.append('upload_id', item.upload_id)
       fd.append('index', String(index))
       fd.append('chunk', blob, 'chunk_' + index)
       const xhr = new XMLHttpRequest()
@@ -1420,83 +1690,92 @@ async function uploadOneChunked(item, token) {
       xhr.timeout = uploadTimeoutMs()
       xhr.upload.onprogress = (e) => {
         if (e.lengthComputable) {
-          chunkProgress[index] = e.loaded
-          updatePct()
+          chunkLoaded[index] = e.loaded
+          recalc()
+          renderUpQueue()
         }
       }
       xhr.onload = () => {
         let body = null
         try { body = JSON.parse(xhr.responseText) } catch (e) { body = null }
         if (xhr.status >= 200 && xhr.status < 300 && body && body.code === 0) {
-          chunkProgress[index] = (end - start)
-          updatePct()
-          resolve(true)
+          chunkLoaded[index] = end - start
+          item.uploaded.add(index)
+          recalc()
+          renderUpQueue()
+          resolve({ ok: true })
         } else {
-          resolve(false)
+          resolve({ ok: false, reason: (body && body.detail) || ('HTTP ' + xhr.status) })
         }
       }
-      xhr.onerror = () => resolve(false)
-      xhr.ontimeout = () => resolve(false)
+      xhr.onerror = () => resolve({ ok: false, reason: '网络错误' })
+      xhr.ontimeout = () => resolve({ ok: false, reason: '请求超时' })
       xhr.send(fd)
     })
   }
-  // 2. 并行上传分片（默认 4 路并发，config.upload.chunk_concurrency）
-  let aborted = false
-  const CHUNK_CONCURRENCY = Math.max(1, Math.min(16,
-    Number(uploadCfg.chunk_concurrency) || 4))
-  const workers = []
-  let nextIdx = 0
-  for (let w = 0; w < Math.min(CHUNK_CONCURRENCY, totalChunks); w++) {
-    workers.push(new Promise(async (resolve) => {
-      while (nextIdx < totalChunks) {
-        const idx = nextIdx++
-        const ok = await sendChunk(idx)
-        if (!ok) {
-          nextIdx = totalChunks
-          aborted = true
-          resolve(false)
-          return
-        }
+  // 只补缺失分片；每个分片发送前检查暂停边界（暂停时不再发新片，已传分片不重传）
+  const pending = []
+  for (let i = 0; i < totalChunks; i++) if (!item.uploaded.has(i)) pending.push(i)
+  let failed = null
+  let cursor = 0
+  async function worker() {
+    while (true) {
+      if (failed || cursor >= pending.length) return
+      if (upPaused) { await upWaitResume(); continue }
+      const idx = pending[cursor++]
+      const r = await sendChunk(idx)
+      if (!r.ok) {
+        // 一个分片失败就停止派发；已成功分片保留在 item.uploaded，下次续传只补缺失片
+        failed = r
+        upWakePauseWaiters()   // 唤醒可能在暂停边界等待的同伴，让本轮尽快收尾
+        return
       }
-      resolve(true)
-    }))
+    }
   }
-  try {
-    await Promise.all(workers)
-  } catch (e) {
-    aborted = true
+  // 并行上传分片（默认 4 路并发，config.upload.chunk_concurrency）
+  const conc = Math.max(1, Math.min(16, Number(uploadCfg.chunk_concurrency) || 4))
+  const workers = []
+  for (let w = 0; w < Math.min(conc, Math.max(1, pending.length)); w++) workers.push(worker())
+  await Promise.all(workers)
+  if (failed) {
+    // 关键：失败不 abort —— 服务端分片会话保留，下次 initiate(resume=true) 只补缺失分片
+    return { ok: false, resumable: true, reason: failed.reason || '分片上传失败' }
   }
-  if (aborted) {
-    await abortUpload(upload_id, token)
-    item.status = '失败：分片上传失败'
-    return false
-  }
-  // 3. complete
+  // 暂停在分片边界同样生效：等恢复后再合并
+  await upWaitResume()
   const fd = new FormData()
-  fd.append('upload_id', upload_id)
+  fd.append('upload_id', item.upload_id)
   fd.append('bucket', bucket)
   fd.append('key', key)
   fd.append('total_chunks', String(totalChunks))
   fd.append('source_url', source_url)
-    fd.append('overwrite', 'true')
+  fd.append('overwrite', 'true')
   try {
     await api('/api/objects/complete', { method: 'POST', body: fd }, token, uploadTimeoutMs())
-    return true
   } catch (e) {
-    await abortUpload(upload_id, token)
-    item.status = '失败：合并失败 ' + e.message
-    return false
+    // 合并失败同样保留会话（如 409），「继续」可重试 complete
+    return { ok: false, resumable: true, reason: '合并失败 ' + ((e && e.message) || e) }
   }
+  // 成功：清理本地断点记录（服务端会话已删除）
+  if (bucket) upResumeDel(bucket, key)
+  return { ok: true }
 }
 
 function renderUpQueue() {
   const box = $('upQueue')
+  if (!box) return
+  updateUpButtons()
   if (!upItems.length) { box.innerHTML = ''; return }
-  box.innerHTML = upItems.map(it =>
-    '<div class="up-item"><span class="nm" title="' + esc(it.file.name) + '">' + esc(it.file.name) + '</span>' +
-    '<progress value="' + it.pct + '" max="100"></progress>' +
-    '<span class="st' + (it.status === '成功' ? ' ok' : it.status.startsWith('失败') ? ' bad' : '') + '">' + esc(it.status) + '</span></div>'
-  ).join('')
+  box.innerHTML = upItems.map(it => {
+    const cls = it.phase === 'done' ? ' ok' : it.phase === 'failed' ? ' bad' : (upPaused ? ' paused' : '')
+    const ops = it.phase === 'failed' && it.retryable
+      ? '<button class="ghost up-act" data-action="retry-upload" data-uid="' + it.uid + '">继续</button>' +
+        '<button class="ghost up-act" data-action="cancel-upload" data-uid="' + it.uid + '">放弃</button>'
+      : ''
+    return '<div class="up-item"><span class="nm" title="' + esc(it.file.name) + '">' + esc(it.file.name) + '</span>' +
+      '<progress value="' + it.pct + '" max="100"></progress>' +
+      '<span class="st' + cls + '">' + esc(upItemLabel(it)) + '</span>' + ops + '</div>'
+  }).join('')
 }
 
 // 整页拖放：拖入显示遮罩，松手自动上传

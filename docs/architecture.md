@@ -1,12 +1,12 @@
 # ArtifactDepot 架构说明
 
-> 版本 **0.10.0**
+> 版本 **0.9.0**
 
 ## 定位
 
 ArtifactDepot 是一个**对象存储 / 工件仓库**站点（不是传统意义的"数据仓库/OLAP"）。
 它负责收存处理产物（视频、文件等），按 **S3 模型**提供标准接口：bucket/key 命名、
-上传、列表、下载（Range）、删除、预签名 URL，并提供网页浏览。
+上传、列表、下载（`HEAD` 探测 + Range 分块并发）、删除、预签名 URL，并提供网页浏览。
 
 它不承担业务逻辑，也不存协作平台的 JSON 数据（那是 DataHub 的事）。
 
@@ -18,8 +18,10 @@ ArtifactDepot 是一个**对象存储 / 工件仓库**站点（不是传统意�
     ▼
 ArtifactDepot（独立 FastAPI 服务，端口 8004）
     │  文件落盘 <depot_dir>/<bucket>/<key>
+    ├─ POST /api/objects/initiate|chunk|complete  ← 分片上传（会话落目标目录 .artifactdepot-uploads，可暂停/续传）
     ├─ GET  /api/objects/list      ← ProjectCollab"任务数据"模块 / 网页 UI
-    ├─ GET  /api/objects/download  ← 下载（Range 206，视频可拖动）
+    ├─ HEAD /api/objects/download  ← 元信息探测（大小 / Accept-Ranges / ETag，不计下载指标）
+    ├─ GET  /api/objects/download  ← 下载（Range 206；网页/桌面客户端并行分块）
     ├─ GET  /                      网页浏览
     ▼
 用户浏览器
@@ -53,10 +55,15 @@ ArtifactDepot/
 ├── dev_start_headless.sh         # 本地后台启动（源码模式直启 uvicorn）
 ├── build_image.sh                # 构建 + 自动导出 tar
 ├── deploy_container.sh           # 部署（host 网络默认 + --config/VOLUME_MAPS）
+├── client/                       # 桌面客户端 + CLI（分块并发下载；client/README.md）
 └── src/artifactdepot/
-    ├── main.py                 # FastAPI 入口 + lifespan（确保仓库根存在）
+    ├── main.py                 # FastAPI 入口 + lifespan（建目录；启动清理旧版 /tmp/dw_chunks 与 legacy 会话、
+    │                           #   创建 staging 并把 tempfile.tempdir 指向它（spool 落数据盘，退出还原）、
+    │                           #   扫描 .artifactdepot-uploads 重建 registry、启动同步 token）
     ├── config/                 # 配置包：__init__.py（加载/手动重载）+ config.json + config.production.json + .env(.example)
-    ├── storage.py              # 对象存储引擎：路径安全 / put/list/delete/bulk_delete / bulk_download_scan / manifest / 预签名 / 签名链接注册表 / token 注册表 / 审计 / DataHub 同步 / meta_dir
+    ├── storage.py              # 对象存储引擎：路径安全 / put/list/delete/bulk_delete / bulk_download_scan / manifest / 预签名 /
+    │                           #   签名链接注册表 / token 注册表 / 审计 / DataHub 同步 / meta_dir /
+    │                           #   分片会话（目标目录 .artifactdepot-uploads 与 legacy staging、进程内 registry、续传与 TTL 清理）
     ├── zipstream.py            # 流式 ZIP（后台线程 + 有界队列 + 背压；目录一键下载，不落临时文件）
     ├── auth.py                 # 写操作 token 校验（query / Bearer）
     ├── api/
@@ -75,8 +82,14 @@ ArtifactDepot/
 ```
 <depot_dir>/                  # 默认 ./warehouse（项目内）；容器部署用 /data/depot 卷
 ├── <bucket>/                     # bucket = 项目（如 project_1）
-│   ├── task_5/xxx.mp4            # key = 任务/文件名（扁平路径式命名）
+│   ├── task_5/                   # key 的父目录（可多级）
+│   │   ├── xxx.mp4               # key = 任务/文件名（扁平路径式命名）
+│   │   └── .artifactdepot-uploads/<upload_id>/
+│   │                             # 活跃分片上传会话（伴随文件本地化；完成/超时自动清理）
+│   │                             #   .session.json / chunk_<i>.part / .incoming/ / .merged
 │   └── .warehouse.json           # 每 bucket 元数据清单（隐藏，列表跳过）
+├── .staging/                     # 默认 staging（upload.staging_dir 留空时）：
+│                                 #   legacy 会话 <upload_id>/ + Starlette multipart spool
 └── …
 
 <meta_dir>/（可选；默认放 depot_dir 根下，0.5.0 起可用 meta_dir 单独放）
@@ -85,6 +98,17 @@ ArtifactDepot/
 └── audit.log                     # 审计日志（JSONL 追加）
 ```
 
+- **伴随文件本地化（0.9.0）**：上传/下载自动创建的临时与断点文件都放「文件所在目录」，不再写宿主 `/tmp`
+  （宿主 `/tmp` 常是 6.83GiB tmpfs，72GB 上传必然失败）：
+  - 服务端：目标明确的会话在 `<目标父目录>/.artifactdepot-uploads/<upload_id>/`；legacy 客户端
+    （`initiate` 不带 `bucket/key`）在 `<staging>/<upload_id>/`；直传临时文件
+    `.<name>.artifactdepot-incoming-<rand>.tmp`；合并临时 `.merged`；框架 multipart spool 由
+    `upload.staging_dir`（默认 `<depot_dir>/.staging`，启动时设置 `tempfile.tempdir`）决定。
+  - 客户端（桌面）：上传断点 `.<源文件名>.artifactdepot-upload.json`、下载 `.part` 与
+    `.<目标名>.artifactdepot-download.json`（0600）；源目录不可写时上传断点回退
+    `~/.artifactdepot/upload-state/<sha1(server|bucket|key)>.json`。
+- `.artifactdepot-uploads` / `.staging` 均为隐藏目录：列表、目录递归大小、ZIP 打包均跳过；
+  **批量删除 `mode="all"` 与 `rename_object` 显式跳过 `.artifactdepot-uploads`**（内部目录保护）。
 - **文件系统是唯一事实源**：列表以目录扫描为准，手工放入的文件也能列出；
   `.warehouse.json` 清单只做元数据补充（size/sha256/mtime/source_url）。
 - 隐藏点文件（`.` 开头）不在列表展示、不可作为上传 key，防止覆盖清单。
@@ -98,7 +122,12 @@ ArtifactDepot/
 ```
 
 - 支持环境变量：`ARTIFACT_DEPOT_DIR` / `ARTIFACT_DEPOT_META_DIR` / `ARTIFACT_DEPOT_DATAHUB_URL` /
-  `ARTIFACT_DEPOT_ACCESS_TOKEN` / `ARTIFACT_DEPOT_PORT` / `ARTIFACT_DEPOT_MAX_UPLOAD_MB`
+  `ARTIFACT_DEPOT_ACCESS_TOKEN` / `ARTIFACT_DEPOT_PORT` / `ARTIFACT_DEPOT_MAX_UPLOAD_MB`，
+  以及 `upload.*`（10 个 `ARTIFACT_DEPOT_UPLOAD_*`，含 `ARTIFACT_DEPOT_UPLOAD_STAGING_DIR`）与
+  `download.*`（3 个 `ARTIFACT_DEPOT_DOWNLOAD_*`）；
+  `.env` 支持点号写法（`upload.chunk_size_mb=8` / `upload.staging_dir=/data/depot/.staging` / `download.chunk_size_mb=8`）
+- `upload.staging_dir` 只在启动时设置 `tempfile.tempdir`（框架 spool 落点）并创建目录；
+  热重载改它会在 `config/reload` 的 `needs_restart` 中提示，需重启才完整生效。
 - **镜像内不得烤死 `ARTIFACT_DEPOT_DATAHUB_URL` 默认值**：环境变量优先级高于配置文件，
   烤死的 127.0.0.1 会盖掉挂载 config.json 的 `datahub_url`（0.5.0 已从 Dockerfile 移除）。
 
@@ -106,10 +135,14 @@ ArtifactDepot/
 
 | 方法 | 路径 | 说明 | 对应 S3 |
 |---|---|---|---|
-| POST | `/api/objects` | multipart 上传（bucket/key/token/source_url/overwrite） | PutObject |
+| POST | `/api/objects` | multipart 上传（bucket/key/token/source_url/overwrite；临时文件写目标父目录 + `put_object(move=True)`） | PutObject |
+| POST | `/api/objects/initiate` | 发起/恢复分片会话（query 或 form；`resume`/`upload_id` 续传，返回 `resumed`/`uploaded`/`staging`） | - |
+| POST | `/api/objects/chunk` | 上传分片（请求体落会话 `.incoming`，再原子改名为 `chunk_<i>.part`） | - |
+| POST | `/api/objects/complete` | 合并分片（`.merged` + `put_object(move=True)` 原子落盘；成功/硬失败清理会话） | - |
+| POST | `/api/objects/abort` | 取消分片会话（删除会话目录，幂等） | - |
 | POST | `/api/objects/mkdir` | 新建目录（key 可含 `/` 多级） | - |
 | GET | `/api/objects/list` | 列对象（bucket/prefix） | ListObjects |
-| GET | `/api/objects/download` | 下载，Range 206，需 token（签名链接免） | GetObject |
+| GET / HEAD | `/api/objects/download` | 下载（`HEAD` 探测 + Range 206 分块并发；HEAD 以 `include_in_schema=false` 注册，不新增权限点），需 token（签名链接免） | GetObject |
 | GET | `/api/objects/download-bulk` | 一键下载目录：单文件直下 / 多文件或含子目录流式 ZIP（复用 `object:download`；见下「可靠性要点」） | - |
 | DELETE | `/api/objects` | 删除对象/空目录（权限点 `object:delete`） | DeleteObject |
 | POST | `/api/objects/bulk-delete` | 批量删除目录内容（`object:delete_bulk`；保留目录本身、需输入名称确认；见下「可靠性要点」） | - |
@@ -134,12 +167,42 @@ ArtifactDepot/
 
 - 状态文件（`tokens.json` / `signed_links.json` / `.warehouse.json`）统一原子写（临时文件 + `fsync` + `os.replace`），
   并用 `storage.state_lock()`（进程内 `threading` 锁 + 跨进程 `fcntl.flock`）串行化读-改-写，避免并发丢更新 / 半截 JSON。
-- 分片上传会话绑定创建者，`upload_id` 严格校验；单分片 ≤64MB（`upload.max_chunk_mb`），会话总量受 `max_upload_mb` / `upload.max_session_gb`（默认 200GB）约束；分片大小、并发、请求超时（默认 24h）均可由 `upload.*` 配置。
-- **分片上传临时文件清理**：`finalize_chunk_upload` 在成功或进入合并/落盘阶段后的硬失败（I/O、磁盘满等）时
-  删除本次 `/tmp/dw_chunks/<upload_id>` 与合并临时文件；校验类失败（缺片 / 超限 / 权限 / 409）保留会话以便重试；
-  `store_chunk` 复制失败清理 `.part.tmp`；直传/分片请求读取异常清理临时文件；
-  服务启动时 `cleanup_all_chunk_sessions()` 清理所有历史遗留会话（容器/进程重启即释放，避免几十 GB 分片长期占盘）；
-  后台任务每 10 分钟清理超过 `upload.session_idle_ttl_seconds`（默认 24h）没有分片写入的会话（浏览器被杀/断网的兜底）。
+- 分片上传会话绑定创建者，`upload_id` 严格校验；单分片 ≤64MB（`upload.max_chunk_mb`），会话总量受 `max_upload_mb` / `upload.max_session_gb`（默认 200GB）约束；分片大小、并发、请求超时（默认 24h）均可由 `upload.*` 配置。会话目录布局（目标明确时）：
+  `<目标父目录>/.artifactdepot-uploads/<upload_id>/` 内放 `.session.json`（owner / created_at / updated_at /
+  received_bytes / bucket / key / size / chunk_size / total_chunks / staging）、`chunk_<i>.part`、
+  `.incoming/<rand>.tmp`（单次 chunk 请求体）、`.merged`（complete 合并临时）。
+- **续传状态机**（服务端以磁盘为唯一事实源，本地状态只是缓存）：
+  1. `initiate(resume=false)` 或首次 → 新建会话（`staging="target"`，目标父目录不存在则创建；父路径是文件 `409`）；
+  2. `chunk` 逐片落盘，每片更新 `.session.json` 的 `updated_at` / `received_bytes`（同时刷新目录 mtime）；
+  3. `complete` → 合并到 `.merged`，`put_object(move=True)` 算完 SHA-256 后 `os.replace` 原子落盘，成功即删除会话；
+  4. 失败 / 暂停 / 取消（客户端不 abort）→ **保留会话**，可再次 `initiate(resume=true)` 续传；
+  5. `resume=true` 时服务端返回磁盘上真实的 `uploaded` / `received_bytes`，客户端只补缺失分片；
+  6. 会话失效 / 参数不一致 → `400` 且 `detail` 含「分片会话」，客户端清本地状态、新建会话重传；
+  7. 超过绝对 TTL / 空闲 TTL → 后台或启动扫描清理（终态：过期）。
+- **清理**：`finalize_chunk_upload` 在成功或进入合并/落盘阶段后的硬失败（I/O、磁盘满等）时删除本次会话目录与
+  `.merged`；校验类失败（缺片 / 超限 / 权限 / `overwrite=false` 的 409）保留会话以便重试；`store_chunk` 复制失败清理
+  `.part.tmp`；直传/分片请求读取异常清理临时文件。启动时先清旧版 `/tmp/dw_chunks` 残留与 legacy staging 根下历史会话，
+  再 `scan_upload_sessions()` 扫描 depot 内 `.artifactdepot-uploads`：超 TTL 的删除、其余注册进 registry；
+  后台每 10 分钟只遍历 registry + legacy staging 根（成本与仓库大小无关），`cleanup_stale_chunk_sessions()` 查空闲、
+  `cleanup_expired_chunk_sessions()` 查绝对寿命（浏览器被杀/断网、无法发送 abort 时的兜底）。
+- **重启续传与单进程假设**：会话元数据与分片在数据盘，进程重启不会丢；启动扫描重建进程内 registry
+  （`{upload_id: Path}`）后客户端即可继续 `initiate(resume=true)`。registry 只是加速索引（避免每请求全树扫描），
+  **磁盘才是唯一事实源**；uvicorn 未开 `--workers`（单进程假设），多进程部署需改为共享存储的会话索引。
+- **框架级 spool 落数据盘**：lifespan 在清理旧 `/tmp/dw_chunks` **之后**把 `tempfile.tempdir` 指向
+  `upload.staging_dir`（默认 `<depot_dir>/.staging`），因此 Starlette multipart 解析产生的 spool 文件也落数据盘而非
+  宿主 `/tmp`；退出 lifespan 时恢复原值（测试/嵌入场景安全）。该配置只在启动生效，热重载改它会在 `needs_restart` 提示。
+- **分块并发下载**（`HEAD` / `GET /api/objects/download` + `Range`，0.9.0）：服务端不新增分块端点，只提供
+  `HEAD` 元信息（`Content-Length` / `Accept-Ranges: bytes` / `ETag` / `Content-Disposition`，`include_in_schema=false`、
+  不新增权限点）与单区间 `Range`（`206` + `Content-Range`；越界 `416`；多区间 `multipart/byteranges`）。
+  下载参数 `download.*`（分片 1–64MB、并发 1–16、超时 60s–7d；默认 8MB / 4 路 / 1h）经
+  `GET /api/auth/permissions` 的 `data.download` 下发（字节/整数/秒），`POST /api/config/reload` 即时生效。
+  客户端（网页 / 桌面）策略：先 `HEAD`，满足 `Accept-Ranges` 且文件大于分片时按闭区间并行 GET，每片校验
+  `206` + `Content-Range` 起点与长度；桌面预分配 `.part` 后按偏移写入（锁保护，重试从已写入偏移续传、
+  不重复计数），网页优先 File System Access 按位置写盘、否则按顺序拼 `Blob`；完成后校验总大小，`ETag`
+  为 `"<64 位 hex>"` 时校验 SHA-256；取消时停止在途请求并清理临时产物；服务端忽略 Range（200）、网页文件
+  >1GiB 且无 FS API、HEAD 不可用（405/501）、签名链接与 `download-bulk` ZIP 均回退单流。
+  审计：每个 Range 一条 `download`（`partial=true`、`range` 为请求头原文、`size` 为区间字节数），HEAD 一条
+  （`head=true`、`size=0`）；HEAD / `304` 不计 `DOWNLOADS`，可解析单区间与完整 GET 各 +1。
 - **批量删除目录内容**（`storage.bulk_delete`，`POST /api/objects/bulk-delete`）：先**只读收集**目标并检查上限
   （`MAX_BULK_DELETE_ITEMS = 50000`，`files + dirs` 超限 `400`，`dry_run` 预览同样受限），再执行删除；
   `dry_run=true` 在删除前返回统计，不落盘、不写审计。执行时 `FileNotFoundError` 视为「已不存在」跳过
@@ -158,7 +221,7 @@ ArtifactDepot/
 ## 可观测性
 
 - `X-Request-ID` 中间件透传/生成请求 ID，随响应头返回；结构化 JSON 访问日志含 request_id/method/route/status/duration_ms/client。
-- `/metrics` 输出 Prometheus 文本格式：HTTP 计数/耗时直方图、上传/下载/删除计数、token 数、磁盘用量；`metrics_enabled=false` 时 404。
+- `/metrics` 输出 Prometheus 文本格式：HTTP 计数/耗时直方图、上传/下载/删除计数、token 数、磁盘用量；`metrics_enabled=false` 时 404。分块下载按「可解析 Range 请求」各计一次下载，`HEAD` 与 `304` 不计。
 - `/health/live`（进程存活）、`/health/ready`（depot 目录可写，否则 503）。
 - 前端脚本/样式外置（`/static/app.js`、`/static/app.css`），事件委托 + 严格 CSP（`script-src 'self'`）；Swagger/ReDoc 单独放行 `unsafe-inline`。
 
@@ -174,11 +237,23 @@ ArtifactDepot/
 - 一键下载：复用 `object:download` + bucket/前缀范围；只打包可见项（隐藏文件/目录、`.keep`、`.warehouse.json`、
   符号链接一律跳过且不跟随），`prefix` 解析后不得越出 bucket；ZIP 条目名来自真实相对路径，中文名用 RFC 5987
   `filename*`；流式生成、单次上限 100000 项。
+- 共享令牌：`access_token` 默认 `admin`（内置 / `config.json` / `.env`），仅用于内网开箱即用/联调；
+  `admin` 属弱口令会触发启动告警，`ARTIFACT_DEPOT_STRICT_CONFIG=1` 时拒绝启动；生产必须改为 ≥16 位随机串。
+- 分块下载：复用 `object:download`，`HEAD` 探测不新增权限点；每个 Range 独立鉴权、独立写审计；
+  签名链接按次数计费时每个 Range 都消耗次数，分块下载应改用 token；`download-bulk` ZIP 无 `Content-Length`，
+  不支持分块。
+- **伴随文件与续传（0.9.0）**：分片会话绑定 owner（`initiate` / `chunk` / `complete` / `abort` 均校验，admin 例外）；
+  `upload_id` 严格字符集校验、会话目录二次确认落在 depot 内；删除/清理不跟随符号链接。
+  内部目录 `.artifactdepot-uploads` 被列表 / 目录大小统计 / ZIP 打包跳过，并被 `bulk_delete(mode="all")` 与
+  `rename_object` **显式跳过**，防止误删/搬走活跃上传；客户端 key 不允许隐藏路径段，无法直接操作内部目录。
+  **不新增权限点**（权限点仍 22 条、OpenAPI 操作仍 35 条、旧 token 无需变更），`initiate` 响应只回传
+  `uploaded` 等相对信息、**不回显服务端绝对路径**；服务端按**单进程**运行（不要 `--workers`），
+  registry 仅作索引、磁盘才是唯一事实源。
 
 ## 部署
 
 - **build → save → 拷贝 → load → deploy**：
-  - 开发机 `./build_image.sh`（构建 + 自动导出 `artifactdepot-0.10.0.tar`）
+  - 开发机 `./build_image.sh`（构建 + 自动导出 `artifactdepot-0.9.0.tar`）
   - 拷贝 tar 到生产机 → `podman load -i` → `./deploy_container.sh --token <你的管理员token>`
 - **host 网络默认**：容器共享宿主网络，`datahub_url` 用 `127.0.0.1:8002` 直连同机 DataHub；
   `--port-map` 可改回端口映射（不推荐，rootless 桥接常不通）。

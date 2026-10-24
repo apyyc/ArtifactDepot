@@ -9,6 +9,7 @@
 import asyncio
 import logging
 import os
+import tempfile
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 
@@ -47,7 +48,7 @@ def _app_version() -> str:
                     return v
     except OSError:
         pass
-    return "0.10.0"
+    return "0.9.0"
 
 
 APP_VERSION = _app_version()
@@ -57,7 +58,11 @@ CHUNK_CLEANUP_INTERVAL = 600
 
 
 async def _chunk_cleanup_loop() -> None:
-    """定期清理超过 config.upload.session_idle_ttl_seconds 没有分片写入的会话。"""
+    """定期清理超过 config.upload.session_idle_ttl_seconds 没有分片写入的会话。
+
+    0.9.0 起清理只遍历进程内 registry（+ legacy staging 根），不扫描整个 depot，
+    因此后台成本与仓库大小无关；目标目录会话在数据盘，重启后由启动扫描重新注册。
+    """
     while True:
         await asyncio.sleep(CHUNK_CLEANUP_INTERVAL)
         try:
@@ -93,14 +98,39 @@ async def lifespan(app: FastAPI):
     # 确保仓库根目录存在，并从 DataHub 拉取用户 token（启动即最新）
     root = storage.get_root()
     root.mkdir(parents=True, exist_ok=True)
-    # 容器/进程重启时不可能还有活跃上传：清理上次进程遗留的 /tmp/dw_chunks/<id>
-    # （浏览器被杀、容器重启、complete 失败等），避免几十 GB 分片长期占盘。
+    # 0.9.0「伴随文件本地化」：
+    # 1) 先清理旧版 <系统临时目录>/dw_chunks 残留（必须趁 tempfile.tempdir 仍是系统
+    #    临时目录时执行，否则设置 staging 后就找不到旧位置了）；
+    # 2) 创建 staging 目录并把 tempfile.tempdir 指向它：Starlette multipart 的 spool
+    #    文件也落数据盘，不再写宿主 /tmp（宿主 /tmp 常是 6.83GiB tmpfs，72GB 上传必爆）；
+    # 3) 退出 lifespan 时恢复原值（测试/嵌入场景安全）。
+    original_tempdir = tempfile.tempdir
+    try:
+        removed_tmp = storage.cleanup_legacy_tmp_chunk_sessions()
+        if removed_tmp:
+            logger.info("[清理] 启动清理旧版 /tmp/dw_chunks 残留：%s 个", removed_tmp)
+    except OSError as e:
+        logger.warning("[清理] 启动清理旧版 /tmp/dw_chunks 失败：%s", e)
+    try:
+        staging = storage.ensure_staging_dir()
+        tempfile.tempdir = str(staging)
+        logger.info("[上传] staging/临时文件目录：%s", staging)
+    except OSError as e:
+        logger.warning("[上传] 无法创建 staging 目录（%s）；继续使用系统临时目录", e)
+    # 启动清理：legacy staging 会话（旧客户端）全部删除；目标目录 .artifactdepot-uploads
+    # 下的会话按 TTL 清理，未过期的注册进进程内 registry（会话在数据盘 → 支持重启后续传）。
     try:
         removed_sessions = storage.cleanup_all_chunk_sessions()
         if removed_sessions:
-            logger.info("[清理] 启动清理遗留分片会话：%s 个", removed_sessions)
+            logger.info("[清理] 启动清理遗留 legacy 分片会话：%s 个", removed_sessions)
+        settings = get_upload_settings()
+        scan = storage.scan_upload_sessions(settings["session_ttl_seconds"],
+                                            settings["session_idle_ttl_seconds"])
+        if scan["registered"] or scan["removed"]:
+            logger.info("[清理] 扫描目标目录分片会话：注册 %s 个、清理过期 %s 个",
+                        scan["registered"], scan["removed"])
     except OSError as e:
-        logger.warning("[清理] 启动清理分片会话失败：%s", e)
+        logger.warning("[清理] 启动扫描分片会话失败：%s", e)
     await storage.sync_tokens_from_datahub(get_config().get("datahub_url", ""), force=True)
     cleanup_task = asyncio.create_task(_chunk_cleanup_loop())
     try:
@@ -109,6 +139,7 @@ async def lifespan(app: FastAPI):
         cleanup_task.cancel()
         with suppress(asyncio.CancelledError):
             await cleanup_task
+        tempfile.tempdir = original_tempdir
 
 
 _STATIC_DIR = Path(__file__).resolve().parent / "resources" / "static"

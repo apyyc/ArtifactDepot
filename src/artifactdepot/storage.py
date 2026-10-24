@@ -5,7 +5,9 @@
 
 存储布局：
   <depot_dir>/<bucket>/<key>...                # bucket=项目，key=任务/文件（扁平路径式）
-  <depot_dir>/<bucket>/.depot.json             # 每 bucket 元数据清单（隐藏，列表跳过）
+  <depot_dir>/<bucket>/.warehouse.json         # 每 bucket 元数据清单（隐藏，列表跳过）
+  <depot_dir>/<bucket>/<key 父目录>/.artifactdepot-uploads/<upload_id>/  # 分片会话（完成即清理）
+  <depot_dir>/.staging/                        # legacy 会话根 + 框架临时文件（upload.staging_dir）
 
 要点：
   - 列目录以文件系统扫描为准（手工放入的文件也能列出），清单只做元数据补充
@@ -38,10 +40,15 @@ import httpx
 
 from fastapi import HTTPException
 
-from artifactdepot.config import get_config, get_upload_settings
+from artifactdepot.config import get_config, get_staging_dir, get_upload_settings
 
 # 隐藏清单文件名（上传/列表均跳过）
 MANIFEST = ".warehouse.json"
+
+# 内部上传会话目录名。0.9.0 起「伴随文件本地化」：分片/合并/请求体临时文件都放在
+# 目标文件父目录下的这个隐藏目录里（旧客户端无 bucket/key 时退化为 staging/<upload_id>）。
+# 隐藏目录本身已被列表/目录统计/ZIP 跳过；批量删除与 rename 必须显式跳过，避免毁掉活跃上传。
+INTERNAL_UPLOAD_DIR = ".artifactdepot-uploads"
 
 _DEFAULT_META = {"size": 0, "sha256": "", "mtime": "", "source_url": "", "uploader": ""}
 
@@ -183,6 +190,9 @@ def validate_key(key: str) -> str:
     # 并在下载响应 Content-Disposition 中触发 header 注入或 500。
     if any(ord(ch) < 32 or ord(ch) == 127 for ch in k):
         raise HTTPException(400, detail=f"非法 key（不允许控制字符）：{key!r}")
+    # 超长 key 会让底层 stat/open 抛 ENAMETOOLONG（历史上表现为 500），统一按参数错误拒绝。
+    if len(k) > 1024:
+        raise HTTPException(400, detail=f"key 过长（最长 1024 字符）：{key[:64]!r}…")
     segs = k.split("/")
     if any(s in ("", "..", ".") for s in segs):
         raise HTTPException(400, detail=f"非法 key：{key!r}")
@@ -294,8 +304,13 @@ def _manifest_save(bucket: str, manifest: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def put_object(bucket: str, key: str, src_path: Path, source_url: str = "",
-               overwrite: bool = True, uploader: str = "") -> dict:
-    """把已落盘的临时文件放入对象存储（流式拷贝，计算 SHA-256，记录元数据）"""
+               overwrite: bool = True, uploader: str = "",
+               move: bool = False) -> dict:
+    """把已落盘的临时文件放入对象存储（流式拷贝，计算 SHA-256，记录元数据）
+
+    move=True 时，算完 SHA-256 后用 `os.replace` 直接搬到最终路径（同一文件系统），
+    避免「临时文件 + 目标文件」两份同时存在的 2× 峰值；跨文件系统时回退流式拷贝。
+    """
     validate_bucket(bucket)
     k = validate_key(key)
     dst = object_path(bucket, k)
@@ -318,8 +333,14 @@ def put_object(bucket: str, key: str, src_path: Path, source_url: str = "",
             h.update(chunk)
             size += len(chunk)
     sha256 = h.hexdigest()
-    # 流式拷贝到最终位置
-    shutil.copyfile(src_path, dst)
+    # 落盘：move=True 走 os.replace（同文件系统零拷贝）；跨文件系统回退流式拷贝
+    if move:
+        try:
+            os.replace(src_path, dst)
+        except OSError:
+            shutil.copyfile(src_path, dst)
+    else:
+        shutil.copyfile(src_path, dst)
     meta = _DEFAULT_META | {
         "size": size,
         "sha256": sha256,
@@ -529,6 +550,8 @@ def _bulk_walk(root_dir: Path, bucket_root: Path, errors: list) -> tuple[list, l
             p = Path(entry.path)
             if p == bucket_root / MANIFEST:
                 continue                  # 保护 bucket 根清单
+            if entry.name == INTERNAL_UPLOAD_DIR and not entry.is_symlink():
+                continue                  # 跳过内部上传会话目录（活跃上传不能被清空）
             try:
                 if entry.is_symlink():
                     files.append((p, entry.stat(follow_symlinks=False).st_size))
@@ -755,11 +778,30 @@ def create_bucket(bucket: str) -> dict:
     return {"bucket": d.name, "created": created}
 
 
+def _rename_collect(src: Path) -> tuple[list[Path], list[Path]]:
+    """收集 rename 源目录下「待迁移文件」与「待删除子目录」（自底向上）。
+
+    跳过 `INTERNAL_UPLOAD_DIR`（.artifactdepot-uploads）：里面有活跃上传会话，
+    既不能搬走也不能删除，否则会毁掉正在进行的上传。
+    """
+    files: list[Path] = []
+    dirs: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(src):
+        dirnames[:] = [n for n in dirnames if n != INTERNAL_UPLOAD_DIR]
+        base = Path(dirpath)
+        if base != src:
+            dirs.append(base)
+        files.extend(base / n for n in filenames)
+    dirs.sort(key=lambda p: len(p.parts), reverse=True)
+    return files, dirs
+
+
 def rename_object(bucket: str, key: str, new_key: str, overwrite: bool = False) -> dict:
     """重命名/移动对象或目录：整体迁移该 key（前缀）下的全部对象与 .keep 占位。
 
     - key 指向文件：仅重命名该对象（清单记录一并迁移）
     - key 指向目录：迁移该前缀下所有对象与隐藏占位，失败整体回滚
+    - 跳过 `.artifactdepot-uploads` 内部上传会话目录（活跃上传不能被搬走）
     - new_key 位于 key 子目录内返回 400；源不存在 404；目标冲突且未 overwrite 时 409
     """
     validate_bucket(bucket)
@@ -780,39 +822,44 @@ def rename_object(bucket: str, key: str, new_key: str, overwrite: bool = False) 
     if not dst.is_relative_to(base):
         raise HTTPException(400, detail="new_key 越界")
 
+    src_dirs: list[Path] = []
     if src.is_file():
         if dst.exists() and not overwrite:
             raise HTTPException(409, detail=f"目标已存在：{bucket}/{nk}")
         moves = [(src, dst)]
     else:
+        files, src_dirs = _rename_collect(src)
         moves = []
-        for path in sorted(src.rglob("*")):
-            if path.is_file():
-                target = base / nk / path.relative_to(src)
-                if target.exists() and not overwrite:
-                    raise HTTPException(
-                        409, detail=f"目标已存在：{bucket}/{target.relative_to(base).as_posix()}")
-                moves.append((path, target))
+        for path in sorted(files):
+            target = base / nk / path.relative_to(src)
+            if target.exists() and not overwrite:
+                raise HTTPException(
+                    409, detail=f"目标已存在：{bucket}/{target.relative_to(base).as_posix()}")
+            moves.append((path, target))
 
     try:
         for path, target in moves:
             target.parent.mkdir(parents=True, exist_ok=True)
             path.rename(target)
         if src.is_dir():
-            for path in sorted(src.rglob("*"), reverse=True):
-                if path.is_dir():
-                    try:
-                        path.rmdir()
-                    except OSError:
-                        raise HTTPException(400, detail="源目录仍非空，已回滚")
+            for path in src_dirs:
+                try:
+                    path.rmdir()
+                except OSError:
+                    raise HTTPException(400, detail="源目录仍非空，已回滚")
             (src / ".keep").unlink(missing_ok=True)
             try:
                 src.rmdir()
             except OSError:
+                # 仍有活跃上传会话（.artifactdepot-uploads）等内部内容：整体回滚，不毁数据
                 raise HTTPException(400, detail="源目录仍非空，已回滚")
     except HTTPException:
         for path, target in moves:
             if target.exists() and not path.exists():
+                try:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                except OSError:
+                    pass
                 target.rename(path)
         raise
 
@@ -1551,20 +1598,41 @@ def query_audit(bucket: str = "", key: str = "", actor: str = "",
 
 # ---------------------------------------------------------------------------
 # 分片上传会话（多线程分片上传）
+#
+# 0.9.0「伴随文件本地化」：上传过程中服务端自动创建的所有文件都与目标文件同目录，
+# 不再写宿主机 /tmp（宿主 /tmp 常是 6.83GiB tmpfs，72GB 上传必然失败）：
+#   目标明确（initiate 带 bucket+key）：
+#       <depot>/<bucket>/<key 父目录>/.artifactdepot-uploads/<upload_id>/
+#   旧客户端（无 bucket/key）：
+#       <staging>/<upload_id>/            # staging = config.upload.staging_dir
+#   会话内部：.session.json / chunk_<i>.part / .incoming/<rand>.tmp / .merged
+#
+# 单进程假设：uvicorn 未开 --workers。进程内 registry 只是加速索引，
+# 磁盘（.session.json + 分片文件）才是唯一事实源，因此服务进程重启后仍可续传。
 # ---------------------------------------------------------------------------
 
-def _chunk_dir() -> Path:
-    return Path(tempfile.gettempdir()) / "dw_chunks"
-
+_INCOMING_DIR = ".incoming"
+_MERGED_NAME = ".merged"
+_LEGACY_CHUNK_DIRNAME = "dw_chunks"
 
 # upload_id 由服务端 secrets.token_urlsafe(16) 生成（22 个 [A-Za-z0-9_-] 字符）。
 # 客户端回传时必须严格匹配该字符集：否则 `Path(base) / "../../x"` 或绝对路径
-# （如 "/"）会逃出 /tmp/dw_chunks，abort 时 shutil.rmtree 可删除任意目录（严重漏洞）。
+# （如 "/"）会逃出会话根，abort 时 shutil.rmtree 可删除任意目录（严重漏洞）。
 _UPLOAD_ID_RE = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
 MAX_TOTAL_CHUNKS = 100000          # total_chunks 上限，避免超大 range 循环 DoS
 MAX_CHUNK_BYTES = 64 * 1024 * 1024       # 单分片上限 64MB（前端分片 8MB，留足余量）
-MAX_SESSION_BYTES = 200 * 1024 ** 3      # max_upload_mb=0 时的会话硬上限 200GB，防 /tmp 写满
+MAX_SESSION_BYTES = 200 * 1024 ** 3      # max_upload_mb=0 时的会话硬上限 200GB，防数据盘写满
 _SESSION_META = ".session.json"
+
+CHUNK_SESSION_TTL = 24 * 3600  # 分片会话绝对有效期（秒）：超过即视为放弃
+CHUNK_SESSION_IDLE_TTL = 6 * 3600  # 代码兜底；实际默认取 config.upload.session_idle_ttl_seconds（24h）
+
+# 进程内会话索引 {upload_id: 会话目录}：
+#   1) 快速定位目标目录会话（避免每请求全树扫描）；
+#   2) 后台清理只看 registry + legacy staging 根，扫描成本不随仓库变大；
+#   3) 跨重启续传：启动时扫描 depot 内 .artifactdepot-uploads 重新注册未过期会话。
+_UPLOAD_REGISTRY: dict[str, Path] = {}
+_UPLOAD_REGISTRY_LOCK = threading.Lock()
 
 
 def _max_chunk_bytes() -> int:
@@ -1578,6 +1646,60 @@ def _max_total_chunks() -> int:
     return min(get_upload_settings()["max_chunks"], MAX_TOTAL_CHUNKS)
 
 
+def _chunk_dir() -> Path:
+    """legacy 分片会话根目录（无 bucket/key 的旧客户端）：`<staging>/`。
+
+    0.9.0 起不再是 `/tmp/dw_chunks`（不再写宿主机临时目录）。
+    """
+    return get_staging_dir()
+
+
+def ensure_staging_dir() -> Path:
+    """创建并返回 staging 目录（lifespan 启动时调用；同时用于 tempfile.tempdir）。"""
+    d = get_staging_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+# --- 会话 registry ---------------------------------------------------------
+
+def _registry_put(upload_id: str, d: Path) -> None:
+    with _UPLOAD_REGISTRY_LOCK:
+        _UPLOAD_REGISTRY[upload_id] = d
+
+
+def _registry_get(upload_id: str) -> Path | None:
+    with _UPLOAD_REGISTRY_LOCK:
+        return _UPLOAD_REGISTRY.get(upload_id)
+
+
+def _registry_drop(upload_id: str) -> None:
+    with _UPLOAD_REGISTRY_LOCK:
+        _UPLOAD_REGISTRY.pop(upload_id, None)
+
+
+def _registry_drop_path(d: Path) -> None:
+    """按会话目录反查并移除 registry 条目（删除会话后调用）。"""
+    with _UPLOAD_REGISTRY_LOCK:
+        for uid, p in list(_UPLOAD_REGISTRY.items()):
+            if p == d:
+                _UPLOAD_REGISTRY.pop(uid, None)
+
+
+def registered_upload_sessions() -> dict:
+    """当前进程 registry 快照（测试/排查用；不要用于业务判断）。"""
+    with _UPLOAD_REGISTRY_LOCK:
+        return dict(_UPLOAD_REGISTRY)
+
+
+def clear_upload_registry() -> None:
+    """清空 registry（lifespan 启动重新扫描前调用；测试隔离用）。"""
+    with _UPLOAD_REGISTRY_LOCK:
+        _UPLOAD_REGISTRY.clear()
+
+
+# --- 路径解析 --------------------------------------------------------------
+
 def _validate_upload_id(upload_id: str) -> str:
     uid = (upload_id or "").strip()
     if not _UPLOAD_ID_RE.match(uid):
@@ -1586,7 +1708,7 @@ def _validate_upload_id(upload_id: str) -> str:
 
 
 def _chunk_session_path(upload_id: str) -> Path:
-    """分片会话目录；严格校验 upload_id，并二次确认解析结果落在会话根内。"""
+    """legacy 分片会话目录（staging/<upload_id>）；严格校验 upload_id，二次确认落在会话根内。"""
     uid = _validate_upload_id(upload_id)
     base = _chunk_dir().resolve()
     d = (base / uid).resolve()
@@ -1595,17 +1717,37 @@ def _chunk_session_path(upload_id: str) -> Path:
     return d
 
 
-def _chunk_part_path(upload_id: str, index: int) -> Path:
-    return _chunk_session_path(upload_id) / f"chunk_{index}.part"
+def chunk_session_dir(upload_id: str):
+    """解析会话目录：registry（目标目录会话）→ legacy staging 根；不存在返回 None。"""
+    uid = _validate_upload_id(upload_id)
+    d = _registry_get(uid)
+    if d is not None and d.is_dir():
+        return d
+    legacy = _chunk_dir() / uid
+    if legacy.is_dir():
+        return legacy
+    return None
 
 
-def _session_meta_path(upload_id: str) -> Path:
-    return _chunk_session_path(upload_id) / _SESSION_META
+def _session_meta_path(d: Path) -> Path:
+    return d / _SESSION_META
 
 
-def _write_session_meta(upload_id: str, meta: dict) -> None:
+def _read_meta_dir(d: Path) -> dict:
+    """读取会话目录的 .session.json；缺失/损坏返回 {}。"""
+    p = _session_meta_path(d)
+    if not p.is_file():
+        return {}
     try:
-        _atomic_write_text(_session_meta_path(upload_id),
+        val = json.loads(p.read_text(encoding="utf-8"))
+        return val if isinstance(val, dict) else {}
+    except Exception:
+        return {}
+
+
+def _write_meta_dir(d: Path, meta: dict) -> None:
+    try:
+        _atomic_write_text(_session_meta_path(d),
                            json.dumps(meta, ensure_ascii=False), mode=0o600)
     except OSError:
         pass
@@ -1613,19 +1755,10 @@ def _write_session_meta(upload_id: str, meta: dict) -> None:
 
 def _load_chunk_session(upload_id: str):
     """返回 (会话目录, 元数据)；目录不存在返回 (None, {})。会校验 upload_id 合法性。"""
-    d = _chunk_session_path(upload_id)
-    if not d.is_dir():
+    d = chunk_session_dir(upload_id)
+    if d is None:
         return None, {}
-    meta = {}
-    p = d / _SESSION_META
-    if p.is_file():
-        try:
-            val = json.loads(p.read_text(encoding="utf-8"))
-            if isinstance(val, dict):
-                meta = val
-        except Exception:
-            meta = {}
-    return d, meta
+    return d, _read_meta_dir(d)
 
 
 def get_chunk_session(upload_id: str) -> dict:
@@ -1647,85 +1780,310 @@ def _assert_session_access(upload_id: str, actor: str = "", is_admin: bool = Fal
     return d, meta
 
 
-def create_chunk_session(owner: str = "") -> str:
+def session_uploaded(d: Path, total_chunks: int = 0) -> tuple[list[int], int]:
+    """扫描磁盘上真实存在的分片：返回 (升序索引列表, 真实字节数)。
+
+    total_chunks > 0 时只统计 `< total_chunks` 的分片（防止历史脏文件混入续传列表）。
+    """
+    uploaded: list[int] = []
+    received = 0
+    try:
+        entries = list(d.glob("chunk_*.part"))
+    except OSError:
+        return [], 0
+    for p in entries:
+        m = re.fullmatch(r"chunk_(\d+)\.part", p.name)
+        if not m:
+            continue
+        idx = int(m.group(1))
+        if total_chunks and idx >= total_chunks:
+            continue
+        try:
+            received += p.stat().st_size
+        except OSError:
+            continue
+        uploaded.append(idx)
+    uploaded.sort()
+    return uploaded, received
+
+
+def _staging_kind(d: Path, meta: dict) -> str:
+    kind = str(meta.get("staging") or "").strip()
+    if kind in ("target", "legacy"):
+        return kind
+    return "target" if INTERNAL_UPLOAD_DIR in d.parts else "legacy"
+
+
+def session_info(upload_id: str) -> dict:
+    """会话续传信息（供 initiate 响应使用；不包含服务端绝对路径）。"""
+    d, meta = _load_chunk_session(upload_id)
+    if d is None:
+        raise HTTPException(400, detail=f"无效或已失效的分片会话：{upload_id}")
+    chunk_size = int(meta.get("chunk_size") or 0)
+    if chunk_size <= 0:
+        chunk_size = get_upload_settings()["chunk_size_mb"] * 1024 * 1024
+    total = int(meta.get("total_chunks") or 0)
+    uploaded, received = session_uploaded(d, total)
+    return {
+        "upload_id": upload_id,
+        "meta": meta,
+        "dir": d,
+        "uploaded": uploaded,
+        "received_bytes": received,
+        "total_chunks": total,
+        "size": int(meta.get("size") or 0),
+        "chunk_size": chunk_size,
+        "staging": _staging_kind(d, meta),
+    }
+
+
+# --- 创建 / 续传 -----------------------------------------------------------
+
+def create_chunk_session(owner: str = "", bucket: str = "", key: str = "",
+                         size: int = 0) -> str:
     """创建分片上传会话，返回 upload_id；会话绑定创建者，避免被他人接管。
 
-    顺手清理过期会话：客户端 abort 前崩溃/关页会残留 /tmp/dw_chunks/<id>，
-    无 TTL 就永久堆积占满磁盘；这里把 mtime 超过 CHUNK_SESSION_TTL 的旧会话删掉。"""
+    - 提供 bucket+key：会话落在目标文件父目录 `.artifactdepot-uploads/<upload_id>/`
+      （伴随文件本地化；父目录不存在则创建，父路径是文件等失败映射 409）；
+    - 都不提供：legacy 会话落在 `<staging>/<upload_id>/`（旧客户端兼容）。
+
+    顺手清理过期会话：只看 registry + legacy staging 根，不做全树扫描。
+    """
+    bucket = (bucket or "").strip()
+    key = (key or "").strip()
+    if bool(bucket) != bool(key):
+        raise HTTPException(400, detail="bucket 与 key 必须同时提供")
+    size = max(0, int(size or 0))
+    settings = get_upload_settings()
+    chunk_size = settings["chunk_size_mb"] * 1024 * 1024
+    total_chunks = (size + chunk_size - 1) // chunk_size if size > 0 else 0
+    if bucket:
+        target = object_path(bucket, key)
+        parent = target.parent
+        try:
+            parent.mkdir(parents=True, exist_ok=True)
+        except (FileExistsError, NotADirectoryError, OSError) as e:
+            raise HTTPException(
+                409, detail=f"父路径不是目录，无法创建上传会话：{bucket}/{key}") from e
+        root = parent / INTERNAL_UPLOAD_DIR
+        staging_kind = "target"
+    else:
+        root = _chunk_dir()
+        staging_kind = "legacy"
     upload_id = secrets.token_urlsafe(16)
-    d = _chunk_session_path(upload_id)
-    d.mkdir(parents=True, exist_ok=True)
-    _write_session_meta(upload_id, {
+    d = root / upload_id
+    try:
+        d.mkdir(parents=True, exist_ok=False)
+    except OSError as e:
+        raise HTTPException(
+            409, detail="无法创建上传会话目录（磁盘不可写或路径冲突）") from e
+    now = _utc_now_iso()
+    _write_meta_dir(d, {
         "owner": (owner or "").strip(),
-        "created_at": _utc_now_iso(),
+        "created_at": now,
+        "updated_at": now,
         "received_bytes": 0,
+        "bucket": bucket,
+        "key": key,
+        "size": size,
+        "chunk_size": chunk_size,
+        "total_chunks": total_chunks,
+        "staging": staging_kind,
     })
-    cleanup_stale_chunk_sessions(get_upload_settings()["session_idle_ttl_seconds"])
-    cleanup_expired_chunk_sessions(get_upload_settings()["session_ttl_seconds"])
+    _registry_put(upload_id, d)
+    # 同步清理（新建会话时顺手做）：registry + legacy staging 根，成本与本仓库无关
+    cleanup_stale_chunk_sessions(settings["session_idle_ttl_seconds"])
+    cleanup_expired_chunk_sessions(settings["session_ttl_seconds"])
     return upload_id
 
 
-CHUNK_SESSION_TTL = 24 * 3600  # 分片会话绝对有效期（秒）：超过即视为放弃
-CHUNK_SESSION_IDLE_TTL = 6 * 3600  # 代码兜底；实际默认取 config.upload.session_idle_ttl_seconds（24h）
+def _metadata_ts(meta: dict) -> float:
+    """会话 meta 的 updated_at/created_at → epoch 秒；解析失败返回 0。"""
+    for key in ("updated_at", "created_at"):
+        ts = _parse_ts(meta.get(key, ""))
+        if ts is not None:
+            return ts.timestamp()
+    return 0.0
+
+
+def find_resumable_session(owner: str, bucket: str, key: str, size: int = 0,
+                           is_admin: bool = False):
+    """在目标目录 `.artifactdepot-uploads` 里找 owner+bucket/key(+size) 匹配的最新会话。
+
+    找不到返回 None（initiate 会新建会话，响应 resumed=false）。
+    命中后会重新注册进 registry（支持服务重启后第一次 resume）。
+    """
+    target = object_path(bucket, key)
+    root = target.parent / INTERNAL_UPLOAD_DIR
+    if not root.is_dir():
+        return None
+    best_id = None
+    best_ts = -1.0
+    for d in root.iterdir():
+        if not d.is_dir() or d.is_symlink():
+            continue
+        if not _UPLOAD_ID_RE.match(d.name):
+            continue
+        meta = _read_meta_dir(d)
+        if _staging_kind(d, meta) != "target":
+            continue
+        if (meta.get("bucket") or "") != bucket or (meta.get("key") or "") != key:
+            continue
+        m_owner = (meta.get("owner") or "").strip()
+        if m_owner and not is_admin and (owner or "").strip() != m_owner:
+            continue
+        if size and int(meta.get("size") or 0) != int(size):
+            continue
+        try:
+            ts = max(_metadata_ts(meta), d.stat().st_mtime)
+        except OSError:
+            continue
+        if ts > best_ts:
+            best_ts = ts
+            best_id = d.name
+    if best_id is None:
+        return None
+    _registry_put(best_id, root / best_id)
+    return best_id
+
+
+def validate_resume_session(upload_id: str, owner: str = "", bucket: str = "",
+                            key: str = "", size: int = 0,
+                            is_admin: bool = False) -> dict:
+    """校验并返回可复用的会话续传信息（initiate resume=true + upload_id）。
+
+    失效/参数不一致 → HTTP 400 且 detail 含「分片会话」（客户端按会话丢失处理，重新上传）；
+    会话属于他人 → 403（admin 例外）。legacy 会话缺 bucket/key/size 时按本次请求补齐 meta。
+    """
+    uid = (upload_id or "").strip()
+    if not _UPLOAD_ID_RE.match(uid):
+        raise HTTPException(400, detail=f"无效或已失效的分片会话：{uid}")
+    d = chunk_session_dir(uid)
+    if d is None:
+        raise HTTPException(400, detail=f"无效或已失效的分片会话：{uid}")
+    meta = _read_meta_dir(d)
+    m_owner = (meta.get("owner") or "").strip()
+    if m_owner and not is_admin and (owner or "").strip() != m_owner:
+        raise HTTPException(403, detail="无权访问该分片会话")
+    changed = False
+    bucket = (bucket or "").strip()
+    key = (key or "").strip()
+    if bucket or key:
+        m_bucket = (meta.get("bucket") or "").strip()
+        m_key = (meta.get("key") or "").strip()
+        if (m_bucket and m_bucket != bucket) or (m_key and m_key != key):
+            raise HTTPException(
+                400, detail=f"分片会话参数不一致（bucket/key）：{uid}")
+        if not m_bucket:
+            meta["bucket"], meta["key"] = bucket, key
+            changed = True
+    if size:
+        m_size = int(meta.get("size") or 0)
+        if m_size and m_size != int(size):
+            raise HTTPException(400, detail=f"分片会话参数不一致（size）：{uid}")
+        if not m_size:
+            settings = get_upload_settings()
+            chunk_size = int(meta.get("chunk_size") or 0) or (
+                settings["chunk_size_mb"] * 1024 * 1024)
+            meta["size"] = int(size)
+            meta["chunk_size"] = chunk_size
+            meta["total_chunks"] = (int(size) + chunk_size - 1) // chunk_size
+            changed = True
+    if changed:
+        meta["updated_at"] = _utc_now_iso()
+        _write_meta_dir(d, meta)
+        _registry_put(uid, d)
+    return session_info(uid)
+
+
+# --- 清理 / 生命周期 -------------------------------------------------------
+
+def _remove_session_dir(d: Path) -> None:
+    """删除会话目录 + registry 条目；若 `.artifactdepot-uploads` 因此变空则 rmdir（失败忽略）。"""
+    shutil.rmtree(d, ignore_errors=True)
+    _registry_drop_path(d)
+    if d.parent.name == INTERNAL_UPLOAD_DIR:
+        try:
+            d.parent.rmdir()
+        except OSError:
+            pass
+
+
+def _iter_live_sessions():
+    """遍历 registry 中的目标会话 + legacy staging 根下的会话目录（去重）。
+
+    只做 O(会话数) 的遍历，不递归扫描整个 depot，因此后台清理成本与仓库大小无关。
+    """
+    seen: set[Path] = set()
+    with _UPLOAD_REGISTRY_LOCK:
+        items = list(_UPLOAD_REGISTRY.items())
+    for uid, d in items:
+        if d.is_dir():
+            seen.add(d)
+            yield d
+        else:
+            _registry_drop(uid)       # 磁盘上已被删除（正常 complete/abort）：清掉陈旧索引
+    root = _chunk_dir()
+    if not root.is_dir():
+        return
+    try:
+        children = list(root.iterdir())
+    except OSError:
+        return
+    for d in children:
+        if d in seen or not d.is_dir() or d.is_symlink():
+            continue
+        # staging 根可能被配置到已有目录：只认 upload_id 形态的子目录，
+        # 绝不碰用户自己的其他目录（防御误配置导致误删）。
+        if not _UPLOAD_ID_RE.match(d.name):
+            continue
+        yield d
 
 
 def cleanup_stale_chunk_sessions(ttl_seconds=None) -> int:
-    """删除过期分片会话目录（目录 mtime 超过 TTL），返回删除数
+    """删除空闲超时的分片会话（会话目录 mtime 超过 TTL），返回删除数。
 
     - 默认 `CHUNK_SESSION_TTL`（24h，可由 config.upload.session_ttl_seconds 覆盖）；
     - 传 `CHUNK_SESSION_IDLE_TTL`（代码兜底 6h；实际默认取
       `config.upload.session_idle_ttl_seconds`，默认 24h 且不小于请求超时）：
       供后台任务定期清理浏览器被杀/断网后没有后续请求的会话。
     活跃上传每写一个分片都会更新会话目录 mtime，因此不会误删正在上传的会话。
+    只遍历 registry + legacy staging 根，不扫描整个 depot。
     """
     if ttl_seconds is None:
         ttl_seconds = get_upload_settings()["session_ttl_seconds"]
     ttl = int(ttl_seconds)
-    root = _chunk_dir()
-    if not root.exists():
-        return 0
     now = time.time()
     removed = 0
-    for d in root.iterdir():
-        if not d.is_dir() or d.is_symlink():
+    for d in list(_iter_live_sessions()):
+        if d.is_symlink():
             continue
         try:
             if now - d.stat().st_mtime < ttl:
                 continue
         except OSError:
             continue
-        shutil.rmtree(d, ignore_errors=True)
+        _remove_session_dir(d)
         removed += 1
     return removed
 
 
 def cleanup_expired_chunk_sessions(ttl_seconds=None) -> int:
-    """删除超过绝对有效期的分片会话（按 .session.json 的 created_at）。
+    """删除超过绝对有效期的分片会话（按 .session.json 的 created_at），返回删除数。
 
-    `cleanup_stale_chunk_sessions()` 按目录 mtime 清理“多久没写入”，用于空闲兜底；
+    `cleanup_stale_chunk_sessions()` 按会话目录 mtime 清理“多久没写入”，用于空闲兜底；
     本函数按会话创建时间清理“总寿命”，即使客户端一直有分片写入，也不能超过
     config.upload.session_ttl_seconds。两者职责不同，启动/新建/后台任务都会同时执行。
     """
     if ttl_seconds is None:
         ttl_seconds = get_upload_settings()["session_ttl_seconds"]
     ttl = int(ttl_seconds)
-    root = _chunk_dir()
-    if not root.exists():
-        return 0
     now = time.time()
     removed = 0
-    for d in root.iterdir():
-        if not d.is_dir() or d.is_symlink():
+    for d in list(_iter_live_sessions()):
+        if d.is_symlink():
             continue
-        meta = {}
-        try:
-            p = d / _SESSION_META
-            if p.is_file():
-                val = json.loads(p.read_text(encoding="utf-8"))
-                if isinstance(val, dict):
-                    meta = val
-        except Exception:
-            meta = {}
+        meta = _read_meta_dir(d)
         created = _parse_ts(meta.get("created_at", ""))
         try:
             created_ts = created.timestamp() if created is not None else d.stat().st_mtime
@@ -1733,30 +2091,129 @@ def cleanup_expired_chunk_sessions(ttl_seconds=None) -> int:
                 continue
         except (OSError, ValueError, OverflowError):
             continue
-        shutil.rmtree(d, ignore_errors=True)
+        _remove_session_dir(d)
         removed += 1
     return removed
 
 
 def cleanup_all_chunk_sessions() -> int:
-    """删除全部分片会话目录（服务启动时调用）。
+    """删除 legacy staging 根下全部分片会话目录（服务启动时调用）。
 
-    容器/进程重启时不可能还有活跃上传，上一次进程留下的
-    ``/tmp/dw_chunks/<upload_id>`` 可能占几十 GB（浏览器被杀、容器重启等），
-    在这里一次性释放；正常上传的成功/失败路径由 finalize/abort 负责清理。
-    返回删除的会话数。
+    0.9.0 起目标目录会话在数据盘上会保留（支持跨重启续传），由
+    `scan_upload_sessions()` 按 TTL 清理/注册；本函数只处理旧式 `<staging>/<id>`
+    （无 bucket/key 的旧客户端，语义等价旧版启动清理）。返回删除的会话数。
     """
     root = _chunk_dir()
-    if not root.exists():
+    if not root.is_dir():
         return 0
     removed = 0
-    for d in root.iterdir():
+    try:
+        children = list(root.iterdir())
+    except OSError:
+        return 0
+    for d in children:
         if not d.is_dir() or d.is_symlink():
             continue
-        shutil.rmtree(d, ignore_errors=True)
+        # 只删 upload_id 形态的会话目录：staging 根若被误配到已有目录，
+        # 也不能连带删掉用户自己的其他子目录。
+        if not _UPLOAD_ID_RE.match(d.name):
+            continue
+        _remove_session_dir(d)
         removed += 1
     return removed
 
+
+def cleanup_legacy_tmp_chunk_sessions(system_tempdir=None) -> int:
+    """清理旧版 `<系统临时目录>/dw_chunks` 残留（此前版本把分片写进 /tmp）。
+
+    必须在把 `tempfile.tempdir` 指向 staging **之前**调用（否则 gettempdir() 已变成
+    staging，会指向错误位置）。系统临时目录可由调用方显式传入，便于测试隔离。
+    """
+    base = Path(system_tempdir) if system_tempdir is not None else Path(tempfile.gettempdir())
+    root = base / _LEGACY_CHUNK_DIRNAME
+    if not root.is_dir() or root.is_symlink():
+        return 0
+    removed = 0
+    try:
+        children = list(root.iterdir())
+    except OSError:
+        return 0
+    for d in children:
+        if not d.is_dir() or d.is_symlink():
+            continue
+        if not _UPLOAD_ID_RE.match(d.name):
+            continue                  # 只清服务端生成的会话目录，不碰用户自建目录
+        shutil.rmtree(d, ignore_errors=True)
+        removed += 1
+    try:
+        root.rmdir()                  # 清空后顺手删掉旧目录本身
+    except OSError:
+        pass
+    return removed
+
+
+def scan_upload_sessions(session_ttl_seconds=None, idle_ttl_seconds=None) -> dict:
+    """启动时扫描 depot 内 `.artifactdepot-uploads`：清理过期会话，其余注册进 registry。
+
+    这样服务重启后（会话在数据盘不会丢）客户端仍可继续上传；同时把已超 TTL 的
+    历史会话清掉。只在启动执行一次全树扫描，后台清理只看 registry。
+    返回 {"registered": N, "removed": M}。
+    """
+    if session_ttl_seconds is None or idle_ttl_seconds is None:
+        settings = get_upload_settings()
+        session_ttl_seconds = (session_ttl_seconds
+                               if session_ttl_seconds is not None
+                               else settings["session_ttl_seconds"])
+        idle_ttl_seconds = (idle_ttl_seconds
+                            if idle_ttl_seconds is not None
+                            else settings["session_idle_ttl_seconds"])
+    abs_ttl = int(session_ttl_seconds)
+    idle_ttl = int(idle_ttl_seconds)
+    registered = removed = 0
+    clear_upload_registry()
+    try:
+        root = get_root().resolve()
+    except OSError:
+        return {"registered": 0, "removed": 0}
+    if not root.is_dir():
+        return {"registered": 0, "removed": 0}
+    now = time.time()
+    for dirpath, dirnames, _filenames in os.walk(root):
+        # 隐藏目录（.staging/.git/.artifactdepot-uploads 自身等）不递归：会话一定在可见路径下
+        dirnames[:] = [n for n in dirnames if not n.startswith(".")]
+        internal = Path(dirpath) / INTERNAL_UPLOAD_DIR
+        if not internal.is_dir():
+            continue
+        try:
+            children = list(internal.iterdir())
+        except OSError:
+            continue
+        for d in children:
+            if not d.is_dir() or d.is_symlink():
+                continue
+            if not _UPLOAD_ID_RE.match(d.name):
+                continue
+            meta = _read_meta_dir(d)
+            created = _parse_ts(meta.get("created_at", ""))
+            try:
+                mtime = d.stat().st_mtime
+            except OSError:
+                continue
+            created_ts = created.timestamp() if created is not None else mtime
+            if now - created_ts >= abs_ttl or now - mtime >= idle_ttl:
+                shutil.rmtree(d, ignore_errors=True)
+                removed += 1
+                continue
+            _registry_put(d.name, d)
+            registered += 1
+        try:
+            internal.rmdir()          # 会话清空后删除 .artifactdepot-uploads
+        except OSError:
+            pass
+    return {"registered": registered, "removed": removed}
+
+
+# --- 分片写入 / 合并 -------------------------------------------------------
 
 def _session_size_limit() -> int:
     """会话总大小上限：优先 max_upload_mb；否则 config.upload.max_session_gb（≤200GB 兜底）。"""
@@ -1767,12 +2224,30 @@ def _session_size_limit() -> int:
     return min(cfg_bytes, MAX_SESSION_BYTES)
 
 
+def open_session_incoming(upload_id: str, actor: str = "", is_admin: bool = False) -> Path:
+    """校验会话归属并返回 `.incoming` 目录（请求体临时文件落在这里，同文件系统）。"""
+    d, _meta = _assert_session_access(upload_id, actor, is_admin)
+    incoming = d / _INCOMING_DIR
+    try:
+        incoming.mkdir(exist_ok=True)
+    except OSError as e:
+        raise HTTPException(500, detail="无法创建分片临时目录（磁盘不可写）") from e
+    return incoming
+
+
+def _part_path(d: Path, index: int) -> Path:
+    return d / f"chunk_{index}.part"
+
+
 def store_chunk(upload_id: str, index: int, src_path: Path,
                 actor: str = "", is_admin: bool = False) -> dict:
     """保存一个分片（src_path 是已落盘临时文件）到会话目录。
 
-    在 state_lock 内完成「配额校验 + 落盘 + 更新 received_bytes」，避免并发分片
-    绕过 max_upload_mb、或把 /tmp 写满。
+    - 请求体临时文件在会话 `.incoming/` 时，直接 `os.replace` 到 `chunk_<i>.part`
+      （同文件系统，省一次拷贝；这也是 72GB 上传不写 /tmp 的关键）；
+    - 其余来源（旧调用/测试）走「拷贝到 .part.tmp + rename」；
+    - 在 state_lock 内完成「配额校验 + 落盘 + 更新 received_bytes」，避免并发分片
+      绕过 max_upload_mb、或把数据盘写满。
     """
     size = src_path.stat().st_size
     max_chunk = _max_chunk_bytes()
@@ -1780,47 +2255,66 @@ def store_chunk(upload_id: str, index: int, src_path: Path,
         raise HTTPException(413,
             detail=f"单个分片超过上限 {max_chunk // (1024 * 1024)}MB")
     with state_lock():
-        _d, meta = _assert_session_access(upload_id, actor, is_admin)
+        d, meta = _assert_session_access(upload_id, actor, is_admin)
         if not isinstance(index, int) or index < 0 or index >= _max_total_chunks():
             raise HTTPException(400, detail=f"非法分片索引：{index}")
-        part = _chunk_part_path(upload_id, index)
+        part = _part_path(d, index)
         old_size = part.stat().st_size if part.exists() else 0
         total = int(meta.get("received_bytes") or 0)
         limit = _session_size_limit()
         if total - old_size + size > limit:
             raise HTTPException(413,
                 detail=f"超过单文件上传上限 {limit // (1024 * 1024)}MB")
-        # 原子写入；失败时清理 .part.tmp，避免分片写失败留下残片
-        tmp = part.with_suffix(".part.tmp")
+        incoming = (d / _INCOMING_DIR).resolve()
         try:
-            shutil.copyfile(src_path, tmp)
-            tmp.rename(part)
-        except BaseException:
+            same_fs = src_path.resolve().parent == incoming
+        except OSError:
+            same_fs = False
+        if same_fs:
+            # 同一会话 .incoming 内：直接原子改名，0 额外拷贝
             try:
-                tmp.unlink(missing_ok=True)
+                os.replace(src_path, part)
+                moved = True
             except OSError:
-                pass
-            raise
+                moved = False
+        else:
+            moved = False
+        if not moved:
+            # 原子写入（copy → .part.tmp → os.replace）；失败时清理残片
+            tmp = part.with_suffix(".part.tmp")
+            try:
+                shutil.copyfile(src_path, tmp)
+                os.replace(tmp, part)
+            except BaseException:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise
         meta["received_bytes"] = total - old_size + size
-        _write_session_meta(upload_id, meta)
+        if int(meta.get("total_chunks") or 0) and index >= int(meta["total_chunks"]):
+            # 分片索引超出会话声明范围：宽容接受但扩一下 total_chunks，避免续传漏算
+            meta["total_chunks"] = index + 1
+        meta["updated_at"] = _utc_now_iso()
+        _write_meta_dir(d, meta)
     return {"upload_id": upload_id, "index": index, "size": size}
 
 
-def _sum_chunk_sizes(upload_id: str, total_chunks: int) -> int:
+def _sum_chunk_sizes(d: Path, total_chunks: int) -> int:
     total = 0
     for i in range(total_chunks):
-        p = _chunk_part_path(upload_id, i)
+        p = _part_path(d, i)
         if not p.exists():
             raise HTTPException(400, detail=f"缺少分片：{i}")
         total += p.stat().st_size
     return total
 
 
-def _merge_chunks(upload_id: str, total_chunks: int, out_path: Path) -> None:
+def _merge_chunks(d: Path, total_chunks: int, out_path: Path) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "wb") as out:
         for i in range(total_chunks):
-            part = _chunk_part_path(upload_id, i)
+            part = _part_path(d, i)
             with open(part, "rb") as f:
                 while chunk := f.read(1024 * 1024):
                     out.write(chunk)
@@ -1832,10 +2326,12 @@ def finalize_chunk_upload(upload_id: str, bucket: str, key: str, total_chunks: i
                           actor: str = "", is_admin: bool = False) -> dict:
     """合并分片并写入仓库；成功或硬失败时清理本次会话。
 
+    - 合并临时文件 `.merged` 写在会话目录内（与目标文件同盘），`put_object(move=True)`
+      算完 SHA-256 后 `os.replace` 原子落盘：写放大从 3×（临时+拷贝）降到 ~1×；
     - 校验类失败（缺片 / total_chunks 越界 / 超出 max_upload_mb / 权限 / 409 冲突）
       **保留会话**，允许补齐分片或调整参数后重试/续传；
     - 进入合并、sha256、put_object 落盘阶段后的硬失败（磁盘满、I/O 异常、未知异常）
-      以及成功，**清理**本次会话与合并临时文件，避免 72GB 级残留长期占 /tmp。
+      以及成功，**清理**本次会话与合并临时文件，避免几十 GB 级残留长期占盘。
     """
     d, _meta = _assert_session_access(upload_id, actor, is_admin)
     max_chunks = _max_total_chunks()
@@ -1844,23 +2340,22 @@ def finalize_chunk_upload(upload_id: str, bucket: str, key: str, total_chunks: i
             detail=f"total_chunks 必须在 1-{max_chunks} 之间")
     # 检查分片齐全
     for i in range(total_chunks):
-        if not _chunk_part_path(upload_id, i).exists():
+        if not _part_path(d, i).exists():
             raise HTTPException(400, detail=f"分片 {i} 缺失")
     # 容量检查
     max_mb = get_config().get("max_upload_mb", 0) or 0
-    total_size = _sum_chunk_sizes(upload_id, total_chunks)
+    total_size = _sum_chunk_sizes(d, total_chunks)
     if max_mb and total_size > max_mb * 1024 * 1024:
         raise HTTPException(413, detail=f"超过单文件上传上限 {max_mb}MB")
 
-    merged = None
+    merged = d / _MERGED_NAME
     keep_session = False
     try:
-        # 合并到临时文件（失败属于硬失败，finally 会清理）
-        with tempfile.NamedTemporaryFile(delete=False) as tmp:
-            merged = Path(tmp.name)
-        _merge_chunks(upload_id, total_chunks, merged)
+        # 合并到会话目录内的 .merged（同一文件系统，失败属于硬失败，finally 会清理）
+        _merge_chunks(d, total_chunks, merged)
         try:
-            return put_object(bucket, key, merged, source_url, overwrite, uploader=uploader)
+            return put_object(bucket, key, merged, source_url, overwrite,
+                              uploader=uploader, move=True)
         except HTTPException as e:
             # overwrite=false 且目标已存在：可改参数重试，保留分片会话；
             # 目标本身是目录属于不可恢复冲突，清理会话（避免残留分片）。
@@ -1868,17 +2363,19 @@ def finalize_chunk_upload(upload_id: str, bucket: str, key: str, total_chunks: i
                 keep_session = True
             raise
     finally:
-        if merged is not None:
+        try:
             merged.unlink(missing_ok=True)
+        except OSError:
+            pass
         if not keep_session:
-            shutil.rmtree(d, ignore_errors=True)
+            _remove_session_dir(d)
 
 
 def abort_chunk_session(upload_id: str, actor: str = "", is_admin: bool = False) -> dict:
     """取消分片会话：校验 upload_id 合法性与归属后删除会话目录（幂等）。"""
-    d, _ = _load_chunk_session(upload_id)   # 非法 upload_id 直接 400
+    d = chunk_session_dir(upload_id)   # 非法 upload_id 直接 400
     if d is None:
         return {"aborted": upload_id, "existed": False}
     _assert_session_access(upload_id, actor, is_admin)
-    shutil.rmtree(d, ignore_errors=True)
+    _remove_session_dir(d)
     return {"aborted": upload_id, "existed": True}

@@ -8,6 +8,7 @@
 """
 import json
 import os
+import shutil
 import stat
 import sys
 from pathlib import Path
@@ -80,7 +81,9 @@ def test_n2_health_ready_not_writable(ctx):
 
 def test_n2_health_ready_missing(ctx):
     c, depot, cfg, config = ctx
-    depot.rmdir()
+    # 0.9.0 起 depot 根有内部 .staging（伴随文件本地化），不能再用 rmdir；
+    # 断言语义不变：整个 depot 目录被删除后 /health/ready 必须 503。
+    shutil.rmtree(depot)
     assert c.get("/health/ready").status_code == 503
 
 

@@ -6,12 +6,16 @@
 
 覆盖：
   1. 大文件（> 分块大小）并发下载：SHA-256 一致、进度多次回调且最终 done == total、
-     .part 已清理；
-  2. 小文件（< 分块大小）回退单流也能成功；
+     .part 与下载断点状态文件均已清理；
+  2. 小文件（< 分块大小）回退单流也能成功（不产生断点状态）；
   3. concurrency=1 时强制单流（不再发 Range 请求）；
-  4. 取消：首个进度回调后置位 cancel，抛 Cancelled 且清理 .part；
+  4. 取消：首个进度回调后置位 cancel，抛 Cancelled 且清理 .part 与断点状态；
   5. 对象不存在：HEAD 探测 / 下载返回 ApiError(404)；
-  6. 服务端 audit.log 出现 >= 2 条 extra.partial 的 download 记录（证明确实多 Range）。
+  6. 服务端 audit.log 出现 >= 2 条 extra.partial 的 download 记录（证明确实多 Range）；
+  7. 目录下载（download-bulk ZIP）保持单流；
+  8. 断点续传：已有 .part + `.<目标名>.artifactdepot-download.json` 时只请求缺失分片；
+  9. 网络失败保留 .part + 断点状态，恢复后只补缺失分片且内容一致；
+  10. size/ETag 与断点状态不一致时丢弃 .part 从头下载。
 
 隔离：服务端使用临时 config.json / depot / meta，access_token=admin-test，
 ARTIFACT_DEPOT_CONFIG / ARTIFACT_DEPOT_ENV 指向临时文件，不读取仓库真实 .env；
@@ -322,6 +326,8 @@ def test_parallel_download_big_file(server, tmp_path):
     assert snapshot[-1] == (server.big_size, server.big_size)
     assert all(total == server.big_size for _, total in snapshot)
     assert not (dest_dir / "parallel.bin.part").exists()
+    # 伴随状态文件：成功后必须删除（不留残余）
+    assert not core.download_state_path(saved).exists(), "成功后应删除下载断点状态文件"
 
 
 # ---------------------------------------------------------------------------
@@ -390,6 +396,8 @@ def test_cancel_stops_and_cleans_part(server, tmp_path):
 
     assert not (dest_dir / "parallel.bin").exists()
     assert not (dest_dir / "parallel.bin.part").exists()
+    # 取消（用户主动放弃）应同时删除伴随断点状态
+    assert not core.download_state_path(dest_dir / "parallel.bin").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -486,6 +494,141 @@ def test_sha256_etag_mismatch_reports_and_cleans_part(tmp_path, monkeypatch):
     assert "校验" in str(excinfo.value)
     assert not target.exists()
     assert not (tmp_path / "verify.bin.part").exists()
+
+
+# ---------------------------------------------------------------------------
+# 10. 断点续传：已有 .part + 下载断点状态时只补缺失分片
+# ---------------------------------------------------------------------------
+
+def _range_chunks(requested: list, chunk_size: int) -> list:
+    """把请求的 Range 头换算成分片索引（按 chunk_size 对齐）。"""
+    out = []
+    for value in requested:
+        match = re.match(r"bytes=(\d+)-", value or "")
+        assert match, f"缺少 Range 头：{value!r}"
+        out.append(int(match.group(1)) // chunk_size)
+    return sorted(out)
+
+
+def _write_download_state(path: Path, size: int, etag: str, chunk_size: int,
+                          done) -> None:
+    """写测试用下载断点状态（格式与客户端一致）。"""
+    path.write_text(json.dumps({
+        "version": core.DOWNLOAD_STATE_VERSION,
+        "size": size, "etag": etag, "chunk_size": chunk_size,
+        "done": sorted(int(i) for i in done), "updated_at": 0,
+    }), encoding="utf-8")
+
+
+def test_resume_only_fetches_missing_download_chunks(tmp_path, monkeypatch):
+    total = 4 * 1024 * 1024 + 7
+    chunk = 1024 * 1024
+    data = random.Random(42).randbytes(total)
+    target = tmp_path / "resume-dl.bin"
+    part = target.with_name(target.name + ".part")
+    state_path = core.download_state_path(target)
+    kept = {0, 1}
+    buf = bytearray(total)
+    for index in kept:
+        start = index * chunk
+        buf[start:start + chunk] = data[start:start + chunk]
+    part.write_bytes(bytes(buf))
+    _write_download_state(state_path, total, "", chunk, kept)
+
+    requested = []
+    fake, _ = _fake_urlopen(data, total)
+
+    def wrapped(req, timeout=None):
+        requested.append(req.headers.get("Range") or "")
+        return fake(req, timeout=timeout)
+
+    monkeypatch.setattr(core.urllib.request, "urlopen", wrapped)
+    client = core.ArtifactDepotClient("http://127.0.0.1:9", "t")
+    saved = client._download_parallel(
+        "/api/objects/download?bucket=b&key=fake.bin", target,
+        _parallel_probe(total), chunk, 2, None, 5.0, None, None)
+
+    assert saved == target
+    assert target.read_bytes() == data
+    assert _range_chunks(requested, chunk) == [2, 3, 4], "已下载分片不应重复请求"
+    assert not part.exists()
+    assert not state_path.exists(), "续传完成后应删除状态文件"
+
+
+def test_download_failure_keeps_part_and_state_then_resumes(tmp_path, monkeypatch):
+    total = 4 * 1024 * 1024
+    chunk = 1024 * 1024
+    data = random.Random(7).randbytes(total)
+    target = tmp_path / "fail-dl.bin"
+    part = target.with_name(target.name + ".part")
+    state_path = core.download_state_path(target)
+    client = core.ArtifactDepotClient("http://127.0.0.1:9", "t")
+
+    # 第 1 片成功；第 2 片及其 3 次重试（共 4 次请求）全部断网 → 下载失败
+    fake, _ = _fake_urlopen(data, total, fail_calls=(2, 3, 4, 5))
+    monkeypatch.setattr(core.urllib.request, "urlopen", fake)
+    # 跳过指数退避等待，避免测试变慢
+    monkeypatch.setattr(core, "_sleep_or_cancel", lambda *a, **k: False)
+    with pytest.raises(core.ApiError):
+        client._download_parallel(
+            "/api/objects/download?bucket=b&key=fake.bin", target,
+            _parallel_probe(total), chunk, 1, None, 5.0, None, None)
+
+    assert part.exists(), "失败应保留 .part（可续传）"
+    assert state_path.exists(), "失败应保留下载断点状态"
+    done = set(json.loads(state_path.read_text(encoding="utf-8"))["done"])
+    assert done == {0}
+
+    # 网络恢复：只补缺失分片，最终内容一致
+    requested = []
+    fake2, _ = _fake_urlopen(data, total)
+
+    def wrapped(req, timeout=None):
+        requested.append(req.headers.get("Range") or "")
+        return fake2(req, timeout=timeout)
+
+    monkeypatch.setattr(core.urllib.request, "urlopen", wrapped)
+    saved = client._download_parallel(
+        "/api/objects/download?bucket=b&key=fake.bin", target,
+        _parallel_probe(total), chunk, 1, None, 5.0, None, None)
+
+    assert saved == target
+    assert target.read_bytes() == data
+    assert _range_chunks(requested, chunk) == [1, 2, 3]
+    assert not part.exists()
+    assert not state_path.exists()
+
+
+def test_download_state_mismatch_discards_and_redownloads(tmp_path, monkeypatch):
+    total = 3 * 1024 * 1024
+    chunk = 1024 * 1024
+    data = random.Random(11).randbytes(total)
+    target = tmp_path / "stale-dl.bin"
+    part = target.with_name(target.name + ".part")
+    state_path = core.download_state_path(target)
+    part.write_bytes(b"\x00" * total)
+    # 状态里的 etag 与当前对象不一致（对象已更新）→ 必须丢弃 .part 从头下载
+    _write_download_state(state_path, total, "stale-etag", chunk, {0, 1})
+
+    requested = []
+    fake, _ = _fake_urlopen(data, total)
+
+    def wrapped(req, timeout=None):
+        requested.append(req.headers.get("Range") or "")
+        return fake(req, timeout=timeout)
+
+    monkeypatch.setattr(core.urllib.request, "urlopen", wrapped)
+    client = core.ArtifactDepotClient("http://127.0.0.1:9", "t")
+    etag = '"' + _sha256_bytes(data) + '"'
+    saved = client._download_parallel(
+        "/api/objects/download?bucket=b&key=fake.bin", target,
+        _parallel_probe(total, etag), chunk, 2, None, 5.0, None, None)
+
+    assert saved == target
+    assert target.read_bytes() == data
+    assert _range_chunks(requested, chunk) == [0, 1, 2], "ETag 不一致时应从头下载"
+    assert not part.exists()
+    assert not state_path.exists()
 
 
 

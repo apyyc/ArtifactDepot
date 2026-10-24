@@ -61,6 +61,9 @@ DEFAULT = {
         "max_session_gb": 200,                # 会话总量上限（max_upload_mb=0 时生效，上限 200GB）
         "session_ttl_seconds": 86400,         # 分片会话绝对有效期（默认 24h）
         "session_idle_ttl_seconds": 86400,    # 空闲清理阈值（默认 24h，且不小于请求超时）
+        "staging_dir": "",                    # 伴随文件/staging 根目录（分片临时文件不再写 /tmp）
+                                              # 留空 = <depot_dir>/.staging；相对路径按 depot_dir 解析；
+                                              # 可填绝对路径（容器可挂独立数据卷）
     },
     "download": {                             # 下载分块/并发/超时（改后即时生效，无需重启）
         "chunk_size_mb": 8,                   # 每片大小（1-64MB；客户端按此切 Range）
@@ -209,6 +212,7 @@ _ENV_MAP = {
     "ARTIFACT_DEPOT_UPLOAD_MAX_SESSION_GB": "upload.max_session_gb",
     "ARTIFACT_DEPOT_UPLOAD_SESSION_TTL_SECONDS": "upload.session_ttl_seconds",
     "ARTIFACT_DEPOT_UPLOAD_SESSION_IDLE_TTL_SECONDS": "upload.session_idle_ttl_seconds",
+    "ARTIFACT_DEPOT_UPLOAD_STAGING_DIR": "upload.staging_dir",
     # 下载分块/并发/超时（支持 .env 点号写法与真实环境变量）
     "ARTIFACT_DEPOT_DOWNLOAD_CHUNK_SIZE_MB": "download.chunk_size_mb",
     "ARTIFACT_DEPOT_DOWNLOAD_CHUNK_CONCURRENCY": "download.chunk_concurrency",
@@ -345,6 +349,29 @@ def public_upload_settings() -> dict:
     }
 
 
+def get_staging_dir(cfg: dict | None = None) -> Path:
+    """`upload.staging_dir` 解析后的绝对路径（伴随文件/staging 根目录）。
+
+    - 留空 → `<depot_dir>/.staging`；
+    - 相对路径 → 按 `depot_dir` 解析（与 meta_dir 一致）；
+    - 绝对路径 → 原样使用（容器可挂独立数据卷）。
+
+    用途：① 无 bucket/key 的旧客户端分片会话根目录（legacy）；
+    ② 启动时把 `tempfile.tempdir` 指向该目录，让 Starlette multipart 的 spool 文件
+    落在数据盘而不是 RAM `/tmp`（宿主 /tmp 常是小容量 tmpfs）。
+    """
+    cfg = cfg if cfg is not None else get_config()
+    upload = cfg.get("upload")
+    raw = ""
+    if isinstance(upload, dict):
+        raw = str(upload.get("staging_dir", "") or "").strip()
+    depot = Path(str(cfg.get("depot_dir") or "."))
+    p = Path(raw) if raw else Path(".staging")
+    if not p.is_absolute():
+        p = depot / p
+    return p
+
+
 # 下载配置的合法区间（越界自动夹紧，避免把客户端/服务端调崩）
 _DOWNLOAD_INT_LIMITS = {
     "chunk_size_mb": (1, 64),
@@ -413,6 +440,13 @@ def reload_config() -> dict:
             else:
                 merged[key] = new_val
                 changed.append(key)
+    # staging_dir 只在启动时设置 tempfile.tempdir；热加载改它需要重启才完整生效
+    # （新会话已按新值落盘，但框架级 spool 仍指向旧目录），这里只提示不强制。
+    def _staging_of(c: dict) -> str:
+        up = c.get("upload")
+        return str(up.get("staging_dir", "") or "").strip() if isinstance(up, dict) else ""
+    if _staging_of(old) != _staging_of(new):
+        needs_restart.append("upload.staging_dir")
     _CONFIG = merged
     return {"ok": True, "error": "", "changed": sorted(changed),
             "needs_restart": sorted(needs_restart), "warnings": warnings}
@@ -440,4 +474,12 @@ def config_warnings(cfg: dict | None = None) -> list:
             out.append("signed_links.expire_min_seconds/expire_max_seconds 配置不合法")
     except (TypeError, ValueError):
         out.append("signed_links 配置项不是整数")
+    # staging 目录（伴随文件落盘位置）不可写 → 分片会话/框架 spool 都会失败，启动前提示
+    try:
+        staging = get_staging_dir(cfg)
+        probe = staging if staging.exists() else staging.parent
+        if probe.exists() and not os.access(probe, os.W_OK):
+            out.append(f"upload.staging_dir 不可写：{staging}（分片临时文件将无法落盘，请检查目录权限）")
+    except (OSError, ValueError) as e:
+        out.append(f"upload.staging_dir 无法访问：{e}")
     return out
