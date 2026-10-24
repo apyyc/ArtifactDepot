@@ -43,10 +43,18 @@ COPY LICENSE LICENSE.zh-CN.md /app/artifactdepot/
 COPY docker/supervisord.conf /etc/supervisor.d/artifactdepot.ini
 
 # 非 root 运行：创建 artifactdepot(10001)，把代码与数据目录归属它
+#
+# 注意：deploy_container.sh 挂卷时会用 --user <宿主UID> + --userns=keep-id 覆盖镜像 USER
+# （否则绑定目录不可写），容器进程因此不属于 artifactdepot，**只能靠 other 位读代码**。
+# 构建上下文里的文件权限会被 COPY 原样带入：若某个源文件是 600（本地 umask 077 生成，
+# 如 0.9.0 的 zipstream.py），运行时 import 会直接 PermissionError → supervisord 重试
+# 耗尽 FATAL（现象：podman logs 只有 spawned/exited status 1，502）。
+# 这里统一放开读权限（X 只给目录/已可执行文件），与构建机的 umask 解耦。
 RUN addgroup -g 10001 artifactdepot \
     && adduser -D -u 10001 -G artifactdepot artifactdepot \
     && mkdir -p /data/depot /data/state /data/config \
-    && chown -R artifactdepot:artifactdepot /app /data/depot /data/state /data/config
+    && chown -R artifactdepot:artifactdepot /app /data/depot /data/state /data/config \
+    && chmod -R a+rX /app
 USER artifactdepot
 
 # 环境变量（数据目录挂载点）

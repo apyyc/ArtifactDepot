@@ -18,6 +18,7 @@
   <button data-t="links" data-action="switch-tab" data-tab="links">签名链接</button>
   <button data-t="tokens" data-action="switch-tab" data-tab="tokens">Token 管理</button>
   <button data-t="audit" data-action="switch-tab" data-tab="audit">审计</button>
+  <button data-t="config" data-action="switch-tab" data-tab="config">配置</button>
   <span style="flex:1;"></span>
   <a class="doc-link" href="/docs" target="_blank" rel="noopener" title="FastAPI 自动生成的交互式 API 调试台">Swagger</a>
   <a class="doc-link" href="/redoc" target="_blank" rel="noopener" title="FastAPI ReDoc 只读文档">ReDoc</a>
@@ -37,26 +38,38 @@
       <div class="row" style="margin-top:8px;">
         <label>令牌:</label>
         <input id="upToken" placeholder="你的 api_token 或管理员 access_token（上传/下载/签名/删除通用）" style="width:380px;" />
-        <span class="muted">用户 token 在协作平台成员列表"查看我的Token"获取；管理员 token 为 config.json 的 access_token（可做全部操作）</span>
+        <span class="muted">普通用户令牌由管理员发放；管理员令牌为 config.json 的 access_token（可做全部操作）</span>
       </div>
     </div>
 
     <div class="card" id="dropZoneCard">
       <h3 style="margin:0 0 8px;font-size:14px;">上传文件</h3>
       <div class="row">
-        <input type="file" id="upFile" multiple />
-        <label>来源URL: <input id="upSource" placeholder="可选，如源视频链接" style="width:240px;" /></label>
+        <input type="file" id="upFile" multiple disabled title="请先填写令牌" />
+        <label>来源: <input id="upSource" placeholder="可选，来源链接或说明" style="width:200px;" /></label>
+        <label>备注: <input id="upNote" placeholder="可选，一句话备注" style="width:180px;" /></label>
         <label>并发数: <select id="upConcurrency"><option value="1">1</option><option value="2">2</option><option value="3" selected>3</option><option value="5">5</option></select></label>
-        <button id="upBtn" data-action="do-upload">上传</button>
-        <button id="upPause" class="ghost" data-action="pause-upload" disabled title="在分片边界暂停：当前分片传完后不再发新分片，已传分片保留">暂停上传</button>
-        <button id="upResume" class="ghost" data-action="resume-upload" disabled title="继续上传：暂停的队列从断点继续；失败（可续传）的文件只补缺失分片">继续上传</button>
+        <button id="upBtn" data-action="do-upload" disabled title="请先填写令牌">上传</button>
       </div>
-      <div class="muted" style="margin-top:4px;">上传到：<span id="upTarget">（当前 bucket + 位置）</span>；token 在协作平台成员列表"查看我的Token"获取。<br />支持多选，或把文件<strong>拖拽到页面任意位置</strong>，松手自动上传（上传前先校验 token）。单个文件大于配置的分片大小（默认 8MB）时自动启用多线程分片上传；分片并发/请求超时由服务端 config.json 的 upload.* 决定。<br />上传失败或暂停都不会丢弃已传分片：失败行显示<strong>「失败（可续传）」</strong>，点该行<strong>「继续」</strong>或上方<strong>「继续上传」</strong>会向服务端找回分片会话、只补缺失分片（不重传已完成分片）；<strong>「暂停上传」</strong>在当前分片传完后生效。<br />页面刷新后浏览器无法自动恢复文件列表：<strong>重新选择同一文件再点「上传」</strong>即可自动找回未完成的会话继续（同一浏览器、同一 token 下有效；文件大小或修改时间变化时会自动新建会话）。<br />下载时，文件大于分片大小（默认 8MB）自动多线程分块下载：支持「另存为」的浏览器（Chrome/Edge）边下边写盘，其它浏览器在内存拼好后保存；进度弹窗可随时取消。分片大小/并发/超时由服务端 config.json 的 download.* 决定。</div>
+      <div class="muted" id="upTokenHint" style="margin-top:2px;">请先填写上方「令牌」，再选择文件或拖拽上传。</div>
+      <div class="muted" style="margin-top:4px;">上传到：<span id="upTarget">（当前 bucket + 位置）</span>。<br />支持多选，或把文件<strong>拖拽到页面任意位置</strong>，松手自动上传（上传前先校验令牌）。大于分片大小（默认 8MB）的文件自动多线程分片上传；失败或暂停不丢已传分片，失败行显示<strong>「失败（可续传）」</strong>，点该行<strong>「继续上传」</strong>只补缺失分片。<br />「暂停上传 / 继续上传」按钮只在对应任务的进度条右侧出现，暂停在当前分片传完后生效。<br />刷新页面后，当前令牌未完成的上传会列在下方，可手动取消；重新选择同一文件即可从断点续传（同一浏览器、同一令牌有效）。<br />下载大文件自动多线程分块：支持「另存为」的浏览器边下边写盘，其它浏览器在内存拼好后保存；进度弹窗可随时取消；下载参数由 config.json 的 download.* 决定。</div>
       <!-- 上传队列行由 app.js 的 renderUpQueue() 渲染（严格 CSP：交互只用 data-action 事件委托）。
+           分片任务运行中：<div class="up-item"><span class="nm">文件名</span><progress value="0" max="100"></progress>
+             <span class="st">上传中…</span><button class="ghost up-act" data-action="pause-upload" data-uid="1">暂停上传</button>
+             <button class="ghost up-act" data-action="cancel-upload" data-uid="1">放弃</button></div>
+           已暂停行：<button class="ghost up-act" data-action="resume-upload" data-uid="1">继续上传</button>
            失败行结构示例：<div class="up-item"><span class="nm">文件名</span><progress value="0" max="100"></progress>
-           <span class="st bad">失败（可续传）</span><button class="ghost up-act" data-action="retry-upload" data-uid="1">继续</button>
-           <button class="ghost up-act" data-action="cancel-upload" data-uid="1">放弃</button></div> -->
+             <span class="st bad">失败（可续传）</span><button class="ghost up-act" data-action="retry-upload" data-uid="1">继续上传</button>
+             <button class="ghost up-act" data-action="cancel-upload" data-uid="1">放弃</button></div>
+           未完成上传行（当前令牌、页面刷新后仍显示）：<div class="up-item pending"><span class="nm">文件名</span>
+             <progress value="0" max="100"></progress><span class="st">已传 4MB / 8MB（50%）</span>
+             <span class="muted pending-key">bucket / 目录/文件名</span>
+             <button class="ghost up-act" data-action="cancel-pending-upload" data-uid="&lt;upload_id&gt;">取消上传</button></div> -->
       <div id="upQueue"></div>
+      <div id="upPendingWrap" style="display:none;margin-top:10px;">
+        <div class="up-pending-head">未完成的上传（当前令牌）<span id="upPendingInfo" class="muted"></span></div>
+        <div id="upPending"></div>
+      </div>
     </div>
 
     <div class="card">
@@ -111,7 +124,7 @@
         <thead><tr><th>用户</th><th>Token</th><th>角色</th><th>权限点数</th><th>资源范围</th><th>过期</th><th>状态</th><th>操作</th></tr></thead>
         <tbody id="tokensBody"></tbody>
       </table>
-      <div class="muted" style="margin-top:4px;">每行下方展示该 token 的具体权限点与生效范围；「资源范围」显示「⚠️ 全部 bucket」表示该 token 未受限、可访问任意 bucket。「显示明文」需管理员令牌。</div>
+      <div class="muted" style="margin-top:4px;">每行下方展示该 token 的具体权限点与生效范围；「资源范围」显示「未限制（全部 bucket）」表示该 token 未受限、可访问任意 bucket。「显示明文」需管理员令牌；未显示明文时只保留 token 前 2 位与后 4 位。</div>
     </div>
 
     <div class="card">
@@ -141,7 +154,7 @@
         <input id="tkPrefixes" placeholder="留空=全部；格式 bucket:前缀，逗号分隔，如 demo:carryvideo/2026/" style="width:420px;" class="mono" />
       </div>
       <div class="row">
-        <span class="muted" id="tkScopePreview" style="font-weight:bold;">生效范围：⚠️ 全部 bucket</span>
+        <span class="muted" id="tkScopePreview" style="font-weight:bold;">生效范围：未限制（全部 bucket）</span>
       </div>
 
       <div class="row" style="margin-top:8px;">
@@ -155,7 +168,7 @@
 
       <div class="row" style="margin-top:12px;">
         <button data-action="generate-token">生成本轮 Token</button>
-        <span class="muted">Token 由服务端生成，仅生成后展示一次，请立即复制保存。</span>
+        <span class="muted">Token 由服务端生成（长度受 config.token.max_length 控制），仅生成后展示一次，请立即复制保存。</span>
       </div>
 
       <div class="row" id="tkResultRow" style="display:none; margin-top:8px;">
@@ -187,6 +200,23 @@
         <tbody id="auditBody"></tbody>
       </table>
       <div class="muted" style="margin-top:4px;">动作为 upload / download / delete / presign。</div>
+    </div>
+  </div>
+  <!-- ============ 配置（管理员共享令牌或具备 config:write 权限的 token） ============ -->
+  <div id="sec-config" style="display:none;">
+    <div class="card">
+      <h3 style="margin:0 0 8px;font-size:14px;">运行时配置（热修改）</h3>
+      <div class="row">
+        <label>管理员令牌:</label>
+        <input id="cfgAdminToken" placeholder="管理员令牌或具备 config:write 的 token" style="width:300px;" autocomplete="off" />
+        <button data-action="load-config">加载配置</button>
+        <button data-action="save-config">保存并热加载</button>
+        <button class="ghost" data-action="reload-config-file" title="只重新读取磁盘上的 config.json / .env，不写文件">从文件重载</button>
+      </div>
+      <div class="muted" id="cfgInfo" style="margin-top:4px;">填写令牌后自动加载配置（也可点「加载配置」）。需要管理员共享令牌或具备 config:write 权限的 token。</div>
+      <div class="muted" style="margin-top:2px;">配置文件：<span id="cfgPath" class="mono">-</span></div>
+      <div id="cfgForm"></div>
+      <div class="muted" style="margin-top:10px;">说明：host / port / depot_dir / meta_dir / cors_origins / allowed_hosts / upload.staging_dir 写入后需重启服务；被 .env 或真实环境变量覆盖的项会标注「仅文件值」，改 config.json 不会立即生效。密钥类字段留空表示保持原值；其中 `access_token` 仅管理员共享令牌可修改。</div>
     </div>
   </div>
 
@@ -222,7 +252,7 @@
 
   <div id="bulkDeleteModal" class="modal-mask" style="display:none;">
     <div class="modal modal-wide">
-      <h3 style="margin:0 0 8px;font-size:15px;">⚠️ <span id="bulkTitle">批量删除</span></h3>
+      <h3 style="margin:0 0 8px;font-size:15px;">注意：<span id="bulkTitle">批量删除</span></h3>
       <div class="muted" id="bulkTarget" style="margin-bottom:8px;"></div>
       <div id="bulkPreview" class="bulk-preview">（正在统计将删除的内容…）</div>
       <div class="bulk-warning" id="bulkWarning"></div>

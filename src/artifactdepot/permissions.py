@@ -71,6 +71,11 @@ PERMISSION_CATALOG = [
     # ---- 系统 / 审计 ----
     {"key": "audit:read", "group": "系统 / 审计", "label": "查询审计日志",
      "method": "GET", "path": "/api/audit", "write": False},
+    # 站点配置读写（GET/POST /api/config 与 POST /api/config/reload）：
+    # 持有该权限点的 token 可在线修改 config.json 并热加载。
+    {"key": "config:write", "group": "系统 / 审计",
+     "label": "修改站点配置（config.json 读写/热加载）",
+     "method": "POST", "path": "/api/config", "write": True},
 ]
 
 # 公开接口（无需 token；仅展示，不可勾选）

@@ -22,6 +22,8 @@ host / port / depot_dir / meta_dir / cors_origins / allowed_hosts 改动需重�
 import copy
 import json
 import os
+import re
+import tempfile
 import threading
 from pathlib import Path
 
@@ -31,6 +33,7 @@ DEFAULT = {
     "meta_dir": "",                            # 状态文件目录（tokens.json/audit.log/signed_links.json）
                                                # 留空 = 放在 depot_dir 下；设了则单独放该目录（相对按 depot_dir 解析）
     "datahub_url": "http://127.0.0.1:8002/api/data",  # 从 DataHub users.json 拉取用户 token
+    "datahub_sync_interval_seconds": 60,      # DataHub 惰性同步最小间隔（秒），0=每次都拉取
     "host": "0.0.0.0",                        # 监听地址
     "port": 8004,                             # 服务端口
     "access_token": "admin",                  # 管理员/工具共享令牌；内置默认 admin（开箱即用）
@@ -45,6 +48,10 @@ DEFAULT = {
     "cors_origins": [],                       # CORS 允许来源白名单；空=不加 CORS 中间件
     "allowed_hosts": ["*"],                   # TrustedHost 白名单；["*"]=不限制
     "require_read_token": False,              # 读接口（buckets/list）是否也要求 token（默认 false 保持内网公开）
+    "ui": {                                   # 网页列表分页（改后刷新页面/重新加载即生效）
+        "file_page_size": 200,                # 文件列表每页条数（10-1000）
+        "audit_page_size": 500,               # 审计日志单次查询条数（10-5000）
+    },
     "signed_links": {                         # 签名链接上下限（count=次数，expire=时效秒数）
         "count_min": 1,
         "count_max": 10,
@@ -56,6 +63,7 @@ DEFAULT = {
         "chunk_concurrency": 4,               # 浏览器每个文件同时上传几片（1-16）
         "file_concurrency": 3,                # 浏览器同时上传几个文件（1-10；网页下拉框默认值）
         "request_timeout_seconds": 86400,     # 单次分片/合并请求超时（默认 24h）
+        "session_cleanup_interval_seconds": 600,  # 后台清理过期分片会话的间隔（默认 10 分钟）
         "max_chunk_mb": 64,                   # 单片硬上限（1-64MB，受代码常量兜底）
         "max_chunks": 100000,                 # 单文件最大分片数（上限 100000）
         "max_session_gb": 200,                # 会话总量上限（max_upload_mb=0 时生效，上限 200GB）
@@ -69,6 +77,10 @@ DEFAULT = {
         "chunk_size_mb": 8,                   # 每片大小（1-64MB；客户端按此切 Range）
         "chunk_concurrency": 4,               # 同时下载几片（1-16）
         "request_timeout_seconds": 3600,      # 单次分片请求超时（默认 1h）
+    },
+    "token": {                                # 新建 token 的长度约束（覆盖 API 显式创建与服务端生成）
+        "min_length": 5,                      # 允许的最小字符数（1-256）
+        "max_length": 30,                     # 允许的最大字符数（1-256）；自动生成时取该长度
     },
 }
 
@@ -199,14 +211,19 @@ _ENV_MAP = {
     "ARTIFACT_DEPOT_DIR": "depot_dir",
     "ARTIFACT_DEPOT_META_DIR": "meta_dir",
     "ARTIFACT_DEPOT_DATAHUB_URL": "datahub_url",
+    "ARTIFACT_DEPOT_DATAHUB_SYNC_INTERVAL_SECONDS": "datahub_sync_interval_seconds",
     "ARTIFACT_DEPOT_ACCESS_TOKEN": "access_token",
     "ARTIFACT_DEPOT_PORT": "port",
     "ARTIFACT_DEPOT_MAX_UPLOAD_MB": "max_upload_mb",
+    # 网页分页（支持 .env 点号写法与真实环境变量）
+    "ARTIFACT_DEPOT_UI_FILE_PAGE_SIZE": "ui.file_page_size",
+    "ARTIFACT_DEPOT_UI_AUDIT_PAGE_SIZE": "ui.audit_page_size",
     # 上传分片/并发/超时（支持 .env 点号写法与真实环境变量）
     "ARTIFACT_DEPOT_UPLOAD_CHUNK_SIZE_MB": "upload.chunk_size_mb",
     "ARTIFACT_DEPOT_UPLOAD_CHUNK_CONCURRENCY": "upload.chunk_concurrency",
     "ARTIFACT_DEPOT_UPLOAD_FILE_CONCURRENCY": "upload.file_concurrency",
     "ARTIFACT_DEPOT_UPLOAD_REQUEST_TIMEOUT_SECONDS": "upload.request_timeout_seconds",
+    "ARTIFACT_DEPOT_UPLOAD_SESSION_CLEANUP_INTERVAL_SECONDS": "upload.session_cleanup_interval_seconds",
     "ARTIFACT_DEPOT_UPLOAD_MAX_CHUNK_MB": "upload.max_chunk_mb",
     "ARTIFACT_DEPOT_UPLOAD_MAX_CHUNKS": "upload.max_chunks",
     "ARTIFACT_DEPOT_UPLOAD_MAX_SESSION_GB": "upload.max_session_gb",
@@ -217,6 +234,9 @@ _ENV_MAP = {
     "ARTIFACT_DEPOT_DOWNLOAD_CHUNK_SIZE_MB": "download.chunk_size_mb",
     "ARTIFACT_DEPOT_DOWNLOAD_CHUNK_CONCURRENCY": "download.chunk_concurrency",
     "ARTIFACT_DEPOT_DOWNLOAD_REQUEST_TIMEOUT_SECONDS": "download.request_timeout_seconds",
+    # 新建 token 长度约束（支持 .env 点号写法与真实环境变量）
+    "ARTIFACT_DEPOT_TOKEN_MIN_LENGTH": "token.min_length",
+    "ARTIFACT_DEPOT_TOKEN_MAX_LENGTH": "token.max_length",
     # 兼容旧前缀
     "WAREHOUSE_DIR": "depot_dir",
     "WAREHOUSE_META_DIR": "meta_dir",
@@ -255,10 +275,11 @@ def _load_config_full(strict: bool = False):
             _apply_env_field(cfg, key, val, warnings, f"环境变量 {env}")
             continue
         try:
-            cfg[key] = int(val) if key in ("port", "max_upload_mb") else val
-        except ValueError:
+            cfg[key] = _coerce(DEFAULT.get(key), val)
+        except (TypeError, ValueError) as e:
             if strict:
-                raise ConfigError(f"环境变量 {env} 不是合法整数：{val!r}")
+                raise ConfigError(f"环境变量 {env} 类型不合法：{val!r}（{e}）") from e
+            warnings.append(f"环境变量 {env} 类型不合法：{val!r}（已忽略）")
 
     # 旧配置键 warehouse_dir 兼容映射（depot_dir 优先）
     if "warehouse_dir" in cfg:
@@ -293,6 +314,7 @@ _UPLOAD_INT_LIMITS = {
     "chunk_concurrency": (1, 16),
     "file_concurrency": (1, 10),
     "request_timeout_seconds": (60, 7 * 24 * 3600),
+    "session_cleanup_interval_seconds": (60, 86400),
     "max_chunk_mb": (1, 64),
     "max_chunks": (1, 100000),
     "max_session_gb": (1, 200),
@@ -414,6 +436,69 @@ def public_download_settings() -> dict:
     }
 
 
+# 网页分页合法区间（越界夹紧；只影响前端查询条数）
+_UI_INT_LIMITS = {
+    "file_page_size": (10, 1000),
+    "audit_page_size": (10, 5000),
+}
+
+
+def get_ui_settings() -> dict:
+    """返回归一化后的网页分页配置（config.json 的 ui.*）。"""
+    raw = get_config().get("ui")
+    if not isinstance(raw, dict):
+        raw = {}
+    d = DEFAULT["ui"]
+    out = {}
+    for key, (lo, hi) in _UI_INT_LIMITS.items():
+        try:
+            val = int(raw.get(key, d[key]))
+        except (TypeError, ValueError):
+            val = int(d[key])
+        out[key] = max(lo, min(hi, val))
+    return out
+
+
+def public_ui_settings() -> dict:
+    """下发给网页的分页配置。"""
+    return get_ui_settings()
+
+
+# 新建 token 长度合法区间（越界夹紧；跨字段 min<=max 在写入时校验）
+_TOKEN_INT_LIMITS = {
+    "min_length": (1, 256),
+    "max_length": (1, 256),
+}
+
+
+def get_token_settings() -> dict:
+    """返回归一化后的 token 长度配置（config.json 的 token.*）。
+
+    - 每次调用都读当前配置，POST /api/config 热加载后立即生效；
+    - 单项越界按区间夹紧；若 min_length > max_length（只能由手工改文件造成），
+      回退到内置默认 5/30，避免生成/校验逻辑反转。
+    """
+    raw = get_config().get("token")
+    if not isinstance(raw, dict):
+        raw = {}
+    d = DEFAULT["token"]
+    out = {}
+    for key, (lo, hi) in _TOKEN_INT_LIMITS.items():
+        try:
+            val = int(raw.get(key, d[key]))
+        except (TypeError, ValueError):
+            val = int(d[key])
+        out[key] = max(lo, min(hi, val))
+    if out["min_length"] > out["max_length"]:
+        out = {"min_length": int(d["min_length"]), "max_length": int(d["max_length"])}
+    return out
+
+
+def public_token_settings() -> dict:
+    """下发给网页/CLI 的新建 token 长度上下限。"""
+    return get_token_settings()
+
+
 def reload_config() -> dict:
     """手动重载配置：重新读 config.json / .env / 环境变量。
 
@@ -482,4 +567,462 @@ def config_warnings(cfg: dict | None = None) -> list:
             out.append(f"upload.staging_dir 不可写：{staging}（分片临时文件将无法落盘，请检查目录权限）")
     except (OSError, ValueError) as e:
         out.append(f"upload.staging_dir 无法访问：{e}")
+    # 新建 token 长度配置（min<=max 才有意义）
+    try:
+        tk = cfg.get("token") or {}
+        tmin = int(tk.get("min_length", 5))
+        tmax = int(tk.get("max_length", 30))
+        if tmin < 1 or tmax < 1 or tmin > tmax:
+            out.append("token.min_length/token.max_length 配置不合法（需 1 <= min <= max）")
+    except (TypeError, ValueError):
+        out.append("token 配置项不是整数")
     return out
+
+
+# ---------------------------------------------------------------------------
+# 网页「配置」标签页：配置项元数据 / 快照 / 写回 config.json + 热加载
+# ---------------------------------------------------------------------------
+
+CONFIG_GROUPS = ("基础", "DataHub", "网络与安全", "界面", "上传", "下载", "签名链接",
+                 "系统/审计", "令牌")
+
+_MASKED_SECRET = "********"
+
+# 每个配置项的中文名 / 分组 / 控件类型 / 说明；DEFAULT 是字段范围与默认值的唯一真源。
+# type: string | path | int | bool | list | secret
+_CONFIG_FIELD_META = {
+    "depot_dir": {"label": "仓库根目录", "group": "基础", "type": "path", "restart": True,
+                  "desc": "对象存储根目录；相对路径按项目根解析"},
+    "meta_dir": {"label": "状态文件目录", "group": "基础", "type": "path", "restart": True,
+                 "desc": "tokens.json / audit.log / signed_links.json 目录；留空=放在 depot_dir 下"},
+    "datahub_url": {"label": "DataHub 地址", "group": "DataHub", "type": "string",
+                    "desc": "从 DataHub users.json 拉取用户 token；留空=不同步"},
+    "datahub_sync_interval_seconds": {"label": "DataHub 同步最小间隔（秒）", "group": "DataHub",
+                                      "type": "int", "min": 0, "max": 86400,
+                                      "desc": "惰性同步的最小间隔，0=每次都拉取"},
+    "host": {"label": "监听地址", "group": "网络与安全", "type": "string", "restart": True},
+    "port": {"label": "监听端口", "group": "网络与安全", "type": "int", "restart": True,
+             "min": 1, "max": 65535},
+    "access_token": {"label": "管理员共享令牌", "group": "网络与安全", "type": "secret",
+                     "desc": "留空表示保持现有值；修改后请用新令牌继续操作"},
+    "max_upload_mb": {"label": "单文件上传上限（MB）", "group": "上传", "type": "int",
+                      "min": 0, "max": 1048576, "desc": "0=不限；分片会话总量也受此上限约束"},
+    "trusted_proxies": {"label": "可信代理 IP/CIDR", "group": "网络与安全", "type": "list",
+                        "desc": "仅这些代理的 X-Forwarded-For 会被采信；逗号分隔"},
+    "cors_origins": {"label": "CORS 允许来源", "group": "网络与安全", "type": "list", "restart": True,
+                     "desc": "空=不启用 CORS 中间件；逗号分隔"},
+    "allowed_hosts": {"label": "TrustedHost 白名单", "group": "网络与安全", "type": "list",
+                      "restart": True, "desc": "[\"*\"]=不限制；逗号分隔"},
+    "require_read_token": {"label": "读接口也要求令牌", "group": "网络与安全", "type": "bool",
+                           "desc": "开启后 buckets/list 也需要有效 token"},
+    "ui_enabled": {"label": "启用网页 UI", "group": "界面", "type": "bool"},
+    "ui.file_page_size": {"label": "文件列表每页条数", "group": "界面", "type": "int",
+                          "min": 10, "max": 1000, "desc": "网页「加载更多」每次请求条数"},
+    "ui.audit_page_size": {"label": "审计单次查询条数", "group": "界面", "type": "int",
+                           "min": 10, "max": 5000},
+    "token.min_length": {"label": "Token 最小长度", "group": "令牌", "type": "int",
+                          "min": 1, "max": 256,
+                          "desc": "新建 token 允许的最小字符数（默认 5）"},
+    "token.max_length": {"label": "Token 最大长度", "group": "令牌", "type": "int",
+                          "min": 1, "max": 256,
+                          "desc": "新建 token 允许的最大字符数（默认 30）；服务端自动生成时取该长度"},
+    "signed_links.count_min": {"label": "签名链接最少次数", "group": "签名链接", "type": "int",
+                               "min": 1, "max": 100000},
+    "signed_links.count_max": {"label": "签名链接最多次数", "group": "签名链接", "type": "int",
+                               "min": 1, "max": 100000},
+    "signed_links.expire_min_seconds": {"label": "签名链接最短时效（秒）", "group": "签名链接",
+                                        "type": "int", "min": 1, "max": 31536000},
+    "signed_links.expire_max_seconds": {"label": "签名链接最长时效（秒）", "group": "签名链接",
+                                        "type": "int", "min": 1, "max": 31536000},
+    "upload.chunk_size_mb": {"label": "分片大小（MB）", "group": "上传", "type": "int"},
+    "upload.chunk_concurrency": {"label": "每文件分片并发", "group": "上传", "type": "int"},
+    "upload.file_concurrency": {"label": "同时上传文件数", "group": "上传", "type": "int"},
+    "upload.request_timeout_seconds": {"label": "分片请求超时（秒）", "group": "上传", "type": "int"},
+    "upload.session_cleanup_interval_seconds": {"label": "分片会话清理间隔（秒）", "group": "上传",
+                                                "type": "int"},
+    "upload.max_chunk_mb": {"label": "单片硬上限（MB）", "group": "上传", "type": "int"},
+    "upload.max_chunks": {"label": "单文件最大分片数", "group": "上传", "type": "int"},
+    "upload.max_session_gb": {"label": "会话总量上限（GB）", "group": "上传", "type": "int"},
+    "upload.session_ttl_seconds": {"label": "会话绝对有效期（秒）", "group": "上传", "type": "int"},
+    "upload.session_idle_ttl_seconds": {"label": "会话空闲清理（秒）", "group": "上传", "type": "int"},
+    "upload.staging_dir": {"label": "staging 目录", "group": "上传", "type": "path", "restart": True,
+                            "desc": "留空=<depot_dir>/.staging；改后需重启才完整生效"},
+    "download.chunk_size_mb": {"label": "下载分片大小（MB）", "group": "下载", "type": "int"},
+    "download.chunk_concurrency": {"label": "下载分片并发", "group": "下载", "type": "int"},
+    "download.request_timeout_seconds": {"label": "下载请求超时（秒）", "group": "下载", "type": "int"},
+    "metrics_enabled": {"label": "启用 /metrics", "group": "系统/审计", "type": "bool"},
+    "audit_max_mb": {"label": "审计单文件上限（MB）", "group": "系统/审计", "type": "int",
+                     "min": 0, "max": 10240},
+    "audit_backups": {"label": "审计历史文件保留数", "group": "系统/审计", "type": "int",
+                      "min": 1, "max": 100},
+}
+
+
+def _infer_field_type(value) -> str:
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, int):
+        return "int"
+    if isinstance(value, list):
+        return "list"
+    return "string"
+
+
+def _field_limits(path: str, meta: dict):
+    """返回整数字段的 (min, max)；优先用 upload/download/ui 的夹紧区间。"""
+    for prefix, table in (("upload.", _UPLOAD_INT_LIMITS),
+                          ("download.", _DOWNLOAD_INT_LIMITS),
+                          ("ui.", _UI_INT_LIMITS)):
+        if path.startswith(prefix):
+            key = path[len(prefix):]
+            if key in table:
+                return table[key]
+    return meta.get("min"), meta.get("max")
+
+
+def config_schema() -> list[dict]:
+    """返回全部可编辑配置项（顺序与 DEFAULT 一致，供网页「配置」标签页渲染）。"""
+    fields: list[dict] = []
+
+    def walk(prefix: str, node: dict) -> None:
+        for key, value in node.items():
+            path = f"{prefix}.{key}" if prefix else key
+            if isinstance(value, dict):
+                walk(path, value)
+                continue
+            meta = _CONFIG_FIELD_META.get(path, {})
+            ftype = meta.get("type") or _infer_field_type(value)
+            item = {
+                "key": path,
+                "label": meta.get("label", path),
+                "group": meta.get("group") or _group_for_path(path),
+                "type": ftype,
+                "default": "" if ftype == "secret" else value,
+                "restart": bool(meta.get("restart", path in RESTART_REQUIRED_KEYS)),
+                "description": meta.get("desc", ""),
+            }
+            if ftype == "int":
+                lo, hi = _field_limits(path, meta)
+                item["min"], item["max"] = lo, hi
+            fields.append(item)
+
+    walk("", DEFAULT)
+    return fields
+
+
+def _group_for_path(path: str) -> str:
+    if path.startswith("upload."):
+        return "上传"
+    if path.startswith("download."):
+        return "下载"
+    if path.startswith("signed_links."):
+        return "签名链接"
+    if path.startswith("ui."):
+        return "界面"
+    return "基础"
+
+
+def get_config_file_path() -> Path:
+    """当前生效的 config.json 路径（ARTIFACT_DEPOT_CONFIG 优先）。"""
+    override = (os.getenv("ARTIFACT_DEPOT_CONFIG", "")
+                or os.getenv("WAREHOUSE_CONFIG", "")).strip()
+    return Path(override) if override else _default_config_path()
+
+
+def _flatten_config(node, prefix: str = "") -> dict:
+    out = {}
+    if not isinstance(node, dict):
+        return out
+    for key, value in node.items():
+        path = f"{prefix}.{key}" if prefix else str(key)
+        if isinstance(value, dict):
+            out.update(_flatten_config(value, path))
+        else:
+            out[path] = value
+    return out
+
+
+def _set_config_path(node: dict, path: str, value) -> None:
+    parts = [p for p in path.split(".") if p]
+    cur = node
+    for part in parts[:-1]:
+        nxt = cur.get(part)
+        if not isinstance(nxt, dict):
+            nxt = {}
+            cur[part] = nxt
+        cur = nxt
+    cur[parts[-1]] = value
+
+
+def _is_secret_key(key: str) -> bool:
+    low = str(key).lower()
+    return any(word in low for word in ("token", "secret", "password", "passwd"))
+
+
+def _mask_config(node):
+    """递归脱敏 access_token 等密钥字段（返回值可安全下发给已认证管理员页面）。"""
+    if isinstance(node, dict):
+        return {k: (_MASKED_SECRET if isinstance(v, str) and v and _is_secret_key(k)
+                    else _mask_config(v))
+                for k, v in node.items()}
+    if isinstance(node, list):
+        return [_mask_config(v) for v in node]
+    return node
+
+
+def _env_override_keys() -> set:
+    """真实环境变量实际覆盖的配置项集合（新前缀优先于旧 WAREHOUSE_*）。"""
+    out = set()
+    for env, key in _ENV_MAP.items():
+        if env.startswith("WAREHOUSE_"):
+            new_env = "ARTIFACT_DEPOT" + env[len("WAREHOUSE"):]
+            if os.getenv(new_env, "").strip():
+                continue
+        if os.getenv(env, "").strip():
+            out.add(key)
+    return out
+
+
+def _dotenv_keys() -> set:
+    return {str(k).strip() for k in _read_env(_env_path()) if str(k).strip()}
+
+
+def _config_sources(file_flat: dict | None = None) -> dict:
+    """每个 schema 字段的取值来源：environment / .env / config.json / default。"""
+    if file_flat is None:
+        try:
+            file_flat = _flatten_config(_read_json(get_config_file_path()))
+        except ConfigError:
+            file_flat = {}
+    env_keys = _env_override_keys()
+    dotenv_keys = _dotenv_keys()
+    sources = {}
+    for field in config_schema():
+        key = field["key"]
+        if key in env_keys:
+            sources[key] = "environment"
+        elif key in dotenv_keys:
+            sources[key] = ".env"
+        elif key in file_flat:
+            sources[key] = "config.json"
+        else:
+            sources[key] = "default"
+    return sources
+
+
+def config_snapshot() -> dict:
+    """给网页「配置」标签页的快照：文件值、生效值、来源、需重启项、告警。
+
+    - `values` 是 config.json 里的值（编辑基准，密钥脱敏）；
+    - `effective` 是当前进程实际生效的值（含 .env / 环境变量覆盖，密钥脱敏）；
+    - `sources` 标明每个字段最终来自哪里，被 .env/环境变量覆盖的字段改 config.json 不会生效。
+    """
+    path = get_config_file_path()
+    error = ""
+    try:
+        file_cfg = _read_json(path, strict=True)
+    except ConfigError as e:
+        file_cfg = {}
+        error = str(e)
+    if not isinstance(file_cfg, dict):
+        file_cfg = {}
+    schema = config_schema()
+    file_flat = _flatten_config(file_cfg)
+    sources = _config_sources(file_flat)
+    overridden = sorted(k for k, v in sources.items() if v in (".env", "environment"))
+    restart_required = sorted(f["key"] for f in schema if f.get("restart"))
+    return {
+        "path": str(path),
+        "exists": path.is_file(),
+        "error": error,
+        "groups": list(CONFIG_GROUPS),
+        "schema": schema,
+        "values": _mask_config(file_cfg),
+        "effective": _mask_config(get_config()),
+        "sources": sources,
+        "overridden": overridden,
+        "restart_required": restart_required,
+        "warnings": config_warnings(),
+    }
+
+
+def _coerce_config_value(field: dict, raw):
+    key, typ = field["key"], field["type"]
+    label = field.get("label") or key
+    if raw is None:
+        raise ConfigError(f"{label} 不能为 null")
+    if typ == "bool":
+        if isinstance(raw, bool):
+            return raw
+        text = str(raw).strip().lower()
+        if text in ("1", "true", "yes", "on"):
+            return True
+        if text in ("0", "false", "no", "off", ""):
+            return False
+        raise ConfigError(f"{label} 必须是布尔值（true/false）")
+    if typ == "int":
+        if isinstance(raw, bool):
+            raise ConfigError(f"{label} 必须是整数")
+        try:
+            val = int(str(raw).strip())
+        except (TypeError, ValueError) as e:
+            raise ConfigError(f"{label} 必须是整数：{raw!r}") from e
+        lo, hi = field.get("min"), field.get("max")
+        if lo is not None and val < lo:
+            raise ConfigError(f"{label} 不能小于 {lo}")
+        if hi is not None and val > hi:
+            raise ConfigError(f"{label} 不能大于 {hi}")
+        return val
+    if typ == "list":
+        if isinstance(raw, (dict, bool)):
+            raise ConfigError(f"{label} 必须是字符串列表")
+        if isinstance(raw, list):
+            if any(isinstance(x, (dict, list)) for x in raw):
+                raise ConfigError(f"{label} 的列表项必须是字符串")
+            items = [str(x).strip() for x in raw]
+        else:
+            items = [x.strip() for x in re.split(r"[,，\n]", str(raw))]
+        return [x for x in items if x]
+    if typ in ("string", "path"):
+        if isinstance(raw, bool) or not isinstance(raw, (str, int, float)):
+            raise ConfigError(f"{label} 必须是字符串")
+        val = str(raw).strip()
+        if key == "depot_dir" and not val:
+            raise ConfigError("仓库根目录不能为空")
+        return val
+    if typ == "secret":
+        return str(raw).strip()
+    raise ConfigError(f"{label} 的类型不支持在线编辑：{typ}")
+
+
+def _validate_merged_config(cfg: dict) -> None:
+    """跨字段校验（单字段范围已由 schema 校验）。"""
+    sl = cfg.get("signed_links")
+    if isinstance(sl, dict):
+        try:
+            cmin = int(sl.get("count_min", 1))
+            cmax = int(sl.get("count_max", 10))
+            emin = int(sl.get("expire_min_seconds", 60))
+            emax = int(sl.get("expire_max_seconds", 604800))
+        except (TypeError, ValueError) as e:
+            raise ConfigError("signed_links 配置项必须是整数") from e
+        if cmax < cmin:
+            raise ConfigError("签名链接最多次数不能小于最少次数")
+        if emax < emin:
+            raise ConfigError("签名链接最长时效不能小于最短时效")
+    up = cfg.get("upload")
+    if isinstance(up, dict):
+        try:
+            chunk = int(up.get("chunk_size_mb", 8))
+            max_chunk = int(up.get("max_chunk_mb", 64))
+        except (TypeError, ValueError) as e:
+            raise ConfigError("upload.chunk_size_mb / max_chunk_mb 必须是整数") from e
+        if chunk > max_chunk:
+            raise ConfigError("分片大小不能大于单片硬上限（upload.max_chunk_mb）")
+    tk = cfg.get("token")
+    if isinstance(tk, dict):
+        try:
+            tmin = int(tk.get("min_length", 5))
+            tmax = int(tk.get("max_length", 30))
+        except (TypeError, ValueError) as e:
+            raise ConfigError("token.min_length / token.max_length 必须是整数") from e
+        if tmin < 1 or tmax < 1:
+            raise ConfigError("Token 长度必须大于 0")
+        if tmin > tmax:
+            raise ConfigError("Token 最小长度不能大于最大长度")
+
+
+def _write_config_text(path: Path, text: str) -> None:
+    """原子写 config.json（0600；含密钥，不能留下半截文件）。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp",
+                                    dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp_name, 0o600)
+        os.replace(tmp_name, path)
+    finally:
+        try:
+            os.unlink(tmp_name)
+        except FileNotFoundError:
+            pass
+
+
+def update_config_file(values: dict) -> dict:
+    """把网页提交的值写回 config.json，并调用 reload_config() 热加载。
+
+    - 只接受 schema 中存在的字段（未知字段拒绝，避免拼错键静默无效）；
+    - `access_token` 留空 / 提交脱敏占位符 = 保持原值；
+    - 写盘失败、重载失败会回滚到原文件并抛 ConfigError；
+    - 返回 {ok, changed, needs_restart, warnings, overridden, path}。
+
+    并发安全：进程内用 `_CONFIG_LOCK` 串行化「读文件-合并-写文件-重载」，
+    避免两个并发保存各自基于旧文件合并、后写覆盖先写（丢失更新）。
+    单进程部署假设与上传会话一致；多进程部署需外部锁/单实例。
+    """
+    with _CONFIG_LOCK:
+        return _update_config_file_locked(values)
+
+
+def _update_config_file_locked(values: dict) -> dict:
+    if not isinstance(values, dict):
+        raise ConfigError("values 必须是对象")
+    path = get_config_file_path()
+    schema = {f["key"]: f for f in config_schema()}
+    try:
+        file_cfg = _read_json(path, strict=True)
+    except ConfigError as e:
+        raise ConfigError(f"当前配置文件无法解析，拒绝写入：{e}") from e
+    if not isinstance(file_cfg, dict):
+        file_cfg = {}
+    if not path.is_file():
+        # 配置文件缺失时以“当前生效配置”为基线，避免只提交一个字段就把管理员令牌等
+        # 其它配置重置成默认值（尤其是 access_token 会导致页面立刻失去管理权限）。
+        file_cfg = copy.deepcopy(get_config())
+
+    merged = copy.deepcopy(file_cfg)
+    written = []
+    for key, raw in values.items():
+        field = schema.get(key)
+        if field is None:
+            raise ConfigError(f"未知配置项：{key}")
+        if field["type"] == "secret":
+            if raw is None or str(raw).strip() in ("", _MASKED_SECRET):
+                continue
+            val = _coerce_config_value(field, raw)
+        else:
+            val = _coerce_config_value(field, raw)
+        _set_config_path(merged, key, val)
+        written.append(key)
+
+    _validate_merged_config(merged)
+    old_text = path.read_text(encoding="utf-8") if path.is_file() else None
+    new_text = json.dumps(merged, ensure_ascii=False, indent=2) + "\n"
+    _write_config_text(path, new_text)
+    result = reload_config()
+    if not result.get("ok"):
+        # 写盘成功但重载失败：回滚旧文件，避免下次重启才炸
+        if old_text is None:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        else:
+            _write_config_text(path, old_text)
+        reload_config()
+        raise ConfigError("配置已回滚（新配置无法加载）：" + (result.get("error") or "未知错误"))
+
+    sources = _config_sources(_flatten_config(merged))
+    overridden = sorted(k for k in written
+                        if sources.get(k) in (".env", "environment"))
+    return {
+        "ok": True,
+        "changed": result.get("changed", []),
+        "needs_restart": result.get("needs_restart", []),
+        "warnings": result.get("warnings", []),
+        "overridden": overridden,
+        "path": str(path),
+    }

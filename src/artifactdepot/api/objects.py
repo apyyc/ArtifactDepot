@@ -107,12 +107,14 @@ async def upload(
     key: str = Form(...),
     token: str = Form(""),
     source_url: str = Form(""),
+    note: str = Form(""),
     overwrite: bool = Form(True),
     public_ip: str = Form(""),
 ):
-    """上传对象（PutObject）。multipart：file + bucket + key + token + source_url + public_ip
+    """上传对象（PutObject）。multipart：file + bucket + key + token + source_url + note + public_ip
 
-    权限：object:upload；token 有 bucket/前缀范围时按资源校验。
+    source_url（来源）与 note（备注）为用户可选元数据，写入对象清单；
+    来源允许填 URL 或自由文本说明。权限：object:upload；token 有 bucket/前缀范围时按资源校验。
     """
     tok = await extract_form_token(request) or token.strip()
     principal = await resolve_principal(tok)
@@ -150,7 +152,7 @@ async def upload(
                     raise HTTPException(413, detail=f"超过单文件上传上限 {max_mb}MB")
                 tmp.write(chunk)
         result = storage.put_object(bucket, key, tmp_path, source_url, overwrite,
-                                    uploader=principal.actor, move=True)
+                                    uploader=principal.actor, move=True, note=note)
         success = True
     finally:
         # 读取/超限/落盘任一阶段失败都删除临时文件（Starlette spool 由框架自行关闭）
@@ -654,11 +656,15 @@ async def complete_upload(
     key: str = Form(...),
     total_chunks: int = Form(...),
     source_url: str = Form(""),
+    note: str = Form(""),
     overwrite: bool = Form(True),
     public_ip: str = Form(""),
     token: str = Form(""),
 ):
-    """合并分片并完成上传。权限 upload:complete，并校验 bucket/key 资源范围"""
+    """合并分片并完成上传。权限 upload:complete，并校验 bucket/key 资源范围
+
+    source_url（来源，允许自由文本）与 note（备注）随合并写入对象元数据。
+    """
     tok = await extract_form_token(request) or token.strip()
     principal = await resolve_principal(tok)
     ensure_scope(principal, "upload:complete", bucket=bucket, key=key)
@@ -666,13 +672,27 @@ async def complete_upload(
     result = storage.finalize_chunk_upload(
         upload_id, bucket, key, total_chunks,
         source_url, uploader=principal.actor, overwrite=overwrite,
-        actor=principal.actor, is_admin=principal.is_admin,
+        actor=principal.actor, is_admin=principal.is_admin, note=note,
     )
     storage.audit("upload", bucket, key, principal.actor, _client_ip(request),
                   size=result["size"], sha256=result["sha256"],
                   public_ip=_public_ip(request))
     UPLOADS.inc()
     return {"code": 0, "message": "success", "data": result}
+
+
+@router.get("/uploads", include_in_schema=False)
+async def list_pending_uploads(
+        actor: Principal = Depends(require_scope("upload:abort"))):
+    """列出**当前令牌**名下尚未完成的分片上传会话（网页「未完成上传」用）。
+
+    - 只返回 `actor.actor` 创建的会话，不跨 token（同一 token 同一身份才可见）；
+    - 权限复用 `upload:abort`（能取消会话的令牌才能看到并清理自己的半成品），
+      不新增权限点；该端点供网页 UI 内部使用，不进 OpenAPI，保持对外操作数不变；
+    - 数据来自磁盘会话，页面刷新 / 服务重启后仍可显示；只返回相对信息，不暴露绝对路径。
+    """
+    items = storage.list_owner_sessions(actor.actor)
+    return {"code": 0, "message": "success", "data": {"items": items, "count": len(items)}}
 
 
 @router.post("/abort")

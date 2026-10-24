@@ -214,7 +214,7 @@ def range_text(record: dict) -> str:
     if prefixes:
         parts.append("前缀=" + "; ".join(
             f"{b}: {' / '.join(str(x) for x in arr)}" for b, arr in prefixes.items()))
-    return "；".join(parts) if parts else "⚠️ 全部 bucket"
+    return "；".join(parts) if parts else "未限制（全部 bucket）"
 
 
 def make_scrollbar(parent, command, orient="vertical"):
@@ -414,7 +414,7 @@ class BulkDeleteDialog(tk.Toplevel):
         frame = ttk.Frame(self, style="Panel.TFrame", padding=18)
         frame.pack(fill="both", expand=True)
         label = "删除本目录全部内容" if mode == "all" else "清空本目录文件"
-        ttk.Label(frame, text="⚠️ " + label, style="Title.TLabel").pack(anchor="w")
+        ttk.Label(frame, text="注意：" + label, style="Title.TLabel").pack(anchor="w")
         ttk.Label(frame, text=f"{bucket} / {self.prefix + '/' if self.prefix else ''}",
                   style="PanelMuted.TLabel").pack(anchor="w", pady=(4, 10))
         self.preview = ttk.Label(frame, text="正在统计…", style="Panel.TLabel",
@@ -1508,7 +1508,7 @@ class TokensTab(ttk.Frame):
         self.buckets_manual_var = tk.StringVar()
         self.all_buckets_var = tk.BooleanVar(value=True)
         self.prefixes_var = tk.StringVar()
-        self.range_var = tk.StringVar(value="生效范围：⚠️ 全部 bucket")
+        self.range_var = tk.StringVar(value="生效范围：未限制（全部 bucket）")
         self.result_var = tk.StringVar()
         self._build()
         self.load_catalog()
@@ -1762,7 +1762,7 @@ class TokensTab(ttk.Frame):
         outside = [b for b in prefixes if buckets and b not in buckets]
         text = "生效范围：" + range_text({"allow_buckets": buckets, "allow_prefixes": prefixes})
         if outside:
-            text += "　⚠️ 前缀 bucket 不在白名单：" + "、".join(outside)
+            text += "　注意：前缀 bucket 不在白名单：" + "、".join(outside)
         self.range_var.set(text)
 
     # ---------------- registry ----------------

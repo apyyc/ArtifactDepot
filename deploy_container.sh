@@ -66,7 +66,7 @@ _resolve_image_tag() {
     _v="$(grep -m1 -oE '[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?' "$SCRIPT_DIR/VERSION" 2>/dev/null | head -1)"
     if [ -n "$_v" ]; then printf '%s' "$_v"; return; fi
   fi
-  printf '0.9.0'   # 兜底：VERSION 缺失时使用上次已知版本
+  printf '0.10.0'  # 兜底：VERSION 缺失时使用上次已知版本
 }
 
 IMAGE_NAME="artifactdepot"           # 镜像名

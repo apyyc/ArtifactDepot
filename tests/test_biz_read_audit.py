@@ -733,8 +733,8 @@ def test_audit_rotated_backup_files_are_filtered(ctx):
 # #8 POST /api/config/reload
 # ---------------------------------------------------------------------------
 
-def test_config_reload_admin_only(ctx):
-    """C：#8 仅共享 token；无 token 401、无效 401、普通 token 403、共享 200。"""
+def test_config_reload_requires_config_write(ctx):
+    """C：#8 需管理员共享 token 或 config:write；无 token 401、无效 401、普通 token 403。"""
     c = ctx["client"]
     _seed_demo(c)
 
@@ -744,12 +744,11 @@ def test_config_reload_admin_only(ctx):
     viewer = _new_token(c, role="viewer")
     r = c.post("/api/config/reload", params={"token": viewer})
     assert r.status_code == 403, r.text
-    assert "需要管理员权限" in _detail(r)
+    assert "config:write" in _detail(r)
 
-    # role=admin 的非共享 token 也只是「全部 scope」，不等于共享 access_token
+    # role=admin 的非共享 token 拥有全部 scope（含 config:write），因此可重载配置
     admin_role = _new_token(c, role="admin")
-    r = c.post("/api/config/reload", params={"token": admin_role})
-    assert r.status_code == 403, r.text
+    assert c.post("/api/config/reload", params={"token": admin_role}).status_code == 200
 
     r = c.post("/api/config/reload", params={"token": ADMIN})
     assert r.status_code == 200, r.text
@@ -897,7 +896,7 @@ def test_public_permissions_catalog(ctx):
     data = body["data"]
     assert {"permissions", "public", "roles", "default_role",
             "require_read_token"} <= set(data)
-    assert len(data["permissions"]) == len(PERMISSION_CATALOG) == 22
+    assert len(data["permissions"]) == len(PERMISSION_CATALOG) == 23
     assert len(data["public"]) == len(PUBLIC_CATALOG) == 6
     assert data["default_role"] == "user"
     assert [r0["key"] for r0 in data["roles"]] == list(ROLE_PRESETS)
@@ -908,6 +907,11 @@ def test_public_permissions_catalog(ctx):
            for path, item in spec["paths"].items() for method in item}
     assert len(ops) == 35                                   # 35 条 OpenAPI 操作
     for item in data["permissions"] + data["public"]:
+        if item.get("key") == "config:write":
+            # 配置接口 include_in_schema=False，仍不出现在 OpenAPI，但确实是受保护权限点
+            assert item["path"] == "/api/config"
+            assert "/api/config" not in spec["paths"]
+            continue
         assert (item["method"].upper(), _norm_path(item["path"])) in ops, item
 
 

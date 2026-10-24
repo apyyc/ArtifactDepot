@@ -266,6 +266,28 @@ def test_chunk_incoming_and_complete_atomic(env):
         assert not list(env["depot"].rglob("*.part*"))
 
 
+def test_complete_writes_source_and_note_metadata(env):
+    """complete 支持「来源」（自由文本）与「备注」，写入清单并由 list 返回。"""
+    with _client() as c:
+        d = _init_ok(c, bucket="b", key="meta/out.bin", size=3)
+        uid = d["upload_id"]
+        _chunk_ok(c, uid, 0, b"xyz")
+        r = c.post("/api/objects/complete", params={"token": ADMIN},
+                   data={"upload_id": uid, "bucket": "b", "key": "meta/out.bin",
+                         "total_chunks": "1", "source_url": "客户B / 录屏",
+                         "note": "  一句话备注  "})
+        assert r.status_code == 200, r.text
+        entry = json.loads(
+            (env["depot"] / "b" / ".warehouse.json").read_text(encoding="utf-8"))["meta/out.bin"]
+        assert entry["source_url"] == "客户B / 录屏"
+        assert entry["note"] == "一句话备注", "备注去首尾空白后落清单"
+        items = c.get("/api/objects/list",
+                      params={"token": ADMIN, "bucket": "b", "prefix": "meta"}
+                      ).json()["data"]["items"]
+        assert items[0]["source_url"] == "客户B / 录屏"
+        assert items[0]["note"] == "一句话备注"
+
+
 # ---------------------------------------------------------------------------
 # 6) 直传临时文件落在目标目录
 # ---------------------------------------------------------------------------

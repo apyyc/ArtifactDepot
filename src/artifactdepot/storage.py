@@ -40,7 +40,8 @@ import httpx
 
 from fastapi import HTTPException
 
-from artifactdepot.config import get_config, get_staging_dir, get_upload_settings
+from artifactdepot.config import (get_config, get_staging_dir, get_token_settings,
+                                  get_upload_settings)
 
 # 隐藏清单文件名（上传/列表均跳过）
 MANIFEST = ".warehouse.json"
@@ -50,7 +51,12 @@ MANIFEST = ".warehouse.json"
 # 隐藏目录本身已被列表/目录统计/ZIP 跳过；批量删除与 rename 必须显式跳过，避免毁掉活跃上传。
 INTERNAL_UPLOAD_DIR = ".artifactdepot-uploads"
 
-_DEFAULT_META = {"size": 0, "sha256": "", "mtime": "", "source_url": "", "uploader": ""}
+# 元数据文本字段上限：清单每次上传都整份重写，长文本会让清单膨胀、拖慢所有上传
+MAX_SOURCE_CHARS = 512   # 来源（source_url，允许非 URL 的自由文本说明）
+MAX_NOTE_CHARS = 200     # 备注（note）
+
+_DEFAULT_META = {"size": 0, "sha256": "", "mtime": "", "source_url": "", "uploader": "",
+                 "note": ""}
 
 
 # ---------------------------------------------------------------------------
@@ -305,11 +311,14 @@ def _manifest_save(bucket: str, manifest: dict) -> None:
 
 def put_object(bucket: str, key: str, src_path: Path, source_url: str = "",
                overwrite: bool = True, uploader: str = "",
-               move: bool = False) -> dict:
+               move: bool = False, note: str = "") -> dict:
     """把已落盘的临时文件放入对象存储（流式拷贝，计算 SHA-256，记录元数据）
 
     move=True 时，算完 SHA-256 后用 `os.replace` 直接搬到最终路径（同一文件系统），
     避免「临时文件 + 目标文件」两份同时存在的 2× 峰值；跨文件系统时回退流式拷贝。
+
+    source_url / note 为用户可选的元数据文本（来源、备注），写入清单 `.warehouse.json`，
+    分别按 MAX_SOURCE_CHARS / MAX_NOTE_CHARS 截断，避免清单被长文本撑大。
     """
     validate_bucket(bucket)
     k = validate_key(key)
@@ -345,7 +354,8 @@ def put_object(bucket: str, key: str, src_path: Path, source_url: str = "",
         "size": size,
         "sha256": sha256,
         "mtime": _utc_now_iso(),
-        "source_url": source_url or "",
+        "source_url": (source_url or "").strip()[:MAX_SOURCE_CHARS],
+        "note": (note or "").strip()[:MAX_NOTE_CHARS],
         "uploader": uploader or "",
     }
     with state_lock():
@@ -443,6 +453,7 @@ def list_objects(bucket: str, prefix: str = "",
                 "mtime": mtime,
                 "sha256": meta.get("sha256", ""),
                 "source_url": meta.get("source_url", ""),
+                "note": meta.get("note", ""),
                 "uploader": meta.get("uploader", ""),
             })
     total = len(items)
@@ -1284,7 +1295,10 @@ def add_token(token: str, user: str, role: str = "", scopes=None,
               keep_existing_permissions: bool = False) -> dict:
     """登记/更新 token → 权限记录（一个 token 只属一个用户）。
 
-    - token 为空时由服务端生成（secrets.token_urlsafe(32)）
+    - token 为空时由服务端生成，长度取 `config.token.max_length`（默认 30）
+    - 显式传入且为**新建** token 时，长度必须落在 `config.token.min_length` ~
+      `config.token.max_length`（默认 5~30）之间，否则 400；覆写已登记的旧 token
+      不做长度校验（兼容历史短 token）
     - scopes 显式传入则优先；否则用 role 预设；role 缺省为 user（兼容旧行为）
     - keep_existing_permissions=True 时（平台按旧协议只推 token+user）仅更新用户名，
       保留已有 role/scopes/资源范围，避免协作平台登记动作把精细权限重置成 role=user
@@ -1292,8 +1306,12 @@ def add_token(token: str, user: str, role: str = "", scopes=None,
     """
     token = (token or "").strip()
     user = (user or "").strip()
+    settings = get_token_settings()
+    min_len, max_len = int(settings["min_length"]), int(settings["max_length"])
+    generated = False
     if not token:
-        token = secrets.token_urlsafe(32)
+        token = secrets.token_urlsafe(max_len)[:max_len]
+        generated = True
     if not user:
         raise HTTPException(400, detail="user 不能为空")
 
@@ -1308,6 +1326,15 @@ def add_token(token: str, user: str, role: str = "", scopes=None,
                 out = dict(rec)
                 out["token"] = token
                 return out
+
+    # 新建 token（非覆写）才校验长度：历史 token 可能短于当前下限，不能因此无法更新。
+    if not generated and token not in _read_tokens_raw():
+        if not (min_len <= len(token) <= max_len):
+            raise HTTPException(
+                400,
+                detail=(f"token 长度必须在 {min_len}–{max_len} 个字符之间"
+                        f"（由 config.token.min_length / token.max_length 控制）"),
+            )
 
     role = (role or "user").strip() or "user"
     if role != "custom" and _role_preset_scopes(role) is None:
@@ -1399,7 +1426,15 @@ def resolve_user(token: str):
 # ---------------------------------------------------------------------------
 
 _last_sync = 0.0
-SYNC_INTERVAL = 60  # 秒：惰性刷新最小间隔，避免无效 token 时反复打 DataHub
+SYNC_INTERVAL = 60  # 秒：惰性刷新最小间隔的代码兜底（实际取 config.datahub_sync_interval_seconds）
+
+
+def _sync_interval_seconds() -> int:
+    """DataHub 惰性同步最小间隔（config.datahub_sync_interval_seconds，0=每次都拉）。"""
+    try:
+        return max(0, int(get_config().get("datahub_sync_interval_seconds", SYNC_INTERVAL)))
+    except (TypeError, ValueError):
+        return SYNC_INTERVAL
 
 
 async def _fetch_datahub_users(datahub_url: str):
@@ -1444,7 +1479,7 @@ async def sync_tokens_from_datahub(datahub_url: str, force: bool = False) -> dic
     """从 DataHub users.json 拉取并合并用户 token（只增不删、权限字段保留）"""
     global _last_sync
     now = time.time()
-    if not force and now - _last_sync < SYNC_INTERVAL:
+    if not force and now - _last_sync < _sync_interval_seconds():
         return load_tokens()
     users, err = await _fetch_datahub_users(datahub_url)
     if err is not None:
@@ -1458,7 +1493,7 @@ async def sync_tokens_detailed(datahub_url: str, force: bool = True) -> dict:
     """手动同步接口用：返回 {mapping, ok, error, datahub_url}"""
     global _last_sync
     now = time.time()
-    if not force and now - _last_sync < SYNC_INTERVAL:
+    if not force and now - _last_sync < _sync_interval_seconds():
         return {"mapping": load_tokens(), "ok": True, "error": "", "datahub_url": datahub_url}
     users, err = await _fetch_datahub_users(datahub_url)
     if err is not None:
@@ -1947,6 +1982,53 @@ def find_resumable_session(owner: str, bucket: str, key: str, size: int = 0,
     return best_id
 
 
+def list_owner_sessions(owner: str = "") -> list[dict]:
+    """列出某个 token 创建者名下、尚未完成的**目标目录**分片会话（网页「未完成上传」用）。
+
+    - 只返回 `owner` 完全一致的会话（同一 token 身份）；无 owner 的历史会话/legacy 会话
+      不列出，避免把别人的半成品展示给当前 token；
+    - 数据全部来自磁盘（`.session.json` + `chunk_*.part`），因此页面刷新、进程重启后仍能显示；
+    - 不返回服务端绝对路径，只返回 bucket/key 等相对信息。
+    """
+    owner = (owner or "").strip()
+    if not owner:
+        return []
+    items: list[dict] = []
+    for d in list(_iter_live_sessions()):
+        meta = _read_meta_dir(d)
+        if (meta.get("owner") or "").strip() != owner:
+            continue
+        bucket = str(meta.get("bucket") or "").strip()
+        key = str(meta.get("key") or "").strip()
+        if not bucket or not key:
+            continue
+        total = int(meta.get("total_chunks") or 0)
+        uploaded, received = session_uploaded(d, total)
+        size = int(meta.get("size") or 0)
+        if size > 0:
+            pct = min(100, max(0, int(received * 100 / size)))
+        else:
+            pct = 0
+        items.append({
+            "upload_id": d.name,
+            "bucket": bucket,
+            "key": key,
+            "name": key.rsplit("/", 1)[-1] or key,
+            "size": size,
+            "received_bytes": received,
+            "percent": pct,
+            "total_chunks": total,
+            "uploaded_chunks": uploaded,
+            "chunk_size": int(meta.get("chunk_size") or 0),
+            "created_at": str(meta.get("created_at") or ""),
+            "updated_at": str(meta.get("updated_at") or ""),
+        })
+    # 最近写入的排前面（ISO8601 UTC 字符串可直接比较）
+    items.sort(key=lambda it: (it.get("updated_at") or "", it.get("created_at") or ""),
+               reverse=True)
+    return items
+
+
 def validate_resume_session(upload_id: str, owner: str = "", bucket: str = "",
                             key: str = "", size: int = 0,
                             is_admin: bool = False) -> dict:
@@ -2323,7 +2405,8 @@ def _merge_chunks(d: Path, total_chunks: int, out_path: Path) -> None:
 def finalize_chunk_upload(upload_id: str, bucket: str, key: str, total_chunks: int,
                           source_url: str = "", uploader: str = "",
                           overwrite: bool = True,
-                          actor: str = "", is_admin: bool = False) -> dict:
+                          actor: str = "", is_admin: bool = False,
+                          note: str = "") -> dict:
     """合并分片并写入仓库；成功或硬失败时清理本次会话。
 
     - 合并临时文件 `.merged` 写在会话目录内（与目标文件同盘），`put_object(move=True)`
@@ -2355,7 +2438,7 @@ def finalize_chunk_upload(upload_id: str, bucket: str, key: str, total_chunks: i
         _merge_chunks(d, total_chunks, merged)
         try:
             return put_object(bucket, key, merged, source_url, overwrite,
-                              uploader=uploader, move=True)
+                              uploader=uploader, move=True, note=note)
         except HTTPException as e:
             # overwrite=false 且目标已存在：可改参数重试，保留分片会话；
             # 目标本身是目录属于不可恢复冲突，清理会话（避免残留分片）。

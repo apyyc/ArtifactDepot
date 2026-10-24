@@ -1,6 +1,6 @@
 # ArtifactDepot — 对象存储仓库站点
 
-> 版本 0.9.0，端口 8004，独立服务
+> 版本 0.10.0，端口 8004，独立服务
 
 **一句话**：按行业标准（对象存储 / S3 模型）设计的文件仓库站点，收存处理产物（视频 / 文件），提供上传（分片并发、暂停/继续、断点续传）、列表、Range 分块并发下载（断点续传）、一键下载目录、删除、新建目录、签名链接与审计，并带网页界面。业务 JSON 数据在 DataHub，**本服务不承担业务逻辑**。
 
@@ -28,22 +28,22 @@
 | 类别 | 能力 |
 |---|---|
 | 存储模型 | S3 风格：`bucket`（= 项目）+ `key`（= 任务/文件路径）扁平命名，文件系统为唯一事实源 |
-| 上传 | multipart 流式落盘 + SHA-256 + `max_upload_mb` 上限；**整页拖拽上传**（多文件排队、上传前先校验 token、并发数可调）；文件列表新增**上传者**列（按 token 识别）；**大文件自动多线程分片上传**（按 `upload.chunk_size_mb`，默认 8MB；分片并发/请求超时由 `upload.*` 配置，超时默认 24h）；**分片会话与临时文件随文件落盘**（目标父目录 `.artifactdepot-uploads/<upload_id>/`，不再写 `/tmp`）；**支持暂停/继续与失败后断点续传**（`initiate(resume=true)` 返回磁盘真实已传分片，只补缺失分片）；校验类失败保留会话，启动扫描 + 后台 10 分钟回收默认 24h 无写入会话 |
+| 上传 | multipart 流式落盘 + SHA-256 + `max_upload_mb` 上限；**整页拖拽上传**（多文件排队、上传前先校验 token、并发数可调）；文件列表新增**上传者**列（按 token 识别）；**大文件自动多线程分片上传**（按 `upload.chunk_size_mb`，默认 8MB；分片并发/请求超时由 `upload.*` 配置，超时默认 24h）；**分片会话与临时文件随文件落盘**（目标父目录 `.artifactdepot-uploads/<upload_id>/`，不再写 `/tmp`）；**支持暂停/继续与失败后断点续传**（`initiate(resume=true)` 返回磁盘真实已传分片，只补缺失分片）；校验类失败保留会话，启动扫描 + 后台 10 分钟回收默认 24h 无写入会话；网页可按当前 token 列出未完成上传并手动取消（只清理自己的会话） |
 | 下载 | Starlette `FileResponse` 原生 **Range(206)**（视频可拖动、断点续传）；**需有效 token**（签名链接免 token）；**大文件分块并发下载**（默认 8MB × 4 路，`download.*` 可配）：网页与桌面客户端先 `HEAD` 探测，再并行 `Range` 下载，支持失败重试、进度/速度、取消、SHA-256 完整性校验，并按环境回退「边下边写盘 / 内存 Blob / 原生单流」；**一键下载目录**（`GET /api/objects/download-bulk`，复用 `object:download`）：单文件直下，多文件/含子目录**流式打包 ZIP**（顶层保留目录结构，跳过隐藏项与符号链接；ZIP 无 `Content-Length`，保持单流不做分块） |
 | 伴随文件本地化 | 上传/下载自动创建的临时文件与断点文件都放**「文件所在目录」**：服务端分片会话 `<目标父目录>/.artifactdepot-uploads/<upload_id>/`（`.session.json` / `chunk_<i>.part` / `.incoming` / `.merged`）、直传临时 `.<name>.artifactdepot-incoming-*.tmp`、框架 multipart spool（`upload.staging_dir`，默认 `<depot_dir>/.staging`）；客户端上传断点 `.<源文件名>.artifactdepot-upload.json`、下载 `.part` 与 `.<目标名>.artifactdepot-download.json`；源目录不可写时上传断点回退 `~/.artifactdepot/upload-state/` |
-| 暂停/续传 | 网页与桌面客户端均支持**暂停/继续上传**（分片边界生效、已传分片不重传）；桌面客户端并发分片下载另支持**暂停/继续下载**。上传失败/暂停/取消**不丢弃会话**，再次开始（或刷新后重新选同一文件）即从断点续传；下载失败/暂停保留 `.part` + 状态（桌面），校验 `size`/ETag 后只补缺失分片；**服务重启后仍可续传**（会话在数据盘，启动扫描重建内存 registry） |
+| 暂停/续传 | 网页按**每个上传任务行**独立暂停/继续（按钮只在对应任务进度条右侧，分片边界生效、已传分片不重传），并可查看/取消当前 token 的未完成会话；桌面客户端支持**暂停/继续上传**（分片边界生效、已传分片不重传），并发分片下载另支持**暂停/继续下载**。上传失败/暂停/取消**不丢弃会话**，再次开始（或刷新后重新选同一文件）即从断点续传；下载失败/暂停保留 `.part` + 状态（桌面），校验 `size`/ETag 后只补缺失分片；**服务重启后仍可续传**（会话在数据盘，启动扫描重建内存 registry） |
 | 缓存/条件请求 | 下载/探测返回 **ETag**（基于 SHA-256），支持 `If-None-Match` → **304**，重复访问省流量 |
 | 目录管理 | **新建目录**（`key` 含 `/` 自动多级）；**删除仅允许空目录**（含内容拒绝，防误删）；**批量删除目录内容**（`object:delete_bulk`）：`files` 只删当前目录的直接文件、`all` 递归清空文件与子目录，保留目录本身、保护 `.warehouse.json`，执行前必须输入目录名确认 |
 | 目录信息 | 目录项显示**递归大小**（本目录 + 全部嵌套子目录的文件总字节，`fmtSize`）与**最新修改时间**（所有文件里最新的 mtime，`fmtTime`）；跳过 `.keep` 等隐藏占位文件 |
 | 签名链接 | 注册表驱动：**按次数(1-10) / 按时效 / 永久** 三种时效；管理员可作废全部、创建者可作废自己的；上下限可配置 |
-| 身份识别 | 按令牌识别「谁」：共享 token 识别为「系统/工具」；用户 token 识别为用户名；**管理员 token 为全集**；删除为权限点 `object:delete`（默认仅管理员共享 token 有）；批量删除为独立权限点 `object:delete_bulk`（`operator` 预设包含） |
+| 身份识别 | 按令牌识别「谁」：共享 token 识别为「系统/工具」；用户 token 识别为用户名；**管理员 token 为全集**；删除为权限点 `object:delete`（普通 `user` 预设不含；`operator` / `admin` 含）；批量删除为独立权限点 `object:delete_bulk`（`operator` 预设包含） |
 | 审计日志 | 每次上传/下载/删除/建目录/签名/作废追加 `audit.log`（JSONL），**双 IP**（局域网 + 公网）、**UTC 时间**；按 `audit_max_mb` 自动轮转 |
 | 可观测性 | `X-Request-ID` 透传 + JSON 结构化访问日志；`/metrics`（Prometheus 文本）；`/health/live`（存活）/ `/health/ready`（可写就绪） |
 | Token 同步 | 从 DataHub `users.json` 拉取用户 token（collab 权威源，本地副本，只增不删；DataHub 不可达时明确提示） |
 | 状态文件可迁移 | `meta_dir` 配置项把 `tokens.json` / `signed_links.json` / `audit.log` 移出仓库根，与业务文件隔离、便于备份 |
 | 生产部署 | 脚本**构建完自动导出 tar**（`--no-save` 跳过）；部署默认 **host 网络**（容器内 `127.0.0.1` = 宿主机，同机连 DataHub 最稳）；Podman 走 systemd user 自启，Docker 走 `--restart=always`；`--config` / `VOLUME_MAPS` 可挂载外部 config.json |
-| 网页 UI | bucket 点击选中 + 高亮、整页拖拽、新建目录、**上传暂停/继续（`#upPause` / `#upResume`，失败行「失败（可续传）」+「继续」只补缺失分片）**、**单文件分块并发下载（进度/速度/取消，支持边下边写盘与原生回退）**、**一键下载目录（单文件直下，多文件/含子目录流式 ZIP，无确认）**、**批量删除（两个危险按钮 + 预览 + 输入目录名确认）**、签名链接管理、Token 管理、审计、文件列表 **「加载更多」分页**；标签栏右侧提供 **Swagger / ReDoc** 入口（静态资源自托管，内网/离线可用）；前端脚本/样式外置 + 严格 **CSP**（`script-src 'self'`）；自定义确认框 |
-| 跳转免填 | 支持 URL 携带 token/bucket 直接进入：`/?token=<api_token>[&bucket=<bucket>]` 自动填充令牌并进入目标 bucket，落地即清除地址栏 token（协作平台「任务数据」跳转自动认证） |
+| 网页 UI | bucket 点击选中 + 高亮、整页拖拽、新建目录、**每个上传任务进度条右侧的「暂停上传 / 继续上传」，失败行「失败（可续传）」+「继续上传」只补缺失分片；按当前令牌列出未完成上传并可手动取消；必须先填令牌才能选择文件；令牌输入框跨标签页自动同步**、**单文件分块并发下载（进度/速度/取消，支持边下边写盘与原生回退）**、**一键下载目录（单文件直下，多文件/含子目录流式 ZIP，无确认）**、**批量删除（两个危险按钮 + 预览 + 输入目录名确认）**、签名链接管理、Token 管理、审计、**「配置」标签页（管理员在线修改 config.json 并热加载）**、文件列表 **「加载更多」分页**；标签栏右侧提供 **Swagger / ReDoc** 入口（静态资源自托管，内网/离线可用）；前端脚本/样式外置 + 严格 **CSP**（`script-src 'self'`）；自定义确认框 |
+| 跳转免填 | 支持 URL 携带 token/bucket 直接进入：`/?token=<api_token>[&bucket=<bucket>]` 自动填充令牌（五个标签页一起填）并进入目标 bucket，落地即清除地址栏 token（协作平台「任务数据」跳转自动认证） |
 
 ---
 
@@ -76,7 +76,7 @@
 - 分片上传续传：复用 `upload:initiate`（**不新增权限点**，旧 token 无需变更）；`initiate(resume=true)` 返回服务端磁盘上真实已传分片，`uploaded` 为唯一事实源；会话绑定 owner（admin 例外）
 - 下载：任一有效 token；签名链接（`link`+`tk` / 旧式 `expires`+`sig`）免 token；大文件由网页 / 桌面客户端按 `download.*`（默认 8MB × 4 路）`HEAD` 探测后并行 `Range` 下载，**每个 Range 请求一条 `download` 审计**（`partial=true`、`size` 为区间字节数；HEAD 记 `head=true`、`size=0` 且不计下载指标）
 - 一键下载目录：复用 `object:download`（**不新增权限点**，旧 token 立即生效）；仅支持 token（不接签名链接）；范围按 bucket/prefix 校验
-- 删除：权限点 `object:delete`（默认仅管理员共享 token 有）；且**目录仅空可删**（含文件/子目录拒绝）
+- 删除：权限点 `object:delete`（普通 `user` 预设不含；`operator` / `admin` 含）；且**目录仅空可删**（含文件/子目录拒绝）
 - 批量删除：权限点 `object:delete_bulk`（`operator` 预设包含）；执行必须输入目录名（bucket 根目录输入 bucket 名）并由服务端二次校验；只清内容不删目录本身，bucket 根 `.warehouse.json` 受保护
 - 签名链接作废：管理员可作废全部，创建者可作废自己的
 
@@ -88,20 +88,20 @@
 
 ```bash
 cd ArtifactDepot
-./build_image.sh                     # 构建 localhost/artifactdepot:0.9.0 + 自动导出 artifactdepot-0.9.0.tar
+./build_image.sh                     # 构建 localhost/artifactdepot:0.10.0 + 自动导出 artifactdepot-0.10.0.tar
 ```
 
 2. 把 tar 拷到生产机
 
 ```bash
-scp artifactdepot-0.9.0.tar apyyc@<生产机>:~/SERVER/artifactdepot/
+scp artifactdepot-0.10.0.tar apyyc@<生产机>:~/SERVER/artifactdepot/
 ```
 
 3. 生产机导入并部署
 
 ```bash
 cd ~/SERVER/artifactdepot
-podman load -i artifactdepot-0.9.0.tar
+podman load -i artifactdepot-0.10.0.tar
 cd ArtifactDepot
 ./deploy_container.sh --token <你的管理员token>   # 默认 host 网络；datahub_url 用挂载的 config.json
 ```
@@ -139,7 +139,7 @@ uv pip install --python .venv/bin/python -r requirements.txt
 
 ```bash
 cd ArtifactDepot
-./build_image.sh                      # 构建 + 自动导出 artifactdepot-0.9.0.tar
+./build_image.sh                      # 构建 + 自动导出 artifactdepot-0.10.0.tar
 ```
 
 常用参数：
@@ -149,7 +149,7 @@ cd ArtifactDepot
 | `--no-save` | 只构建，不导出 tar |
 | `--save /path/to/out.tar` | 指定导出路径（默认同目录 `artifactdepot-<tag>.tar`） |
 | `--no-cache` | 不用构建缓存（依赖层有改动时用） |
-| `--tag <版本>` | 自定义版本标签（默认 0.9.0） |
+| `--tag <版本>` | 自定义版本标签（默认 0.10.0） |
 | `--load /path/to/in.tar` | 不构建，直接导入已有 tar |
 | `--list` | 只列出本地镜像 |
 
@@ -159,9 +159,9 @@ cd ArtifactDepot
 
 ```bash
 # 导出（等价于 build_image.sh 的自动步骤）
-podman save -o artifactdepot-0.9.0.tar localhost/artifactdepot:0.9.0
+podman save -o artifactdepot-0.10.0.tar localhost/artifactdepot:0.10.0
 # 目标机导入
-podman load -i artifactdepot-0.9.0.tar
+podman load -i artifactdepot-0.10.0.tar
 ```
 
 ---
@@ -219,12 +219,13 @@ PYTHONPATH=src .venv/bin/python -m uvicorn artifactdepot.main:app --host 0.0.0.0
 
 1. 打开 `http://<主机>:8004/`，页面自动列出 bucket，点击即选中进入
 2. 顶部**令牌框**填入你的 api_token 或管理员 access_token（上传/下载/签名/删除/建目录通用；管理员可做全部；默认共享令牌为 `admin`，上线前请改强令牌）
-3. 选文件或**拖拽到页面任意位置**，松手自动上传（先校验 token）；大文件分片上传中可点**「暂停上传」**，之后点**「继续上传」**从断点继续；失败行显示「失败（可续传）」，点「继续」只补缺失分片
+3. 令牌框填入后「选择文件」才可用；选文件或**拖拽到页面任意位置**，松手自动上传（上传前先校验令牌）。大文件分片上传中，点该任务进度条右侧**「暂停上传」**，之后点**「继续上传」**从断点继续；失败行显示「失败（可续传）」，点该行「继续上传」只补缺失分片。刷新后当前令牌未完成的上传会列在下方，可手动取消
 4. 点「新建目录」输入目录名（可含 `/` 多级）组织文件；目录「删除」仅空目录可删；需要清空当前目录时用**「清空本目录文件」/「删除本目录全部内容」**，弹窗先预览文件数/目录数/总大小，再输入目录名确认；需要整目录取回时点**「下载本目录」**（bucket 根即整桶；单文件直接下载，多文件或含子目录自动打包 ZIP）
 5. 下载单个文件：文件行点「下载」；大文件自动按 `download.*`（默认 8MB × 4 路）分块并发，弹窗显示进度/速度并可**取消**；Chrome/Edge 可边下边写盘，其它浏览器或超大文件回退原生下载（详见「下载客户端行为」）
 6. 需要分享时点文件「签名链接」，弹窗选按时效/按次数/永久，生成后内嵌显示、可复制
 7. 管理员在「签名链接」页可看全部链接（含每行复制）、作废；「Token 管理」页同步/登记
 8. 需要查接口说明时点标签栏右侧的 **Swagger / ReDoc**（由 FastAPI 依据实际路由生成，可在线调试）
+9. 管理员可在 **「配置」标签页** 用共享令牌在线修改 `config.json` 并热加载：全部字段按分组展示，标注「需重启 / 被 .env 覆盖」；密钥字段留空表示保持原值
 
 ---
 
@@ -255,10 +256,19 @@ ARTIFACT_DEPOT_CONFIG=$(mktemp) PYTHONPATH=src python3 -m pytest tests/test_acce
   按 `bucket/key/size` 自动找回（找不到则新建 `resumed=false`）、`chunk`/`complete` 落点与原子清理、
   直传临时文件在目标目录、列表/批量删除/rename 跳过内部目录、服务重启后目标会话仍可续传、
   绝对/空闲 TTL 清理与 registry 更新、系统临时目录无残留、`initiate` 参数校验（400/409）。
-- `tests/test_upload_resume_ui.py` 覆盖网页端静态契约（14 个用例）：`#upPause`/`#upResume` 按钮、
-  `data-action` 均有 JS 处理器、失败行「失败（可续传）」与 `retry-upload`、`initiate` 发送
-  `resume`/`upload_id`、失败不 `abort`、分片边界暂停、继续只补缺失分片、刷新后重选文件的指纹缓存、
-  token/文件变化新建会话、CSP 无内联脚本、JS 语法。
+- `tests/test_upload_resume_ui.py` 覆盖网页端静态契约（18 个用例）：令牌门槛（未填令牌时
+  「选择文件 / 上传」禁用）、每个任务行的「暂停上传 / 继续上传 / 放弃」与 `data-action` 处理器、
+  失败行「失败（可续传）」与 `retry-upload`、`initiate` 发送 `resume`/`upload_id`、失败不 `abort`、
+  任务独立在分片边界暂停、继续只补缺失分片、刷新后重选文件的指纹缓存、按当前令牌列出/取消未完成上传、
+  上传说明精简且无平台信息、CSP 无内联脚本、JS 语法。
+- `tests/test_upload_pending.py` 覆盖「当前令牌未完成上传」内部接口（5 个用例）：无 token 401 /
+  缺 scope 403、同 token 可见而其它 token 与管理员不可见、字段与百分比、取消后从列表消失、
+  完成会话不列出、权限目录 23 条（2026-10-25 新增 `config:write`）且 OpenAPI 操作仍 35 条（内部接口不进 schema）。
+- `tests/test_config_ui.py` 覆盖「配置」标签页与新增配置项：配置接口需管理员共享 token 或 `config:write` 权限点、
+  快照 schema/文件值/生效值/来源/密钥脱敏、热更新写盘并生效、需重启项只写文件、未知/越界/类型错误 400、
+  null/对象/列表项对象拒绝、配置文件缺失时保留 access_token 基线、配置文件 0600、管理员令牌轮换、
+  `.env` 覆盖标注、清理间隔/DataHub 同步间隔/网页分页生效、`token.min_length` / `token.max_length` 校验、
+  接口不进 OpenAPI、网页静态标记。
 - `tests/test_upload_config.py` 覆盖上传参数配置化（`upload.*`）：默认值下发、自定义与越界夹紧、
   `max_chunk_mb` / `max_chunks` 生效、配置重载即时生效、`.env` 点号写法、网页端读取 `upload.*`（静态）。
 - `tests/test_download_chunked.py` 覆盖服务端分块并发下载：`access_token` 默认 `admin`、
@@ -297,7 +307,7 @@ ARTIFACT_DEPOT_CONFIG=$(mktemp) PYTHONPATH=src python3 -m pytest tests/test_acce
 - **`.env` 里的空值视为「未设置」**，不会覆盖 `config.json`。例：`config.json` 有 `access_token=abc`，`.env` 写 `access_token=`（空），最终仍是 `abc`
 - **`.env` 支持点号嵌套**：`signed_links.count_max=99` 直接写进嵌套字段
 - **未知配置项只告警不报错**：启动时提示 `未知配置项：xxx（已忽略）`
-- **环境变量入口**：`depot_dir` / `meta_dir` / `datahub_url` / `access_token` / `port` / `max_upload_mb`，以及 `upload.*` 的 10 个上传参数、`download.*` 的 3 个下载参数（见下表）；其余（如 `ui_enabled`、`signed_links`、`audit_max_mb`）只能靠 `config.json` 或 `.env`（`.env` 支持 `upload.chunk_size_mb=8` / `upload.staging_dir=/data/depot/.staging` / `download.chunk_size_mb=8` 点号写法）
+- **环境变量入口**：`depot_dir` / `meta_dir` / `datahub_url` / `access_token` / `port` / `max_upload_mb` / `datahub_sync_interval_seconds`，以及 `upload.*` 的 11 个上传参数、`download.*` 的 3 个下载参数、`ui.*` 的 2 个网页分页参数、`token.*` 的 2 个长度参数（见下表）；其余（如 `ui_enabled`、`signed_links`、`audit_max_mb`）只能靠 `config.json` 或 `.env`（`.env` 支持 `upload.chunk_size_mb=8` / `upload.staging_dir=/data/depot/.staging` / `download.chunk_size_mb=8` / `token.max_length=30` 点号写法）
 - **相对路径按「项目根」解析，不是按配置文件所在目录**。`"depot_dir": "./data"` 会解析成 `<仓库根>/data`；**容器部署必须写绝对路径**（如 `/data/depot`）
 
 容器部署时，`deploy_container.sh` 注入第 4 层环境变量：
@@ -325,15 +335,16 @@ ARTIFACT_DEPOT_ACCESS_TOKEN=...                 # 仅在使用 --token 时注入
 配置文件：`src/artifactdepot/config/config.json`（非敏感项，会进镜像）；**隐私项放 `src/artifactdepot/config/.env`**（字段名=值，如 `access_token=...`，不进 git/镜像）。可用 `ARTIFACT_DEPOT_CONFIG` 指定外部 config.json、`ARTIFACT_DEPOT_ENV` 指定外部 .env。
 
 > **优先级**：内置默认 < `config.json` < `.env` < 真实环境变量。
-> **手动重载**：网页「Token 管理」页有 **「重新加载配置」** 按钮（仅管理员），或调 `POST /api/config/reload`；`access_token`/`max_upload_mb`/`upload.*`/`download.*`/`signed_links`/`require_read_token`/`ui_enabled`/`metrics_enabled`/`trusted_proxies`/`audit_*`/`datahub_url` 即时生效，`host`/`port`/`depot_dir`/`meta_dir`/`cors_origins`/`allowed_hosts` 需重启。
+> **手动重载**：网页「配置」标签页可在线编辑 `config.json` 并热加载（管理员共享令牌或具备 `config:write` 的 token）；也可在「Token 管理」页点 **「重新加载配置」**，或调 `POST /api/config/reload`；`access_token`/`max_upload_mb`/`upload.*`/`download.*`/`ui.*`/`token.*`/`datahub_sync_interval_seconds`/`signed_links`/`require_read_token`/`ui_enabled`/`metrics_enabled`/`trusted_proxies`/`audit_*`/`datahub_url` 即时生效，`host`/`port`/`depot_dir`/`meta_dir`/`cors_origins`/`allowed_hosts`/`upload.staging_dir` 需重启。
 
 ### config.json 字段详解
 
 ```json
 {
-  "depot_dir": "./warehouse",
+  "depot_dir": "./depot",
   "meta_dir": "",
   "datahub_url": "http://127.0.0.1:8002/api/data",
+  "datahub_sync_interval_seconds": 60,
   "host": "0.0.0.0",
   "port": 8004,
   "access_token": "admin",
@@ -344,6 +355,11 @@ ARTIFACT_DEPOT_ACCESS_TOKEN=...                 # 仅在使用 --token 时注入
   "audit_backups": 5,
   "cors_origins": [],
   "allowed_hosts": ["*"],
+  "require_read_token": false,
+  "ui": {
+    "file_page_size": 200,
+    "audit_page_size": 500
+  },
   "signed_links": {
     "count_min": 1,
     "count_max": 10,
@@ -355,6 +371,7 @@ ARTIFACT_DEPOT_ACCESS_TOKEN=...                 # 仅在使用 --token 时注入
     "chunk_concurrency": 4,
     "file_concurrency": 3,
     "request_timeout_seconds": 86400,
+    "session_cleanup_interval_seconds": 600,
     "max_chunk_mb": 64,
     "max_chunks": 100000,
     "max_session_gb": 200,
@@ -366,15 +383,20 @@ ARTIFACT_DEPOT_ACCESS_TOKEN=...                 # 仅在使用 --token 时注入
     "chunk_size_mb": 8,
     "chunk_concurrency": 4,
     "request_timeout_seconds": 3600
+  },
+  "token": {
+    "min_length": 5,
+    "max_length": 30
   }
 }
 ```
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
-| `depot_dir` | `./warehouse` | 对象存储根目录。相对路径按**项目根**解析（本地免 sudo）；**容器部署填 `/data/depot` 卷路径** |
+| `depot_dir` | `./depot` | 对象存储根目录。相对路径按**项目根**解析（本地免 sudo）；**容器部署填 `/data/depot` 卷路径** |
 | `meta_dir` | `""` | **状态文件目录**（`tokens.json` / `signed_links.json` / `audit.log`）。留空 = 放在 `depot_dir` 根下；设了则独立存放（相对路径按 `depot_dir` 解析）。生产建议 `"/data/state"`（与部署脚本的状态卷挂载点一致），把可再生的状态文件与业务文件隔离、备份更清晰（0.5.0 新增） |
 | `datahub_url` | `http://127.0.0.1:8002/api/data` | 从哪个 DataHub 拉取用户 token（collab 权威源）。**同机 host 网络**部署就用 `127.0.0.1:8002`；跨机用 `http://<IP>:8002/api/data` |
+| `datahub_sync_interval_seconds` | `60` | DataHub 惰性同步最小间隔（秒）；`0` = 每次校验本地未命中都拉取 |
 | `host` | `0.0.0.0` | 监听地址 |
 | `port` | `8004` | 服务端口 |
 | `access_token` | `admin` | **管理员/工具共享令牌**：识别为「系统/工具」，可执行全部操作；管理接口（Token/审计）也用它。内置默认与 `config.json` / `.env` 默认都是 `admin`（开箱即用、便于内网联调）；**生产/公网部署必须改为 ≥16 位随机串**，可用 `--token` / `ARTIFACT_DEPOT_ACCESS_TOKEN` / config.json / `.env` 覆盖。`config_warnings()` 仍会对空/弱 token 告警（`admin` 属弱口令，长度 <12），设 `ARTIFACT_DEPOT_STRICT_CONFIG=1` 时告警会直接拒绝启动 |
@@ -387,6 +409,8 @@ ARTIFACT_DEPOT_ACCESS_TOKEN=...                 # 仅在使用 --token 时注入
 | `cors_origins` | `[]` | CORS 允许来源白名单；空 = 不启用 CORS 中间件 |
 | `allowed_hosts` | `["*"]` | TrustedHost 白名单；`["*"]` = 不限制 |
 | `require_read_token` | `false` | 读接口（`/api/buckets`、`/api/objects/list`）是否要求 `bucket:list` / `object:list` 权限；默认 false 保持内网公开 |
+| `ui.file_page_size` | `200` | 文件列表「加载更多」每次条数（10–1000） |
+| `ui.audit_page_size` | `500` | 审计日志单次查询条数（10–5000） |
 | `signed_links.count_min` | `1` | 签名链接**次数**下限（按次数类型） |
 | `signed_links.count_max` | `10` | 签名链接**次数**上限 |
 | `signed_links.expire_min_seconds` | `60` | 签名链接**时效**下限（秒） |
@@ -395,6 +419,7 @@ ARTIFACT_DEPOT_ACCESS_TOKEN=...                 # 仅在使用 --token 时注入
 | `upload.chunk_concurrency` | `4` | 浏览器每个文件同时上传的分片数（1–16） |
 | `upload.file_concurrency` | `3` | 浏览器同时上传的文件数（1–10，网页下拉框默认值） |
 | `upload.request_timeout_seconds` | `86400` | 分片/合并请求超时（默认 24h） |
+| `upload.session_cleanup_interval_seconds` | `600` | 后台清理过期分片会话的间隔（60s–24h） |
 | `upload.max_chunk_mb` | `64` | 单片硬上限（1–64MB） |
 | `upload.max_chunks` | `100000` | 单文件最大分片数（上限 100000） |
 | `upload.max_session_gb` | `200` | 会话总量上限（`max_upload_mb=0` 时生效，上限 200GB） |
@@ -404,6 +429,8 @@ ARTIFACT_DEPOT_ACCESS_TOKEN=...                 # 仅在使用 --token 时注入
 | `download.chunk_size_mb` | `8` | 下载分片大小（1–64MB）；网页/桌面客户端按此切 `Range` |
 | `download.chunk_concurrency` | `4` | 单个文件同时下载的分片数（1–16） |
 | `download.request_timeout_seconds` | `3600` | 单次分片请求超时（60s–7d，默认 1h） |
+| `token.min_length` | `5` | 新建 token 允许的最小字符数（1–256） |
+| `token.max_length` | `30` | 新建 token 允许的最大字符数（1–256）；服务端自动生成 token 时取该长度 |
 
 > **次数与时效互斥**：签名链接类型为「按时效 / 按次数 / 永久」三选一。选按时效时次数不生效，选按次数时效不生效。越界返回 400；前端按配置显示 min/max 提示并拦截。
 
@@ -416,13 +443,17 @@ ARTIFACT_DEPOT_ACCESS_TOKEN=...                 # 仅在使用 --token 时注入
 | `ARTIFACT_DEPOT_DIR` | `depot_dir` |
 | `ARTIFACT_DEPOT_META_DIR` | `meta_dir`（0.5.0 新增） |
 | `ARTIFACT_DEPOT_DATAHUB_URL` | `datahub_url` |
+| `ARTIFACT_DEPOT_DATAHUB_SYNC_INTERVAL_SECONDS` | `datahub_sync_interval_seconds` |
 | `ARTIFACT_DEPOT_ACCESS_TOKEN` | `access_token` |
 | `ARTIFACT_DEPOT_PORT` | `port` |
 | `ARTIFACT_DEPOT_MAX_UPLOAD_MB` | `max_upload_mb` |
+| `ARTIFACT_DEPOT_UI_FILE_PAGE_SIZE` | `ui.file_page_size` |
+| `ARTIFACT_DEPOT_UI_AUDIT_PAGE_SIZE` | `ui.audit_page_size` |
 | `ARTIFACT_DEPOT_UPLOAD_CHUNK_SIZE_MB` | `upload.chunk_size_mb` |
 | `ARTIFACT_DEPOT_UPLOAD_CHUNK_CONCURRENCY` | `upload.chunk_concurrency` |
 | `ARTIFACT_DEPOT_UPLOAD_FILE_CONCURRENCY` | `upload.file_concurrency` |
 | `ARTIFACT_DEPOT_UPLOAD_REQUEST_TIMEOUT_SECONDS` | `upload.request_timeout_seconds` |
+| `ARTIFACT_DEPOT_UPLOAD_SESSION_CLEANUP_INTERVAL_SECONDS` | `upload.session_cleanup_interval_seconds` |
 | `ARTIFACT_DEPOT_UPLOAD_MAX_CHUNK_MB` | `upload.max_chunk_mb` |
 | `ARTIFACT_DEPOT_UPLOAD_MAX_CHUNKS` | `upload.max_chunks` |
 | `ARTIFACT_DEPOT_UPLOAD_MAX_SESSION_GB` | `upload.max_session_gb` |
@@ -432,6 +463,8 @@ ARTIFACT_DEPOT_ACCESS_TOKEN=...                 # 仅在使用 --token 时注入
 | `ARTIFACT_DEPOT_DOWNLOAD_CHUNK_SIZE_MB` | `download.chunk_size_mb` |
 | `ARTIFACT_DEPOT_DOWNLOAD_CHUNK_CONCURRENCY` | `download.chunk_concurrency` |
 | `ARTIFACT_DEPOT_DOWNLOAD_REQUEST_TIMEOUT_SECONDS` | `download.request_timeout_seconds` |
+| `ARTIFACT_DEPOT_TOKEN_MIN_LENGTH` | `token.min_length` |
+| `ARTIFACT_DEPOT_TOKEN_MAX_LENGTH` | `token.max_length` |
 
 > 优先级：**环境变量 > 配置文件 > 内置默认**。容器部署用 `-e` 传环境变量即可，无需改代码/文件。
 
@@ -485,6 +518,10 @@ cp src/artifactdepot/config/config.production.json ~/SERVER/artifactdepot/config
     "chunk_size_mb": 8,
     "chunk_concurrency": 4,
     "request_timeout_seconds": 3600
+  },
+  "token": {
+    "min_length": 5,
+    "max_length": 30
   }
 }
 ```
@@ -538,7 +575,7 @@ ArtifactDepot/
 ### 磁盘存储布局
 
 ```
-<depot_dir>/                  # 如 ./warehouse 或 /data/depot
+<depot_dir>/                  # 如 ./depot 或 /data/depot
 - <bucket>/                       # bucket = 项目（如 音视门carryVdeio）
   - 任务1/交付物/a.mp4             # key = 路径，含 / 即子目录
   - 任务1/交付物/.keep             # 新建目录的隐藏占位（列表跳过）
@@ -572,7 +609,7 @@ ArtifactDepot/
 
 | 模块 | 职责 |
 |---|---|
-| `config/__init__.py` | 合并 默认 < config.json < .env < 环境变量；相对路径按项目根解析；支持 `meta_dir` / `upload.staging_dir` / 手动 `reload_config()`；归一化并夹紧 `upload.*` / `download.*` 参数（`get_*_settings` / `public_*_settings`），`staging_dir` 改动进入 `needs_restart` |
+| `config/__init__.py` | 合并 默认 < config.json < .env < 环境变量；相对路径按项目根解析；支持 `meta_dir` / `upload.staging_dir` / 手动 `reload_config()`；归一化并夹紧 `upload.*` / `download.*` / `ui.*` 参数（`get_*_settings` / `public_*_settings`），`staging_dir` 改动进入 `needs_restart`；网页「配置」标签页的 `config_schema()` / `config_snapshot()` / `update_config_file()`（原子写 0600、校验、失败回滚、字段来源/覆盖标注） |
 | `storage.py` | **核心引擎**：bucket/key 落盘、路径穿越防护、SHA-256、`.warehouse.json` 清单、签名链接注册表（创建/校验/次数递减/作废）、token 注册表、审计日志（双 IP + UTC）、DataHub 同步、mkdir、空目录删除策略、**批量删除目录内容（`bulk_delete`）**、**一键下载只读扫描（`bulk_download_scan`）**、**分片会话（目标目录 `.artifactdepot-uploads` / legacy staging、进程内 registry、续传查找、TTL 清理与启动扫描、`put_object(move=True)` 原子落盘）**、`_dir_recursive_info()` 目录递归统计（大小/最新 mtime）、`_meta_path` 状态文件定位（meta_dir） |
 | `zipstream.py` | **流式 ZIP 生成**（目录一键下载）：后台线程写非 seekable 队列 writer + 有界队列消费（背压），`ZIP_STORED`/Zip64、256 KiB 分块读取、不落临时文件；客户端中断可取消，审计恰好一次 |
 | `auth.py` | `check_admin_token`（UTF-8 字节常量时间比较，非 ASCII 安全）、`resolve_actor`、`resolve_actor_with_sync`（惰性同步）、`require_write_token` / `require_admin` |
@@ -611,7 +648,7 @@ ArtifactDepot/
 | 项 | 说明 |
 |---|---|
 | 鉴权 | 权限点 `object:upload`（管理员共享 token 放行全部；按 token 的 bucket/前缀范围校验） |
-| 请求 | multipart/form-data：`file`(必)、`bucket`(必，=项目)、`key`(必，含 `/` 自动建目录)、`token`、`source_url`、`overwrite`(默认 `true`)、`public_ip` |
+| 请求 | multipart/form-data：`file`(必)、`bucket`(必，=项目)、`key`(必，含 `/` 自动建目录)、`token`、`source_url`（来源，允许 URL 或自由文本）、`note`（备注）、`overwrite`(默认 `true`)、`public_ip` |
 | 成功 | `data:{bucket, key, size, sha256}`；`.warehouse.json` 同时记录 `uploader`（按 token 识别为「系统/工具」或用户名） |
 | 错误 | `401` 无效 token；`413` 超过 `max_upload_mb` 上限；`409` `overwrite=false` 且对象已存在 |
 | 说明 | 流式落盘到 `<depot_dir>/<bucket>/<key>`，写审计（双 IP、UTC）；key 父目录自动创建；小文件/常规上传直接走本接口；大文件建议使用下面的分片接口 |
@@ -624,7 +661,7 @@ ArtifactDepot/
 |---|---|---|
 | `initiate` | `POST /api/objects/initiate` | 创建/恢复分片会话；参数与响应见下 |
 | `chunk` | `POST /api/objects/chunk` | multipart：`upload_id`、`index`、`chunk`（分片文件）；请求体临时文件写会话 `.incoming/`，随后原子改名为 `chunk_<i>.part` |
-| `complete` | `POST /api/objects/complete` | multipart/form-data：`upload_id`、`bucket`、`key`、`total_chunks`、`source_url`、`overwrite`、`public_ip`；合并到会话内 `.merged` 后 `put_object(move=True)` 原子落盘 |
+| `complete` | `POST /api/objects/complete` | multipart/form-data：`upload_id`、`bucket`、`key`、`total_chunks`、`source_url`（来源）、`note`（备注）、`overwrite`、`public_ip`；合并到会话内 `.merged` 后 `put_object(move=True)` 原子落盘 |
 | `abort` | `POST /api/objects/abort` | `upload_id`；放弃并清理会话目录（幂等） |
 
 **`initiate` 请求参数**（query 与 multipart form 均可，允许空 body 向后兼容；同名时表单优先）：
@@ -668,7 +705,7 @@ ArtifactDepot/
 
 - 内部目录 `.artifactdepot-uploads` 是隐藏目录：列表 / 目录递归大小 / ZIP 打包跳过，**批量删除 `mode=all` 与 rename 也显式跳过**（保护活跃上传）；会话清空后目录自动 `rmdir`。
 - 成功或硬失败（磁盘满、I/O）清理会话；**校验类失败（缺片、`total_chunks` 越界、超限、权限、`overwrite=false` 的 409）保留会话**可重试。
-- **重启续传**：会话在数据盘，服务启动时扫描 `.artifactdepot-uploads`，未过期会话重新注册进进程内 registry（单进程假设，uvicorn 未开 `--workers`），客户端可继续上传；超过 `upload.session_ttl_seconds`（绝对）/ `upload.session_idle_ttl_seconds`（空闲）的会话被清理，后台每 10 分钟再清一次。
+- **重启续传**：会话在数据盘，服务启动时扫描 `.artifactdepot-uploads`，未过期会话重新注册进进程内 registry（单进程假设，uvicorn 未开 `--workers`），客户端可继续上传；超过 `upload.session_ttl_seconds`（绝对）/ `upload.session_idle_ttl_seconds`（空闲）的会话被清理，后台按 `upload.session_cleanup_interval_seconds`（默认 600s）再清一次。
 
 > 其余说明：`complete` 会校验所有分片齐全、合并后复用 `put_object` 写 `.warehouse.json` 与审计；
 > 前端对大于 `upload.chunk_size_mb`（默认 8MB）的文件自动走分片流程，分片并发/超时也读取服务端配置（默认 4 路、24h）；`<=` 该阈值走普通 `POST /api/objects`。
@@ -688,7 +725,7 @@ ArtifactDepot/
 |---|---|
 | 鉴权 | 默认内网开放；`require_read_token=true` 时需权限点 `object:list`（资源范围外返回 403） |
 | 请求 | Query：`bucket`(必)、`prefix`(空=根目录；指向目录时列该目录直接子项) |
-| 成功 | `data:{bucket, prefix, items:[...]}`；文件项含 `name/key/is_dir/size/mtime(UTC Z)/sha256/source_url/uploader`；目录项 `key` 以 `/` 结尾，并含 `size`（**递归总大小**）与 `mtime`（**最新修改时间**） |
+| 成功 | `data:{bucket, prefix, items:[...]}`；文件项含 `name/key/is_dir/size/mtime(UTC Z)/sha256/source_url/note/uploader`；目录项 `key` 以 `/` 结尾，并含 `size`（**递归总大小**）与 `mtime`（**最新修改时间**） |
 | 错误 | `400` prefix 越界（越出 bucket 根） |
 
 #### 下载文件 — `GET /api/objects/download`（GetObject）
@@ -749,12 +786,12 @@ ArtifactDepot/
 |---|---|---|
 | GET | `/api/objects/signed-links/config` | 返回次数/时效上下限（供前端渲染校验） |
 | GET | `/api/objects/signed-links` | 列签名链接（需 `link:list`；带范围 token 只见范围内条目；**完整 URL 仅管理员/创建者可见**；密钥不回传） |
-| POST | `/api/objects/signed-links/{id}/revoke` | 作废（需 `link:revoke`；管理员可作废任意，用户只能作废自己创建的） |
+| POST | `/api/objects/signed-links/{link_id}/revoke` | 作废（需 `link:revoke`；管理员可作废任意，用户只能作废自己创建的） |
 
 ### 系统 / 管理接口
 
 #### Token 校验 — `GET /api/auth/check`
-`?token=` → `data:{valid, actor, role, scopes, allow_buckets, allow_prefixes, expires_at, expired, enabled}`；上传/下载前先审核。
+`?token=` → 成功：`data:{valid:true, actor, role, is_admin, scopes, allow_buckets, allow_prefixes, expires_at, description}`；失败：`valid:false` 且另含 `expired` / `enabled`。上传/下载前先审核。
 
 #### 健康检查 — `GET /health`
 `{"status":"ok","depot_dir":"...","exists":true}`
@@ -762,12 +799,16 @@ ArtifactDepot/
 #### 列 bucket — `GET /api/buckets`
 返回 `data:[...]` bucket（项目）列表。
 
+#### 运行时配置 — `GET/POST /api/config`、`POST /api/config/reload`（权限点 `config:write`）
+`GET` 返回配置快照（`schema` / `values` / `effective` / `sources` / `overridden` / `warnings`，密钥脱敏）；`POST` 只接受已知配置项、原子写回 `config.json` 并热加载（未知项/越界/类型错误 `400`）；`POST /api/config/reload` 重新读取磁盘配置。三者均接受**管理员共享 token**或具备 **`config:write`** 权限点的 token；无 token `401`、缺权限 `403`。`config:write` 用户 token 不得提交新的 `access_token`（`403`，仅管理员可轮换），其他配置项可改。config 接口 `include_in_schema=False`，OpenAPI 操作数仍 35。
+
 #### Token 注册表管理（权限点 `token:*`）
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/api/tokens` | 查看 token→用户名 映射 |
-| POST | `/api/tokens` | 登记/更新：JSON `{"token": "...", "user": "..."}` |
+| GET | `/api/tokens` | 查看 token 映射；未「显示明文」时只展示**前 2 位 + `****` + 后 4 位**，管理员可 `?reveal=true` 看明文 |
+| POST | `/api/tokens` | 生成/登记：`token` 留空按 `token.max_length` 生成，显式新 token 长度须在 `token.min_length`–`token.max_length`（默认 5–30）内，越界 400 |
+| PUT | `/api/tokens/{value}` | 更新权限/范围/过期/启用状态（未传字段保留；不校验 token 长度；显式 token 建议 URL-safe，含 `/` 时该路径不可寻址） |
 | DELETE | `/api/tokens?value=<token>` | 移除某个 token（用户重置/注销时） |
 | POST | `/api/tokens/sync` | 从 DataHub `users.json` 拉取并合并用户 token（collab 权威源、本地副本只增不删）；返回 `data.ok` 反映 DataHub 可达性 |
 
@@ -778,7 +819,7 @@ Query：`bucket`/`key`/`actor`/`since`(YYYY-MM-DD 起)/`limit`(默认 500)。返
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/api/docs` | 文档清单（公开）：`[{name,title,available}]`，name ∈ api_rules/architecture/readme/changelog |
+| GET | `/api/docs` | 文档清单（公开）：`[{name,title,available}]`，name ∈ api_rules/architecture/readme/changelog/license/license_zh/license_header |
 | GET | `/api/docs/{name}` | 文档内容（公开）：`data:{name,title,content}` |
 | GET | `/api/docs/{name}?raw=1` | 直接返回 `text/plain` 原文 |
 
@@ -786,16 +827,18 @@ Query：`bucket`/`key`/`actor`/`since`(YYYY-MM-DD 起)/`limit`(默认 500)。返
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/` | 网页控制台（bucket 选择、整页拖拽上传、**上传暂停/继续与失败续传**、**分块并发下载（进度/速度/取消）**、一键下载目录、新建目录、批量删除、签名链接/Token/审计管理；标签栏右侧含 Swagger/ReDoc 入口） |
+| GET | `/` | 网页控制台（bucket 选择、整页拖拽上传、**每个任务行的暂停/继续 + 当前令牌未完成上传列表/取消**、**配置标签页（具备 `config:write` 的令牌在线改 config.json + 热加载，输入令牌后自动加载）**、**分块并发下载（进度/速度/取消）**、一键下载目录、新建目录、批量删除、签名链接/Token/审计管理；标签栏右侧含 Swagger/ReDoc 入口） |
 
 ### 上传客户端行为（网页 / 桌面）
 
 **网页端**（`src/artifactdepot/resources/static/app.js`）：
 
 - **参数**：`initiate` 始终带 `bucket`/`key`/`size`；续传再带 `resume=true`（可带 `upload_id` 指定复用）；队列项记录 `upload_id` / `chunk_size` / `uploaded`。
-- **暂停/继续**：`#upPause`（`data-action="pause-upload"`）在当前分片传完后生效，不再发新分片；`#upResume`（`data-action="resume-upload"`）唤醒暂停的 worker，并向服务端 `initiate(resume=true)` 取回真实 `uploaded` 后只补缺失分片。
-- **失败续传**：失败**不再 `abortUpload`**，该行显示**「失败（可续传）」**并提供 `data-action="retry-upload"` 的「继续」；会话与已传分片保留在服务端。
-- **刷新后**：浏览器无法自动恢复文件列表；重新选择同一文件再点「上传」即可按 `bucket/key/size` 找回未完成会话（同一浏览器、同一 token 下有效；token 变更或文件 size/mtime 变化时自动新建会话）。
+- **令牌门槛**：未填写令牌时 `#upFile` 与上传按钮禁用（`syncUploadGate()`）；拖拽入队前同样再次校验令牌。
+- **暂停/继续（按任务行）**：每行独立 `data-action="pause-upload" / "resume-upload"` + `data-uid`，按钮只出现在该任务进度条右侧；`pauseUpload(uid)` 在当前分片传完后生效，`resumeUpload(uid)` 唤醒该任务的 worker，并向服务端 `initiate(resume=true)` 取回真实 `uploaded` 后只补缺失分片。
+- **未完成上传（当前令牌）**：页面加载 / 输入令牌后调用内部接口 `GET /api/objects/uploads`（`include_in_schema=False`，复用 `upload:abort` 权限），只返回当前 token 名下未完成的会话；点「取消上传」调用 `POST /api/objects/abort` 并清理本地断点记录。
+- **失败续传**：失败**不再 `abortUpload`**，该行显示**「失败（可续传）」**并提供 `data-action="retry-upload"` 的「继续上传」；会话与已传分片保留在服务端。
+- **刷新后**：浏览器无法自动恢复文件列表；当前令牌未完成会话会列在下方（可手动取消），重新选择同一文件再点「上传」即可按 `bucket/key/size` 找回并续传（同一浏览器、同一 token 下有效；token 变更或文件 size/mtime 变化时自动新建会话）。
 - **CSP**：事件委托 + `data-action`，无内联脚本（`script-src 'self'`）。
 
 **桌面客户端**（`client/`，详见 `client/README.md`）：

@@ -1,9 +1,143 @@
 # Changelog
 
-ArtifactDepot v0.9.0 — 所有对本项目的重要更改都将记录在此文件中。
+ArtifactDepot v0.10.0 — 所有对本项目的重要更改都将记录在此文件中。
 
 本日志格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本号遵循 [语义化版本规范](https://semver.org/lang/zh-CN/)。
+
+---
+
+## [0.10.0] - 2026-10-25
+
+### 文档审计与稳定文档校对（2026-10-25）
+
+#### Changed
+
+- **`docs/api_rules.md` 全量逐接口校对**：修正 `initiate` 的 token 传递方式（form token 不解析）、
+  `public_ip` 交叉引用、错误码（补配置/`rename`/`access_token` 防提权）、列表空 bucket/目录 `mtime`/分页说明、
+  `mkdir`/`DELETE`/`abort`/分片响应、`presign` 上下限与响应语义、批量删除内部目录跳过、ZIP 目录 `mtime`、
+  `reload` 环境变量、DataHub `mapping` 明文提示、配置表补齐 38 项、`operator` 角色补 `object:download`、
+  `auth/check` 成功/失败字段等。
+- **`README.md` / `docs/architecture.md`**：修正 `depot_dir` 默认值 `./depot`、补 `PUT /api/tokens/{value}`、
+  统一 `{link_id}`、补文档白名单许可证、`auth/check` 字段、删除权限说明；API 契约表补全路径并拆分行。
+- **一致性基线**：文档与运行时一致（35 条 OpenAPI 操作、23 个权限点、38 个配置项、9 个角色预设、7 篇文档）；
+  文档保持无 emoji。
+- **接口文档精简**：`docs/api_rules.md` 由 1481 行精简为 800 行，移除版本/变更日志、历史勘误、内部实现细节、
+  接入指南等非接口内容，只保留文档介绍、接口规则、错误码、配置项、权限点与角色。
+
+### 站点配置权限、Token 长度与脱敏（2026-10-25）
+
+#### Added
+
+- **新增权限点 `config:write`（系统 / 审计）**：`GET/POST /api/config` 与 `POST /api/config/reload`
+  改为「管理员共享 token 或具备 `config:write` 的 token」可调用；无 token `401`、缺权限 `403`。
+  权限点总数 22 → **23 条**，OpenAPI 操作数仍 **35 条**（config 接口仍 `include_in_schema=False`）；
+  `admin` 角色预设自动包含新权限点，其他角色预设不变。
+- **配置项 `token.min_length` / `token.max_length`（默认 5 / 30，范围 1–256）**：配置中心新增「令牌」分组；
+  服务端自动生成 token 长度取 `max_length`；显式创建新 token 长度须在 `[min_length, max_length]` 内，
+  越界返回 `400`；覆写既有 token 不校验长度（兼容历史短 token）；支持环境变量
+  `ARTIFACT_DEPOT_TOKEN_MIN_LENGTH` / `ARTIFACT_DEPOT_TOKEN_MAX_LENGTH`；配置保存时校验 `min <= max`。
+- **`GET /api/auth/permissions` 新增 `data.token`**：`{min_length, max_length}`，供网页生成 token 时读取。
+
+#### Changed
+
+- **Token 脱敏规则**：未勾选「显示明文」时显示**前 2 位 + `****` + 后 4 位**（长度 ≤6 时仅前 2 位 + `****`），
+  不再显示哈希后缀；前 2 + 后 4 相同的不同 token 由服务端追加短哈希兜底，避免注册表条目互相覆盖。
+- **网页「配置」标签页**：输入令牌后自动加载配置（400ms 防抖），不再需要手动点「加载配置」；
+  配置页不再仅限管理员共享令牌，具备 `config:write` 的 token 也可读取/写回/热加载。
+- **配置写入加固**：`config:write` 用户 token **不能提交新的 `access_token`**（403，仅管理员共享 token 可轮换），
+  避免借配置页接管管理员身份；配置写入用进程内 `_CONFIG_LOCK` 串行化，避免并发保存丢失更新。
+- **文档与网页 UI 移除 emoji**：`README.md`、`CHANGELOG.md`、`docs/*.md`、`index.html`、`app.js`、`app.css`
+  中的警示等 emoji 改为中文文字，并新增自动化测试防止回潮。
+- **测试**：更新权限点计数（23）、config 权限、Token 掩码与长度校验用例；新增 emoji 禁令测试。
+
+### 令牌跨标签页同步（2026-10-25）
+
+#### Added
+
+- **令牌输入框跨标签自动同步**：五个标签页（浏览 / 签名链接 / Token 管理 / 审计 / 配置）各自有一个
+  令牌输入框，在任意一个输入后，其余输入框自动填入同一令牌，不必逐页重复输入；清空同理。
+  同步会派发 `input` 事件，让上传门槛（选择文件/上传按钮）、当前令牌未完成上传列表随之刷新。
+- **URL 带入的 token 也同步**：`/?token=...` 进入时五个标签页的令牌框一起填入（此前只填「浏览」
+  与「签名链接」两处）。
+- **配置页改管理员令牌后全局换新**：保存 `access_token` 后五个输入框一起更新，避免后续操作 401。
+
+#### Changed
+
+- 令牌只在**当前页面内存**里同步，不写 `localStorage` / `sessionStorage`（与「断点续传只缓存文件
+  指纹、不存 token」的策略一致），刷新页面后需重新输入或走 `?token=` 跳转。
+- **测试**：`tests/test_upload_resume_ui.py` 新增令牌跨标签同步静态契约（五个输入框 + 监听 +
+  URL 带入 + 配置改令牌 + 不落盘）。
+- **文档**：`README.md`（网页 UI / 跳转免填两行）同步。
+
+### 上传元数据：来源放宽 + 新增备注（2026-10-25）
+
+#### Added
+
+- **网页新增可选「备注」**：上传工具栏在「来源」右侧新增 `#upNote` 输入框（可选，一句话备注），
+  直传与分片上传都会随请求提交，写入对象元数据。
+- **接口新增 `note` 字段**：`POST /api/objects` 与 `POST /api/objects/complete` 均接受可选
+  multipart 字段 `note`；落盘后写入 `.warehouse.json` 的 `note`，`GET /api/objects/list`
+  的文件项返回 `note`（无则为空串）。旧客户端不传即空，行为兼容，权限点/OpenAPI 操作数不变。
+
+#### Changed
+
+- **「来源URL」改为「来源」**：网页标签与占位提示改成「来源 / 可选，来源链接或说明」，
+  值不再限定为 URL——接口侧本来就只按字符串存储，因此允许频道名、系统名、客户名等自由文本。
+- **元数据文本长度上限**：来源 512 字符、备注 200 字符（超出截断），避免整份重写的
+  `.warehouse.json` 被长文本撑大、拖慢所有上传。
+- **文档**：`README.md`（上传/分片/列表字段）、`docs/api_rules.md`（§2.1 上传参数、§2.5 列表项、
+  §3.5 complete 参数）同步。
+
+### 网页上传交互优化（2026-10-25）
+
+#### Added
+
+- **当前令牌未完成上传列表**：页面加载或输入令牌后，按当前 token 列出上传了一半的分片会话
+  （文件名、bucket/key、已传字节/百分比），可逐条「取消上传」。会话来自服务端磁盘，因此页面刷新、
+  服务重启后仍能显示；取消会调用 `POST /api/objects/abort` 删除服务端分片并清理本地断点记录。
+  内部接口 `GET /api/objects/uploads` 使用 `include_in_schema=False`、复用 `upload:abort` 权限，
+  **只返回 `owner == 当前 actor` 的会话**，不新增权限点（当时 22 条，现 23 条）与 OpenAPI 操作（仍 35 条）。
+- **任务行内暂停/继续/放弃**：每个上传任务的进度条右侧独立提供「暂停上传」「继续上传」「放弃」，
+  顶部「并发数 / 上传」工具栏不再出现全局暂停/继续按钮；暂停按任务在分片边界生效，不影响其它文件；
+  小文件单请求直传不显示暂停按钮，但「放弃」会 abort 当前 XHR。
+- **令牌门槛**：未填写令牌时「选择文件」与「上传」按钮禁用（页面初始即 `disabled`），
+  输入令牌后即时解禁；拖拽入队前仍会再次校验令牌。
+
+#### Changed
+
+- **上传说明文案精简**：缩短为上传目标、多选/拖拽、分片与失败续传、任务行暂停/继续、
+  刷新后未完成列表/取消、下载分块与取消几行；**不再出现协作平台 /「查看我的Token」等信息**。
+- **测试**：新增 `tests/test_upload_pending.py`（接口/隔离/取消/契约计数 5 个用例）；
+  `tests/test_upload_resume_ui.py` 更新为「令牌门槛 + 任务行暂停/继续 + 未完成上传列表」静态契约（18 个用例）。
+- **文档**：`README.md`、`docs/api_rules.md`（§3.5 内部接口、§7 网页行为）同步。
+
+### 配置中心 + 配置项补齐（2026-10-25）
+
+#### Added
+
+- **网页「配置」标签页**（仅管理员共享令牌）：读取全部 `config.json` 字段（按基础/DataHub/
+  网络与安全/界面/上传/下载/签名链接/系统分组），显示「需重启」「被 .env 覆盖」「被环境变量覆盖」
+  标记；支持在线修改、原子写回并热加载，也可只从磁盘重载。密钥字段脱敏展示，留空表示保持原值。
+- **管理员配置接口**：`GET /api/config` 返回 schema / 文件值 / 生效值 / 字段来源 / 告警 /
+  需重启项；`POST /api/config` 校验类型与范围、原子写 `config.json`（0600）、调用 `reload_config()`
+  热加载，失败自动回滚。两者 `include_in_schema=False`，仅共享管理员令牌可用，不新增权限点/操作数。
+- **新增配置项**：`upload.session_cleanup_interval_seconds`（后台分片清理间隔，默认 600s）、
+  `datahub_sync_interval_seconds`（DataHub 惰性同步间隔，默认 60s，0=每次拉取）、
+  `ui.file_page_size`（文件列表分页，默认 200）、`ui.audit_page_size`（审计查询条数，默认 500）。
+
+#### Changed
+
+- `config.json` / `config.production.json` 补齐此前缺失的 `require_read_token`，并加入上述新键；
+  `.env.example` 同步点号写法与 `ARTIFACT_DEPOT_*` 环境变量。
+- 网页从 `/api/auth/permissions` 的 `data.ui` 读取分页配置；审计查询显式传 `limit`。
+- **配置写入校验补强**：`POST /api/config` 对 `null`、对象/列表项对象等错误容器类型一律返回 `400`，
+  不再把 `None`/dict 静默转成字符串；配置文件缺失时以**当前生效配置**为基线，避免只提交一个字段
+  就把 `access_token` 等其它配置重置为默认值。
+- **测试**：新增 `tests/test_config_ui.py`（12 个用例，覆盖接口权限/热更新/回滚/密钥轮换/.env 覆盖/
+  新配置项/OpenAPI 计数/网页静态标记/错误类型/缺失文件基线）。
+- **文档**：`README.md`、`docs/api_rules.md`（§4.1.3 配置接口、§7 配置标签页、§8 总表、§9 配置项、
+  §12.1 `ui` 下发）、`docs/architecture.md` 同步。
 
 ---
 
@@ -302,7 +436,7 @@ ArtifactDepot v0.9.0 — 所有对本项目的重要更改都将记录在此文�
   并要求二次确认；`allow_prefixes` 里出现不在 `allow_buckets` 中的 bucket 时直接阻止提交并说明原因
   （避免「写了前缀却不生效」）。
 - **生效范围展示**：生成结果区展示「生效范围：bucket=…；前缀=…」；Token 注册表「资源范围」列空范围时显示
-  `⚠️ 全部 bucket`；「显示明文」下的权限明细行也展示「生效范围」。
+  「未限制（全部 bucket）」；「显示明文」下的权限明细行也展示「生效范围」。
 - 文档：`docs/api_rules.md` §1.4（资源范围为硬边界）、§2.2 / §4.2（带 token 的读接口鉴权与越界 `403`）、
   §5 / §12.4（防提权）、§6（审计范围过滤）、§9（补 `require_read_token` / `metrics_enabled` 配置项）。
 
@@ -314,7 +448,7 @@ ArtifactDepot v0.9.0 — 所有对本项目的重要更改都将记录在此文�
   **不带 token 时行为不变**：仍按 `require_read_token` 保持公开（`false`）或 `401`（`true`）。
 - **审计查询范围过滤**：非共享 token 的 `GET /api/audit` 只返回其 `allow_buckets` / `allow_prefixes`
   范围内的记录（过滤在收集阶段完成，`limit` 语义不变）。
-- **Token 注册表 UI**：「资源范围」列改由统一格式化函数渲染，空范围醒目显示 `⚠️ 全部 bucket`。
+- **Token 注册表 UI**：「资源范围」列改由统一格式化函数渲染，空范围醒目显示「未限制（全部 bucket）」。
 
 #### Security
 

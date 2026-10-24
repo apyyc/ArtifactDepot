@@ -68,7 +68,7 @@ ArtifactDepot/
     ├── auth.py                 # 写操作 token 校验（query / Bearer）
     ├── api/
     │   ├── objects.py          # S3-like 对象 API
-    │   ├── system.py           # /health /api/buckets /api/tokens /api/audit
+    │   ├── system.py           # /health /api/buckets /api/tokens /api/audit /api/config /api/auth
     │   └── docs.py             # /api/docs 文档清单与内容（前端文档页数据源）
     ├── web/ui.py               # 网页 UI
     ├── permissions.py          # 权限点目录与角色预设
@@ -80,7 +80,7 @@ ArtifactDepot/
 ## 存储布局
 
 ```
-<depot_dir>/                  # 默认 ./warehouse（项目内）；容器部署用 /data/depot 卷
+<depot_dir>/                  # 默认 ./depot（项目内）；容器部署用 /data/depot 卷
 ├── <bucket>/                     # bucket = 项目（如 project_1）
 │   ├── task_5/                   # key 的父目录（可多级）
 │   │   ├── xxx.mp4               # key = 任务/文件名（扁平路径式命名）
@@ -133,6 +133,8 @@ ArtifactDepot/
 
 ## API 契约（S3 对应）
 
+> 下表列出主要接口（完整权限/参数/返回见 `docs/api_rules.md` §8、§12）。
+
 | 方法 | 路径 | 说明 | 对应 S3 |
 |---|---|---|---|
 | POST | `/api/objects` | multipart 上传（bucket/key/token/source_url/overwrite；临时文件写目标父目录 + `put_object(move=True)`） | PutObject |
@@ -140,20 +142,31 @@ ArtifactDepot/
 | POST | `/api/objects/chunk` | 上传分片（请求体落会话 `.incoming`，再原子改名为 `chunk_<i>.part`） | - |
 | POST | `/api/objects/complete` | 合并分片（`.merged` + `put_object(move=True)` 原子落盘；成功/硬失败清理会话） | - |
 | POST | `/api/objects/abort` | 取消分片会话（删除会话目录，幂等） | - |
+| GET | `/api/objects/uploads` | 网页内部：列出当前令牌未完成的分片会话（`include_in_schema=false`，复用 `upload:abort`，不新增权限点） | - |
 | POST | `/api/objects/mkdir` | 新建目录（key 可含 `/` 多级） | - |
+| POST | `/api/objects/rename` | 重命名/移动目录或对象（源与目标都校验范围） | - |
+| GET | `/api/objects/head` | 对象元信息探测（`object:head`；404/304） | HeadObject |
 | GET | `/api/objects/list` | 列对象（bucket/prefix） | ListObjects |
 | GET / HEAD | `/api/objects/download` | 下载（`HEAD` 探测 + Range 206 分块并发；HEAD 以 `include_in_schema=false` 注册，不新增权限点），需 token（签名链接免） | GetObject |
 | GET | `/api/objects/download-bulk` | 一键下载目录：单文件直下 / 多文件或含子目录流式 ZIP（复用 `object:download`；见下「可靠性要点」） | - |
 | DELETE | `/api/objects` | 删除对象/空目录（权限点 `object:delete`） | DeleteObject |
 | POST | `/api/objects/bulk-delete` | 批量删除目录内容（`object:delete_bulk`；保留目录本身、需输入名称确认；见下「可靠性要点」） | - |
 | POST | `/api/objects/presign` | 生成签名链接（count/time/permanent） | Presigned URL |
-| GET/POST/DELETE/PUT | `/api/tokens` | Token 注册表管理（`token:read/write/delete`） | - |
+| GET | `/api/objects/signed-links` | 列签名链接（`link:list`；完整 URL 仅管理员/创建者） | - |
+| GET | `/api/objects/signed-links/config` | 签名链接次数/时效上下限（公开） | - |
+| POST | `/api/objects/signed-links/{link_id}/revoke` | 作废签名链接（`link:revoke`；本人或管理员） | - |
+| GET/POST/DELETE | `/api/tokens` | Token 注册表管理（`token:read/write/delete`；默认脱敏前 2 + 后 4） | - |
+| PUT | `/api/tokens/{value}` | 更新 token 权限/范围/过期/启用状态（`token:write`） | - |
+| GET/POST | `/api/config` | 运行时配置快照 / 在线写回 config.json 并热加载（`config:write`；`include_in_schema=false`） | - |
+| POST | `/api/config/reload` | 手动重载配置（`config:write` 或管理员共享 token） | - |
 | GET | `/api/auth/permissions` | 权限点/接口目录（公开） | - |
+| GET | `/api/auth/check` | 校验 token 身份/状态（公开，返回 valid/expired/enabled） | - |
 | POST | `/api/tokens/sync` | 从 DataHub 拉取并合并用户 token（`token:sync`，返回 ok/error） | - |
 | GET | `/api/buckets` | 列 bucket | ListBuckets |
 | GET | `/api/audit` | 审计查询（`audit:read`） | - |
-| GET | `/health` | 健康检查 | - |
-| GET | `/api/docs` | 文档清单/内容（公开只读，白名单） | - |
+| GET | `/health` `/health/live` `/health/ready` | 健康/存活/就绪检查 | - |
+| GET | `/metrics` | Prometheus 指标（可禁用） | - |
+| GET | `/api/docs` `/api/docs/{name}` | 文档清单/内容（公开只读，白名单；`?raw=1` → text/plain） | - |
 | GET | `/` | 网页 UI（标签栏含 Swagger/ReDoc 入口） | - |
 
 0.7.0 起每个受保护接口对应一个**权限点（scope）**（见 `permissions.py`）：
@@ -203,6 +216,13 @@ ArtifactDepot/
   >1GiB 且无 FS API、HEAD 不可用（405/501）、签名链接与 `download-bulk` ZIP 均回退单流。
   审计：每个 Range 一条 `download`（`partial=true`、`range` 为请求头原文、`size` 为区间字节数），HEAD 一条
   （`head=true`、`size=0`）；HEAD / `304` 不计 `DOWNLOADS`，可解析单区间与完整 GET 各 +1。
+- **配置中心**（网页「配置」标签页，管理员共享令牌或具备 `config:write` 的 token）：`GET /api/config` 返回由 `DEFAULT` 递归生成的
+  schema、config.json 文件值、当前生效值、字段来源（config.json/.env/环境变量/default）、需重启项与告警；
+  `POST /api/config` 校验类型/范围后原子写回 config.json（0600），再 `reload_config()` 热加载，失败回滚；
+  写入用进程内 `_CONFIG_LOCK` 串行化（防并发保存互相覆盖）；非管理员共享 token **不能提交新的 `access_token`**（403，防提权接管）；
+  `POST /api/config/reload` 重新读取磁盘配置。网页在配置页输入令牌后自动加载（400ms 防抖）。
+  两个 config 接口 `include_in_schema=false`，OpenAPI 操作数不变；密钥字段脱敏，`.env`/环境变量覆盖的字段
+  会标注「写入文件但不生效」，与 `config/reload` 的 `needs_restart` 语义一致。
 - **批量删除目录内容**（`storage.bulk_delete`，`POST /api/objects/bulk-delete`）：先**只读收集**目标并检查上限
   （`MAX_BULK_DELETE_ITEMS = 50000`，`files + dirs` 超限 `400`，`dry_run` 预览同样受限），再执行删除；
   `dry_run=true` 在删除前返回统计，不落盘、不写审计。执行时 `FileNotFoundError` 视为「已不存在」跳过
@@ -242,11 +262,16 @@ ArtifactDepot/
 - 分块下载：复用 `object:download`，`HEAD` 探测不新增权限点；每个 Range 独立鉴权、独立写审计；
   签名链接按次数计费时每个 Range 都消耗次数，分块下载应改用 token；`download-bulk` ZIP 无 `Content-Length`，
   不支持分块。
+- 站点配置：`config:write` 权限点可读取配置快照、写回 config.json 并热加载，仅授予可信管理者；
+  但**不能轮换 `access_token`**（403，仅管理员共享 token 可改），避免用户 token 通过配置页接管管理员；
+  `/api/config*` 不进 OpenAPI，无 token 401、缺权限 403。
+- Token 展示与长度：注册表默认只显示**前 2 位 + `****` + 后 4 位**；新建 token 长度受
+  `token.min_length` / `token.max_length`（默认 5–30，范围 1–256）约束，越界 400；覆写既有 token 不校验长度。
 - **伴随文件与续传（0.9.0）**：分片会话绑定 owner（`initiate` / `chunk` / `complete` / `abort` 均校验，admin 例外）；
   `upload_id` 严格字符集校验、会话目录二次确认落在 depot 内；删除/清理不跟随符号链接。
   内部目录 `.artifactdepot-uploads` 被列表 / 目录大小统计 / ZIP 打包跳过，并被 `bulk_delete(mode="all")` 与
   `rename_object` **显式跳过**，防止误删/搬走活跃上传；客户端 key 不允许隐藏路径段，无法直接操作内部目录。
-  **不新增权限点**（权限点仍 22 条、OpenAPI 操作仍 35 条、旧 token 无需变更），`initiate` 响应只回传
+  **不新增权限点**（0.9.0 权限点为 22 条、现为 23 条；OpenAPI 操作仍 35 条、旧 token 无需变更），`initiate` 响应只回传
   `uploaded` 等相对信息、**不回显服务端绝对路径**；服务端按**单进程**运行（不要 `--workers`），
   registry 仅作索引、磁盘才是唯一事实源。
 

@@ -378,7 +378,7 @@ def test_threaded_clients_head_and_range(ctx, files):
 def test_permission_catalog_unchanged(ctx):
     c, _, _, _ = ctx
     d = c.get("/api/auth/permissions").json()["data"]
-    assert len(d["permissions"]) == 22
+    assert len(d["permissions"]) == 23
     keys = {p["key"] for p in d["permissions"]}
     assert "object:download" in keys
     assert not any(k.startswith("download:") for k in keys), "分块下载复用 object:download，不新增权限点"

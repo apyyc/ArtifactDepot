@@ -35,10 +35,27 @@
   .up-item .st { flex: 0 0 130px; text-align: right; color: #888; }
   .up-item .st.ok { color: #67c23a; }
   .up-item .st.bad { color: #f56c6c; }
-  /* 上传暂停/继续 + 失败续传：暂停态文案橙色，失败行内「继续 / 放弃」按钮与全局按钮禁用态 */
+  /* 上传任务行：暂停/继续/放弃按钮只在对应任务进度条右侧；未完成上传（当前令牌）列表 */
   .up-item .st.paused { color: #e6a23c; }
   .up-item .up-act { padding: 2px 8px; font-size: 12px; line-height: 1.4; }
-  #upPause:disabled, #upResume:disabled { opacity: .55; cursor: not-allowed; }
+  .up-item .up-act:disabled { opacity: .55; cursor: not-allowed; }
+  .up-pending-head { font-size: 13px; font-weight: bold; color: #606266; margin-bottom: 2px; }
+  .up-item.pending .nm { flex: 0 0 170px; }
+  .up-item.pending .st { flex: 0 0 180px; }
+  .up-item .pending-key { flex: 0 0 210px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #upTokenHint { color: #e6a23c; }
+  #upFile:disabled { opacity: .55; cursor: not-allowed; }
+  /* 配置标签页：按分组渲染全部配置项，含「需重启 / 被 .env 覆盖」标记 */
+  .cfg-group { margin-top: 14px; border-top: 1px solid #ebeef5; padding-top: 8px; }
+  .cfg-group h4 { margin: 0 0 4px; font-size: 13px; color: #409eff; }
+  .cfg-field { display: grid; grid-template-columns: 240px minmax(240px, 1fr); gap: 3px 12px; align-items: center; margin: 7px 0; }
+  .cfg-label { font-size: 13px; line-height: 1.6; color: #303133; }
+  .cfg-input input[type="text"], .cfg-input input[type="password"], .cfg-input input[type="number"] { width: 100%; max-width: 420px; }
+  .cfg-input input[type="checkbox"] { width: 16px; height: 16px; }
+  .cfg-desc { grid-column: 2; font-size: 12px; line-height: 1.5; }
+  .cfg-badge { display: inline-block; margin-left: 6px; padding: 0 5px; border: 1px solid #dcdfe6; border-radius: 3px; font-size: 11px; line-height: 16px; font-weight: normal; vertical-align: 1px; }
+  .cfg-badge.restart { color: #e6a23c; border-color: #f3d19e; background: #fdf6ec; }
+  .cfg-badge.locked { color: #f56c6c; border-color: #fbc4c4; background: #fef0f0; }
   .doc-link { align-self: center; margin-left: 6px; padding: 5px 10px; border: 1px solid #dcdfe6; border-radius: 4px; color: #606266; font-size: 12px; text-decoration: none; }
   .doc-link:hover { color: #409eff; border-color: #409eff; }
   .modal-mask { position: fixed; inset: 0; background: rgba(0,0,0,.4); display: flex; align-items: center; justify-content: center; z-index: 1000; }

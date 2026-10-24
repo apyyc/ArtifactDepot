@@ -48,7 +48,7 @@ def _app_version() -> str:
                     return v
     except OSError:
         pass
-    return "0.9.0"
+    return "0.10.0"
 
 
 APP_VERSION = _app_version()
@@ -64,7 +64,14 @@ async def _chunk_cleanup_loop() -> None:
     因此后台成本与仓库大小无关；目标目录会话在数据盘，重启后由启动扫描重新注册。
     """
     while True:
-        await asyncio.sleep(CHUNK_CLEANUP_INTERVAL)
+        # 间隔本身也可配（config.upload.session_cleanup_interval_seconds）；每轮重新读取，
+        # 热加载后下一轮生效（已在 sleep 中的这一轮不会被打断）。
+        try:
+            interval = int(get_upload_settings().get(
+                "session_cleanup_interval_seconds", CHUNK_CLEANUP_INTERVAL))
+        except Exception:
+            interval = CHUNK_CLEANUP_INTERVAL
+        await asyncio.sleep(max(60, interval))
         try:
             settings = get_upload_settings()
             removed_idle = await asyncio.to_thread(

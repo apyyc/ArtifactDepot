@@ -203,10 +203,12 @@ def _mk_bucket(c, name: str):
 
 
 def _up(c, bucket: str, key: str, data: bytes = b"x", token: str = ADMIN,
-        overwrite: bool = True, source_url: str = "", filename: str = "f.bin"):
+        overwrite: bool = True, source_url: str = "", filename: str = "f.bin",
+        note: str = ""):
     return c.post("/api/objects", params={"token": token},
                   data={"bucket": bucket, "key": key,
-                        "overwrite": str(overwrite).lower(), "source_url": source_url},
+                        "overwrite": str(overwrite).lower(), "source_url": source_url,
+                        "note": note},
                   files={"file": (filename, data)})
 
 
@@ -572,7 +574,7 @@ def test_upload_normal_disk_manifest_audit(ctx):
     payload = b"DATA-1234"
     n = len(_audit(depot))
     r = _up(c, "demo", "a/new.bin", payload, token=actor,
-            source_url="http://example.com/src", filename="new.bin")
+            source_url="客户A / 剪映导出", note="  第三版成片  ", filename="new.bin")
     assert r.status_code == 200, r.text
     data = r.json()["data"]
     assert data["bucket"] == "demo" and data["key"] == "a/new.bin"
@@ -581,7 +583,9 @@ def test_upload_normal_disk_manifest_audit(ctx):
     assert (depot / "demo" / "a" / "new.bin").read_bytes() == payload
     meta = _manifest(depot, "demo")["a/new.bin"]
     assert meta["size"] == len(payload) and meta["sha256"] == _sha(payload)
-    assert meta["uploader"] == "uploader" and meta["source_url"] == "http://example.com/src"
+    assert meta["uploader"] == "uploader" and meta["source_url"] == "客户A / 剪映导出"
+    # 「来源」放宽为自由文本；「备注」去首尾空白后落清单
+    assert meta["note"] == "第三版成片"
 
     rows = _audit(depot)
     assert len(rows) == n + 1
@@ -595,6 +599,7 @@ def test_upload_normal_disk_manifest_audit(ctx):
                                                           "token": ADMIN}).json()["data"]["items"]
             if i["key"] == "a/new.bin"][0]
     assert item["sha256"] == _sha(payload) and item["uploader"] == "uploader"
+    assert item["source_url"] == "客户A / 剪映导出" and item["note"] == "第三版成片"
     head = c.get("/api/objects/head", params={"bucket": "demo", "key": "a/new.bin",
                                               "token": ADMIN}).json()["data"]
     assert head["sha256"] == _sha(payload) and head["size"] == len(payload)
@@ -615,6 +620,19 @@ def test_upload_normal_disk_manifest_audit(ctx):
                files={"file": ("f", b"BEAR")})
     assert r.status_code == 200
     assert (depot / "demo" / "a" / "bearer-token.txt").read_bytes() == b"BEAR"
+
+
+def test_upload_metadata_text_caps(ctx):
+    """元数据文本上限：来源 512 / 备注 200，超出截断，避免整份重写的清单被长文本撑大。"""
+    c, _, depot, _ = ctx
+    _seed(c)
+    long_source = "S" * 600
+    long_note = "N" * 300
+    r = _up(c, "demo", "cap/x.bin", b"CAP", source_url=long_source, note=long_note)
+    assert r.status_code == 200, r.text
+    meta = _manifest(depot, "demo")["cap/x.bin"]
+    assert meta["source_url"] == "S" * 512
+    assert meta["note"] == "N" * 200
 
 
 def test_upload_out_of_range_403_zero_side_effects(ctx):

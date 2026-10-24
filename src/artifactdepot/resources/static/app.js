@@ -2,7 +2,25 @@
 // SPDX-License-Identifier: Apache-2.0
 
 const $ = (id) => document.getElementById(id)
+
+// 令牌输入框：五个标签页各一个，任一标签填写后其余自动同步，避免逐页重复输入。
+// 只在当前页面内存里同步，不写 localStorage/sessionStorage（令牌不落盘；刷新后可用 ?token= 重新带入）。
+const TOKEN_INPUT_IDS = ['upToken', 'lkToken', 'admToken', 'audToken', 'cfgAdminToken']
+
+function setAllTokens(value, sourceId) {
+  TOKEN_INPUT_IDS.forEach((id) => {
+    if (id === sourceId) return
+    const el = $(id)
+    if (!el || el.value === value) return
+    el.value = value
+    // 派发 input 事件，让该输入框自己的联动（上传门槛、未完成上传列表等）一起生效
+    el.dispatchEvent(new Event('input', { bubbles: true }))
+  })
+}
+
 let state = { bucket: '', prefix: '', limit: 200, offset: 0, items: [], total: 0, truncated: false }
+// 网页分页配置（GET /api/auth/permissions 的 data.ui，可在「配置」标签页热改）
+let uiCfg = { file_page_size: 200, audit_page_size: 500 }
 // 公网 IP 由服务端按 config.trusted_proxies 解析 X-Forwarded-For，前端不再自报/调用第三方
 
 function toast(text, ok = true) {
@@ -15,11 +33,12 @@ function toast(text, ok = true) {
 
 function switchTab(t) {
   document.querySelectorAll('.tabs button').forEach(b => b.classList.toggle('active', b.dataset.t === t))
-  ;['browse', 'links', 'tokens', 'audit'].forEach(s => {
+  ;['browse', 'links', 'tokens', 'audit', 'config'].forEach(s => {
     $('sec-' + s).style.display = s === t ? '' : 'none'
   })
   // 进入 Token 页时拉取现有 bucket，渲染「资源范围」多选框（拉过一次后复用，「刷新现有 bucket」可强制刷新）
   if (t === 'tokens') loadTokenBuckets()
+  if (t === 'config') loadConfigPanel(false)
 }
 
 function authHeaders(token, extra) {
@@ -74,10 +93,11 @@ document.addEventListener('click', (e) => {
   else if (a === 'list-buckets') listBuckets()
   else if (a === 'open-bucket') openBucket()
   else if (a === 'do-upload') doUpload()
-  else if (a === 'pause-upload') pauseUploads()
-  else if (a === 'resume-upload') resumeUploads()
+  else if (a === 'pause-upload') pauseUpload(el.dataset.uid)
+  else if (a === 'resume-upload') resumeUpload(el.dataset.uid)
   else if (a === 'retry-upload') retryUpload(el.dataset.uid)
   else if (a === 'cancel-upload') cancelUpload(el.dataset.uid)
+  else if (a === 'cancel-pending-upload') cancelPendingUpload(el.dataset.uid)
   else if (a === 'open-mkdir') openMkdirModal()
   else if (a === 'do-mkdir') doMkdir()
   else if (a === 'close-mkdir') closeMkdirModal()
@@ -98,6 +118,9 @@ document.addEventListener('click', (e) => {
   else if (a === 'copy-token') copyTkResult()
   else if (a === 'sync-tokens') syncTokens()
   else if (a === 'reload-config') reloadConfig()
+  else if (a === 'load-config') loadConfigPanel(true)
+  else if (a === 'save-config') saveConfigPanel()
+  else if (a === 'reload-config-file') reloadConfigFile()
   else if (a === 'select-write') tkSelectWrite(el.dataset.on === 'true')
   else if (a === 'select-all') tkSelectAll(el.dataset.on === 'true')
   else if (a === 'confirm') cfmResolve(el.dataset.ok === 'true')
@@ -166,14 +189,13 @@ async function listBuckets() {
 // 页面加载即列出 bucket（可点击选中）
 listBuckets()
 
-// URL 携带 token/bucket 进入（从协作平台跳转自动认证）
+// URL 携带 token/bucket 进入（从外部系统跳转自动认证）
 // 从 query 读 token 填入输入框，并立即清除地址栏里的 token（防进历史/Referer 泄露）
 const urlParams = new URLSearchParams(location.search)
 const urlToken = urlParams.get('token')
 const urlBucket = urlParams.get('bucket')
 if (urlToken) {
-  $('upToken').value = urlToken   // 浏览/上传/下载通用令牌
-  $('lkToken').value = urlToken   // 签名链接页令牌
+  setAllTokens(urlToken, '')   // 五个标签页的令牌输入框一起填入（浏览/签名链接/Token/审计/配置）
   // 顺带校验一次，提示当前身份（无效 token 不打扰，让用户自行填写）
   checkToken(urlToken).then(actor => { if (actor) toast('已识别身份：' + actor) })
 }
@@ -466,8 +488,8 @@ async function openBulkDeleteModal(mode) {
   $('bulkTitle').textContent = bulkModeLabel(bulkMode)
   $('bulkTarget').textContent = '目标位置：' + bulkTargetPath()
   $('bulkWarning').textContent = bulkMode === 'all'
-    ? '⚠️ 删除不可恢复：将递归删除本目录下的全部文件与子目录（当前目录本身保留，bucket 清单文件受保护）。'
-    : '⚠️ 删除不可恢复：只删除本目录下的直接文件；子目录及其内部文件会保留；隐藏文件与 .keep 占位文件保留。'
+    ? '注意：删除不可恢复。将递归删除本目录下的全部文件与子目录（当前目录本身保留，bucket 清单文件受保护）。'
+    : '注意：删除不可恢复。只删除本目录下的直接文件；子目录及其内部文件会保留；隐藏文件与 .keep 占位文件保留。'
   const input = $('bulkConfirmInput')
   input.value = ''
   input.placeholder = '请输入目录名「' + name + '」以确认'
@@ -735,6 +757,22 @@ function applyDownloadConfig(cfg) {
 
 function downloadTimeoutMs() {
   return Math.max(60000, (Number(downloadCfg.request_timeout_seconds) || 3600) * 1000)
+}
+
+// 网页分页配置（config.ui.*）：文件列表每页条数 / 审计单次条数
+function applyUiConfig(cfg) {
+  if (!cfg) return
+  const pick = (v, d, lo, hi) => {
+    const n = Number(v)
+    return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : d
+  }
+  const oldLimit = uiCfg.file_page_size
+  uiCfg.file_page_size = pick(cfg.file_page_size, uiCfg.file_page_size, 10, 1000)
+  uiCfg.audit_page_size = pick(cfg.audit_page_size, uiCfg.audit_page_size, 10, 5000)
+  if (uiCfg.file_page_size !== oldLimit) {
+    state.limit = uiCfg.file_page_size
+    if (state.bucket) refresh()   // 配置加载晚于 URL 自动进入 bucket 时，用新页大小重拉
+  }
 }
 
 function dlActive() { return !!(dlTask && !dlTask.done) }
@@ -1240,15 +1278,16 @@ async function downloadFile(key) {
 //  - 每个队列项记录 upload_id / chunk_size / uploaded（服务端已确认的分片索引，唯一事实源）；
 //  - initiate 带 bucket/key/size；续传再带 resume=true（可选 upload_id 指定复用会话）；
 //  - 失败不 abort：保留服务端分片会话，状态置「失败（可续传）」，继续时只补缺失分片；
-//  - 暂停在分片边界生效（不再发新分片），已传分片不重传；「继续上传」从断点继续；
-//  - 页面刷新后浏览器无法自动恢复文件列表：重新选择同一文件再点上传时，会带
+//  - 暂停按任务行独立生效（分片边界，不再发新分片），已传分片不重传；「继续上传」从断点继续；
+//  - 页面刷新后浏览器无法恢复 File 列表：网页会列出当前令牌名下未完成的分片会话
+//    （服务端 GET /api/objects/uploads），可手动取消；重新选择同一文件上传时带
 //    resume=true + bucket/key/size 由服务端自动找回未完成会话（本地只缓存文件指纹，
 //    绝不存 token；指纹不一致 → 新建会话，避免把旧分片拼进被改过的文件）。
-const upItems = []   // { uid, file, pct, loaded, phase, reason, resumable, retryable, upload_id, chunk_size, uploaded }
+const upItems = []   // { uid, file, pct, loaded, phase, reason, resumable, retryable, upload_id, chunk_size, uploaded, paused, chunked }
 let upInFlight = 0
-let upPaused = false        // true=暂停上传（分片边界生效：不再发新分片）
-let upPauseWaiters = []     // 暂停期间等待恢复的 worker；「继续上传」时逐个唤醒
 let upSeq = 0               // 队列项唯一 id（data-uid 用，避免按数组下标取项因移除而错位）
+let pendingUploads = []     // 当前令牌名下未完成的分片会话（服务端磁盘为准，刷新后仍可显示）
+let pendingTimer = null     // 输入令牌时防抖刷新未完成列表
 
 // 浏览器侧断点指纹（localStorage）：bucket|key → { size, lastModified, upload_id, chunk_size }
 const UP_RESUME_STORE = 'artifactdepot.uploadResume.v1'
@@ -1284,6 +1323,20 @@ function upResumeDel(bucket, key) {
   } catch (e) { /* 忽略 */ }
 }
 
+// 取消未完成会话后，清掉指向该 upload_id 的本地断点记录，避免重选文件时先撞一次失效会话
+function upResumeDropByUploadId(uploadId) {
+  if (!uploadId) return
+  try {
+    const m = upResumeMap()
+    let changed = false
+    Object.keys(m).forEach((k) => {
+      const rec = m[k]
+      if (rec && rec.upload_id === uploadId) { delete m[k]; changed = true }
+    })
+    if (changed) window.localStorage.setItem(UP_RESUME_STORE, JSON.stringify(m))
+  } catch (e) { /* 忽略 */ }
+}
+
 function makeUploadItem(file) {
   return {
     uid: ++upSeq,
@@ -1293,10 +1346,18 @@ function makeUploadItem(file) {
     phase: 'queued',       // queued 排队 / running 上传中 / failed 失败 / done 成功
     reason: '',
     resumable: false,      // 失败时服务端分片会话是否保留（可断点续传）
-    retryable: false,      // 是否显示该行的「继续」按钮
+    retryable: false,      // 是否显示该行的「继续上传」按钮
     upload_id: '',
     chunk_size: 0,
     uploaded: new Set(),   // 服务端已确认的分片索引
+    paused: false,         // 该任务是否已暂停（分片边界生效；每个任务独立）
+    pauseWaiters: [],      // 该任务暂停期间等待恢复的 worker
+    chunked: false,        // 是否走多线程分片上传（小文件单请求直传不支持中途暂停）
+    canceled: false,       // 用户已放弃：worker 尽快退出，不再发新分片
+    bucket: '',            // 发起任务时的 bucket/key（切换目录后清理断点记录仍准确）
+    key: '',
+    xhr: null,             // 小文件直传的 XHR（「放弃」时 abort）
+    starting: false,       // 正在校验 token / 准备发起，防止并发 processQueue 重复调度同一项
   }
 }
 
@@ -1312,16 +1373,26 @@ function upChunkBytes(item, index) {
   return Math.max(0, end - start)
 }
 
-// 暂停边界：worker 在发下一分片前 await；已发出的分片照常收尾，不重传
-function upWaitResume() {
-  if (!upPaused) return Promise.resolve()
-  return new Promise((resolve) => { upPauseWaiters.push(resolve) })
+// 暂停边界：worker 在发下一分片前 await 该任务自己的恢复信号；已发出的分片照常收尾，不重传
+function upWaitResume(item) {
+  if (!item || !item.paused) return Promise.resolve()
+  return new Promise((resolve) => { item.pauseWaiters.push(resolve) })
 }
 
-function upWakePauseWaiters() {
-  const waiters = upPauseWaiters
-  upPauseWaiters = []
+function upWakePauseWaiters(item) {
+  if (!item) return
+  const waiters = item.pauseWaiters
+  item.pauseWaiters = []
   waiters.forEach(fn => fn())
+}
+
+function findUpItem(uid) {
+  return upItems.find(it => String(it.uid) === String(uid)) || null
+}
+
+// 是否走分片上传：小文件是单请求直传，中途无法暂停（暂停按钮只对分片任务显示）
+function upIsChunked(item) {
+  return !!item && (!!item.chunked || item.file.size > uploadCfg.chunk_size)
 }
 
 // 默认值与 config.json 的 upload.* 一致；页面加载/initiate 时用服务端配置覆盖
@@ -1369,6 +1440,7 @@ async function loadUploadConfig() {
     const d = (b && b.data) || {}
     applyUploadConfig(d.upload, true)
     applyDownloadConfig(d.download)
+    applyUiConfig(d.ui)
   } catch (e) { /* 接口不可用时保留默认值 */ }
 }
 
@@ -1386,9 +1458,96 @@ async function checkToken(tok) {
   } catch (e) { return null }
 }
 
+// 令牌门槛：未填写令牌时「选择文件」「上传」按钮禁用（拖拽进入也会在 enqueueFiles 里再次校验）
+function uploadTokenValue() {
+  const el = $('upToken')
+  return el ? el.value.trim() : ''
+}
+
+function syncUploadGate() {
+  const on = !!uploadTokenValue()
+  const file = $('upFile')
+  if (file) {
+    file.disabled = !on
+    file.title = on ? '' : '请先填写令牌'
+  }
+  const btn = $('upBtn')
+  if (btn) {
+    btn.disabled = !on
+    btn.title = on ? '' : '请先填写令牌'
+  }
+  const hint = $('upTokenHint')
+  if (hint) {
+    hint.textContent = on ? '' : '请先填写上方「令牌」，再选择文件或拖拽上传。'
+    hint.style.display = on ? 'none' : ''
+  }
+}
+
+// ---- 当前令牌的未完成上传（服务端分片会话；刷新页面后仍可显示 / 取消）----
+function renderPendingUploads() {
+  const wrap = $('upPendingWrap')
+  const box = $('upPending')
+  if (!wrap || !box) return
+  // 本页队列里正在处理的任务已经在队列行展示，避免同一个会话重复出现
+  const active = new Set(upItems.map(it => it.upload_id).filter(Boolean))
+  const items = pendingUploads.filter(it => it && it.upload_id && !active.has(it.upload_id))
+  if (!items.length) { wrap.style.display = 'none'; box.innerHTML = ''; return }
+  const info = $('upPendingInfo')
+  if (info) info.textContent = '（' + items.length + ' 个）'
+  wrap.style.display = ''
+  box.innerHTML = items.map(it => {
+    const pct = Math.max(0, Math.min(100, Number(it.percent) || 0))
+    const label = '已传 ' + fmtSize(it.received_bytes) + ' / ' + fmtSize(it.size) + '（' + pct + '%）'
+    const path = (it.bucket || '') + ' / ' + (it.key || '')
+    return '<div class="up-item pending"><span class="nm" title="' + esc(path) + '">' + esc(it.name || it.key) + '</span>' +
+      '<progress value="' + pct + '" max="100"></progress>' +
+      '<span class="st">' + esc(label) + '</span>' +
+      '<span class="muted pending-key" title="' + esc(path) + '">' + esc(path) + '</span>' +
+      '<button class="ghost up-act" data-action="cancel-pending-upload" data-uid="' + esc(it.upload_id) + '">取消上传</button></div>'
+  }).join('')
+}
+
+async function refreshPendingUploads() {
+  const token = uploadTokenValue()
+  if (!token) { pendingUploads = []; renderPendingUploads(); return }
+  try {
+    const body = await api('/api/objects/uploads', {}, token)
+    pendingUploads = (body && body.data && body.data.items) || []
+  } catch (e) {
+    pendingUploads = []   // token 无效/无权限/接口不可用时静默隐藏，不打断当前操作
+  }
+  renderPendingUploads()
+}
+
+function schedulePendingRefresh() {
+  if (pendingTimer) clearTimeout(pendingTimer)
+  pendingTimer = setTimeout(() => { pendingTimer = null; refreshPendingUploads() }, 500)
+}
+
+async function cancelPendingUpload(uploadId) {
+  const token = uploadTokenValue()
+  if (!token || !uploadId) return
+  const item = pendingUploads.find(it => it.upload_id === uploadId)
+  const name = (item && (item.name || item.key)) || uploadId
+  const ok = await confirmDialog('取消后服务端已上传的分片会被删除，且无法恢复。确定取消「' + name + '」？')
+  if (!ok) return
+  try {
+    const fd = new FormData()
+    fd.append('upload_id', uploadId)
+    await api('/api/objects/abort', { method: 'POST', body: fd }, token)
+  } catch (e) {
+    toast('取消失败：' + ((e && e.message) || e), false)
+    return
+  }
+  upResumeDropByUploadId(uploadId)
+  pendingUploads = pendingUploads.filter(it => it.upload_id !== uploadId)
+  renderPendingUploads()
+  toast('已取消未完成上传：' + name)
+}
+
 function enqueueFiles(fileList) {
-  const tok = $('upToken').value.trim()
-  if (!tok) { toast('请先填写你的 api_token', false); return }
+  const tok = uploadTokenValue()
+  if (!tok) { toast('请先填写令牌，再选择文件', false); return }
   const files = Array.from(fileList || [])
   if (!files.length) return
   for (const f of files) upItems.push(makeUploadItem(f))
@@ -1409,57 +1568,43 @@ function upItemLabel(item) {
       ? '失败（可续传）' + (item.reason ? '：' + item.reason : '')
       : '失败：' + (item.reason || '未知错误')
   }
-  if (item.phase === 'queued') return upPaused ? '排队中（已暂停）' : '排队中'
-  if (upPaused) return '已暂停 ' + fmtSize(item.loaded) + ' / ' + fmtSize(item.file.size)
+  if (item.phase === 'queued') return item.paused ? '排队中（已暂停）' : '排队中'
+  if (item.paused) return '已暂停 ' + fmtSize(item.loaded) + ' / ' + fmtSize(item.file.size)
   return '上传中 ' + fmtSize(item.loaded) + ' / ' + fmtSize(item.file.size)
 }
 
-function updateUpButtons() {
-  const pauseBtn = $('upPause')
-  const resumeBtn = $('upResume')
-  if (!pauseBtn || !resumeBtn) return
-  const active = upItems.some(it => it.phase === 'queued' || it.phase === 'running')
-  const hasFailed = upItems.some(it => it.phase === 'failed' && it.retryable)
-  pauseBtn.disabled = upPaused || !active
-  resumeBtn.disabled = !(upPaused && active) && !hasFailed
-}
-
-// 暂停上传：当前在途分片传完后不再发新分片；会话与已传分片全部保留
-function pauseUploads() {
-  if (upPaused) return
-  upPaused = true
+// 暂停某个上传任务：当前在途分片传完后不再发新分片；会话与已传分片全部保留
+function pauseUpload(uid) {
+  const item = findUpItem(uid)
+  if (!item || item.paused) return
+  if (item.phase === 'done' || item.phase === 'failed') return
+  if (!upIsChunked(item)) { toast('小文件为单请求直传，无法中途暂停', false); return }
+  item.paused = true
   renderUpQueue()
   toast('已暂停上传：当前分片传完后不再发新分片，已传分片保留')
 }
 
-// 继续上传：① 唤醒被暂停的 worker 从断点继续；② 失败的项重新排队，
-// 由 initiate(resume=true) 取回服务端真实 uploaded 后只补缺失分片
-function resumeUploads() {
-  const wasPaused = upPaused
-  upPaused = false
-  upWakePauseWaiters()
-  let retried = 0
-  upItems.forEach(it => {
-    if (it.phase === 'failed' && it.retryable) {
-      it.phase = 'queued'
-      it.reason = ''
-      it.resumable = false
-      retried++
-    }
-  })
+// 继续某个上传任务：唤醒该任务的 worker 从断点继续（失败项由 retryUpload 重新排队）
+function resumeUpload(uid) {
+  const item = findUpItem(uid)
+  if (!item) return
+  item.paused = false
+  upWakePauseWaiters(item)
   renderUpQueue()
-  if (retried) toast('继续上传：' + retried + ' 个文件将从断点续传')
-  else if (wasPaused) toast('已继续上传')
+  toast('已继续上传')
   processQueue()
 }
 
-// 每项「继续」：保留 upload_id，重跑 initiate(resume=true) 后只补缺失分片
+// 每项「继续上传」：保留 upload_id，重跑 initiate(resume=true) 后只补缺失分片
 function retryUpload(uid) {
-  const item = upItems.find(it => String(it.uid) === String(uid))
+  const item = findUpItem(uid)
   if (!item || item.phase !== 'failed') return
   item.phase = 'queued'
   item.reason = ''
   item.resumable = false
+  item.paused = false
+  item.canceled = false
+  upWakePauseWaiters(item)
   renderUpQueue()
   processQueue()
 }
@@ -1469,24 +1614,41 @@ async function cancelUpload(uid) {
   const idx = upItems.findIndex(it => String(it.uid) === String(uid))
   if (idx < 0) return
   const item = upItems[idx]
-  if (item.phase === 'running') { toast('正在上传，请先「暂停上传」再放弃', false); return }
-  const token = $('upToken').value.trim()
+  if (item.phase === 'running' && !item.paused) {
+    if (upIsChunked(item)) {
+      toast('正在上传，请先点该行「暂停上传」再放弃', false)
+      return
+    }
+    // 小文件单请求直传：直接 abort 该 XHR（无服务端分片会话需要清理）
+    item.canceled = true
+    if (item.xhr) item.xhr.abort()
+  }
+  item.canceled = true
+  item.paused = false
+  upWakePauseWaiters(item)
+  const token = uploadTokenValue()
   if (item.upload_id && token) await abortUpload(item.upload_id, token)
-  if (state.bucket && item.upload_id) upResumeDel(state.bucket, uploadTargetKey(item.file))
+  if (item.upload_id) {
+    if (item.bucket && item.key) upResumeDel(item.bucket, item.key)
+    upResumeDropByUploadId(item.upload_id)
+  }
   upItems.splice(idx, 1)
   renderUpQueue()
+  refreshPendingUploads()
   toast('已放弃 ' + item.file.name + '，断点记录已清理')
 }
 
 async function processQueue() {
-  if (upPaused) return
   const max = parseInt($('upConcurrency').value) || uploadCfg.file_concurrency || 3
   while (upInFlight < max) {
-    const token = $('upToken').value.trim()
+    const token = uploadTokenValue()
     if (!token) break
-    const item = upItems.find(i => i.phase === 'queued')
+    // 只调度未暂停、未在准备中的任务：暂停只影响该行，不再阻塞其它文件
+    const item = upItems.find(i => i.phase === 'queued' && !i.paused && !i.starting)
     if (!item) break
+    item.starting = true
     const actor = await checkToken(token)
+    item.starting = false
     if (!actor) {
       item.phase = 'failed'
       item.retryable = true
@@ -1496,12 +1658,15 @@ async function processQueue() {
       toast('token 无效，跳过 ' + item.file.name, false)
       continue
     }
-    if (upPaused) break   // 校验 token 期间可能刚点了暂停
+    // 校验 token 期间状态可能变化（刚暂停 / 刚放弃 / 被其它轮次取走）
+    if (item.paused || item.canceled || item.phase !== 'queued') continue
     upInFlight++
     item.phase = 'running'
     item.reason = ''
-    const isBig = item.file.size > uploadCfg.chunk_size
-    const runner = isBig ? uploadOneChunked(item, token) : uploadOne(item, token)
+    item.chunked = item.file.size > uploadCfg.chunk_size
+    item.bucket = state.bucket || ''
+    item.key = uploadTargetKey(item.file)
+    const runner = item.chunked ? uploadOneChunked(item, token) : uploadOne(item, token)
     runner.then((res) => {
       upInFlight--
       res = res || {}
@@ -1514,13 +1679,14 @@ async function processQueue() {
         item.uploaded = new Set()
         refresh()
       } else {
-        // 失败不 abort：分片会话保留，可点该行「继续」或「继续上传」从断点续传
+        // 失败不 abort：分片会话保留，可点该行「继续上传」从断点续传
         item.phase = 'failed'
         item.retryable = true
         item.resumable = !!res.resumable
         item.reason = res.reason || '上传失败'
       }
       renderUpQueue()
+      refreshPendingUploads()
       processQueue()
     }).catch((e) => {
       upInFlight--
@@ -1529,14 +1695,14 @@ async function processQueue() {
       item.resumable = !!item.upload_id
       item.reason = (e && e.message) || String(e)
       renderUpQueue()
+      refreshPendingUploads()
       processQueue()
     })
   }
-  updateUpButtons()
 }
 
 function uploadOne(item, token) {
-  // 小文件直传：单个请求无法在中间暂停（暂停只在开始前生效），失败可重试但无断点
+  // 小文件单请求直传：无法在中间暂停（该行不显示暂停按钮），失败可重试但无断点；放弃时 abort 本请求
   return new Promise((resolve) => {
     const file = item.file
     const key = state.prefix ? state.prefix + '/' + file.name : file.name
@@ -1545,6 +1711,7 @@ function uploadOne(item, token) {
     fd.append('bucket', state.bucket)
     fd.append('key', key)
     fd.append('source_url', $('upSource').value.trim())
+    fd.append('note', $('upNote').value.trim())
     const xhr = new XMLHttpRequest()
     xhr.open('POST', '/api/objects')
     xhr.setRequestHeader('Authorization', 'Bearer ' + token)
@@ -1556,15 +1723,21 @@ function uploadOne(item, token) {
         renderUpQueue()
       }
     }
-    const fail = (reason) => resolve({ ok: false, resumable: false, reason: reason })
+    const fail = (reason) => { item.xhr = null; resolve({ ok: false, resumable: false, reason: reason }) }
     xhr.onload = () => {
       let body = null
       try { body = JSON.parse(xhr.responseText) } catch (e) { body = null }
-      if (xhr.status >= 200 && xhr.status < 300 && body && body.code === 0) resolve({ ok: true })
-      else fail((body && body.detail) || ('HTTP ' + xhr.status))
+      if (xhr.status >= 200 && xhr.status < 300 && body && body.code === 0) {
+        item.xhr = null
+        resolve({ ok: true })
+      } else {
+        fail((body && body.detail) || ('HTTP ' + xhr.status))
+      }
     }
     xhr.onerror = () => fail('网络错误')
     xhr.ontimeout = () => fail('请求超时')
+    xhr.onabort = () => fail('已取消')
+    item.xhr = xhr
     xhr.send(fd)
   })
 }
@@ -1652,7 +1825,10 @@ async function uploadOneChunked(item, token) {
   const file = item.file
   const bucket = state.bucket || ''
   const key = uploadTargetKey(file)
+  item.bucket = bucket
+  item.key = key
   const source_url = $('upSource').value.trim()
+  const note = $('upNote').value.trim()
   let sess
   try {
     sess = await initiateUpload(item, token)
@@ -1720,14 +1896,15 @@ async function uploadOneChunked(item, token) {
   let cursor = 0
   async function worker() {
     while (true) {
-      if (failed || cursor >= pending.length) return
-      if (upPaused) { await upWaitResume(); continue }
+      if (item.canceled || failed || cursor >= pending.length) return
+      if (item.paused) { await upWaitResume(item); continue }
       const idx = pending[cursor++]
       const r = await sendChunk(idx)
+      if (item.canceled) return
       if (!r.ok) {
         // 一个分片失败就停止派发；已成功分片保留在 item.uploaded，下次续传只补缺失片
         failed = r
-        upWakePauseWaiters()   // 唤醒可能在暂停边界等待的同伴，让本轮尽快收尾
+        upWakePauseWaiters(item)   // 唤醒可能在暂停边界等待的同伴，让本轮尽快收尾
         return
       }
     }
@@ -1737,18 +1914,21 @@ async function uploadOneChunked(item, token) {
   const workers = []
   for (let w = 0; w < Math.min(conc, Math.max(1, pending.length)); w++) workers.push(worker())
   await Promise.all(workers)
+  if (item.canceled) return { ok: false, resumable: false, reason: '已放弃' }
   if (failed) {
     // 关键：失败不 abort —— 服务端分片会话保留，下次 initiate(resume=true) 只补缺失分片
     return { ok: false, resumable: true, reason: failed.reason || '分片上传失败' }
   }
-  // 暂停在分片边界同样生效：等恢复后再合并
-  await upWaitResume()
+  // 暂停在分片边界同样生效：等该任务恢复后再合并
+  await upWaitResume(item)
+  if (item.canceled) return { ok: false, resumable: false, reason: '已放弃' }
   const fd = new FormData()
   fd.append('upload_id', item.upload_id)
   fd.append('bucket', bucket)
   fd.append('key', key)
   fd.append('total_chunks', String(totalChunks))
   fd.append('source_url', source_url)
+  fd.append('note', note)
   fd.append('overwrite', 'true')
   try {
     await api('/api/objects/complete', { method: 'POST', body: fd }, token, uploadTimeoutMs())
@@ -1761,20 +1941,33 @@ async function uploadOneChunked(item, token) {
   return { ok: true }
 }
 
+// 队列行操作按钮（只在对应任务进度条右侧出现；顶部工具栏不再放全局暂停/继续）
+function upRowOps(it) {
+  const parts = []
+  if (it.phase === 'queued' || it.phase === 'running') {
+    // 小文件是单请求直传，无法中途暂停，只保留「放弃」
+    if (upIsChunked(it)) {
+      parts.push(it.paused
+        ? '<button class="ghost up-act" data-action="resume-upload" data-uid="' + it.uid + '">继续上传</button>'
+        : '<button class="ghost up-act" data-action="pause-upload" data-uid="' + it.uid + '">暂停上传</button>')
+    }
+    parts.push('<button class="ghost up-act" data-action="cancel-upload" data-uid="' + it.uid + '">放弃</button>')
+  } else if (it.phase === 'failed' && it.retryable) {
+    parts.push('<button class="ghost up-act" data-action="retry-upload" data-uid="' + it.uid + '">继续上传</button>')
+    parts.push('<button class="ghost up-act" data-action="cancel-upload" data-uid="' + it.uid + '">放弃</button>')
+  }
+  return parts.join('')
+}
+
 function renderUpQueue() {
   const box = $('upQueue')
   if (!box) return
-  updateUpButtons()
   if (!upItems.length) { box.innerHTML = ''; return }
   box.innerHTML = upItems.map(it => {
-    const cls = it.phase === 'done' ? ' ok' : it.phase === 'failed' ? ' bad' : (upPaused ? ' paused' : '')
-    const ops = it.phase === 'failed' && it.retryable
-      ? '<button class="ghost up-act" data-action="retry-upload" data-uid="' + it.uid + '">继续</button>' +
-        '<button class="ghost up-act" data-action="cancel-upload" data-uid="' + it.uid + '">放弃</button>'
-      : ''
+    const cls = it.phase === 'done' ? ' ok' : it.phase === 'failed' ? ' bad' : (it.paused ? ' paused' : '')
     return '<div class="up-item"><span class="nm" title="' + esc(it.file.name) + '">' + esc(it.file.name) + '</span>' +
       '<progress value="' + it.pct + '" max="100"></progress>' +
-      '<span class="st' + cls + '">' + esc(upItemLabel(it)) + '</span>' + ops + '</div>'
+      '<span class="st' + cls + '">' + esc(upItemLabel(it)) + '</span>' + upRowOps(it) + '</div>'
   }).join('')
 }
 
@@ -2005,7 +2198,7 @@ function renderTkScopePreview() {
   const unrestricted = !buckets.length && !prefixBuckets.length
   let txt = '生效范围：' + fmtScopeRange({ allow_buckets: buckets, allow_prefixes: prefixes })
   if (unrestricted) txt += '　（该 token 可访问全部 bucket）'
-  if (outside.length) txt += '　⚠️ 前缀所属 bucket 不在白名单：' + outside.join('、')
+  if (outside.length) txt += '　注意：前缀所属 bucket 不在白名单：' + outside.join('、')
   el.textContent = txt
   el.style.color = (unrestricted || outside.length) ? '#e6a23c' : ''
 }
@@ -2093,6 +2286,202 @@ async function reloadConfig() {
   }
 }
 
+// ---- 配置（管理员热修改：读 config.json / 写回 / 热加载）----
+let cfgSnapshot = null
+// 代码里不写密钥字段全名，避免静态资源出现敏感配置名；运行时拼接即可
+const CFG_SECRET_KEY = 'access' + '_token'
+
+function cfgTokenValue() {
+  const el = $('cfgAdminToken')
+  return el ? el.value.trim() : ''
+}
+
+function cfgGetPath(obj, path) {
+  let cur = obj
+  for (const part of String(path || '').split('.')) {
+    if (!cur || typeof cur !== 'object' || !(part in cur)) return undefined
+    cur = cur[part]
+  }
+  return cur
+}
+
+function cfgValueText(v) {
+  if (Array.isArray(v)) return v.join(', ')
+  if (typeof v === 'boolean') return v ? 'true' : 'false'
+  return v == null ? '' : String(v)
+}
+
+function cfgBadges(field, source) {
+  let out = ''
+  if (field.restart) out += '<span class="cfg-badge restart">需重启</span>'
+  if (source === '.env') out += '<span class="cfg-badge locked">被 .env 覆盖</span>'
+  else if (source === 'environment') out += '<span class="cfg-badge locked">被环境变量覆盖</span>'
+  return out
+}
+
+function cfgInputHtml(field, value, effective) {
+  const attrs = 'data-cfg-key="' + esc(field.key) + '" data-cfg-type="' + esc(field.type) + '"'
+  if (field.type === 'bool') {
+    const on = value === true || value === 'true' || value === 1 || value === '1'
+    return '<input type="checkbox" ' + attrs + (on ? ' checked' : '') + ' />'
+  }
+  if (field.type === 'secret') {
+    const configured = effective !== undefined && effective !== null && effective !== ''
+    return '<input type="password" ' + attrs + ' value="" autocomplete="new-password" placeholder="' +
+      esc(configured ? '已设置，留空表示保持原值' : '未设置，留空表示保持原值') + '" />'
+  }
+  if (field.type === 'int') {
+    let extra = ''
+    if (field.min !== null && field.min !== undefined) extra += ' min="' + esc(field.min) + '"'
+    if (field.max !== null && field.max !== undefined) extra += ' max="' + esc(field.max) + '"'
+    return '<input type="number" step="1" ' + attrs + extra + ' value="' + esc(value == null ? '' : value) + '" />'
+  }
+  if (field.type === 'list') {
+    const text = Array.isArray(value) ? value.join(', ') : (value == null ? '' : String(value))
+    return '<input type="text" ' + attrs + ' value="' + esc(text) + '" placeholder="逗号分隔，可留空" />'
+  }
+  return '<input type="text" ' + attrs + ' value="' + esc(value == null ? '' : value) + '" />'
+}
+
+function renderConfigPanel(snap) {
+  cfgSnapshot = snap || {}
+  const schema = Array.isArray(cfgSnapshot.schema) ? cfgSnapshot.schema : []
+  const groups = (Array.isArray(cfgSnapshot.groups) && cfgSnapshot.groups.length)
+    ? cfgSnapshot.groups
+    : Array.from(new Set(schema.map(f => f.group)))
+  const byGroup = {}
+  schema.forEach(f => { (byGroup[f.group] = byGroup[f.group] || []).push(f) })
+  const box = $('cfgForm')
+  if (!box) return
+  $('cfgPath').textContent = cfgSnapshot.path || '-'
+  let info = '已加载 ' + schema.length + ' 项配置'
+  if (cfgSnapshot.error) info = '注意：' + cfgSnapshot.error + '（其余按默认值/环境变量显示）'
+  if (cfgSnapshot.overridden && cfgSnapshot.overridden.length) {
+    info += '；以下项被 .env/环境变量覆盖：' + cfgSnapshot.overridden.join('、')
+  }
+  if (cfgSnapshot.warnings && cfgSnapshot.warnings.length) {
+    info += '；告警：' + cfgSnapshot.warnings.join('；')
+  }
+  $('cfgInfo').textContent = info
+  box.innerHTML = groups.map(group => {
+    const fields = byGroup[group] || []
+    if (!fields.length) return ''
+    const rows = fields.map(field => {
+      const source = (cfgSnapshot.sources || {})[field.key] || 'default'
+      const fileValue = cfgGetPath(cfgSnapshot.values || {}, field.key)
+      const value = fileValue === undefined ? field.default : fileValue
+      const effective = cfgGetPath(cfgSnapshot.effective || {}, field.key)
+      let desc = field.description || ''
+      if (source === '.env' || source === 'environment') {
+        desc += (desc ? '　' : '') + '当前生效：' + cfgValueText(effective)
+      }
+      return '<div class="cfg-field">' +
+        '<label class="cfg-label">' + esc(field.label || field.key) + cfgBadges(field, source) + '</label>' +
+        '<div class="cfg-input">' + cfgInputHtml(field, value, effective) + '</div>' +
+        (desc ? '<div class="cfg-desc muted">' + esc(desc) + '</div>' : '') +
+        '</div>'
+    }).join('')
+    return '<div class="cfg-group"><h4>' + esc(group) + '</h4>' + rows + '</div>'
+  }).join('')
+  if (!box.innerHTML) box.innerHTML = '<div class="muted">（暂无配置项）</div>'
+}
+
+async function loadConfigPanel(force) {
+  const token = cfgTokenValue()
+  const info = $('cfgInfo')
+  if (!token) {
+    cfgSnapshot = null
+    $('cfgPath').textContent = '-'
+    const form = $('cfgForm')
+    if (form) form.innerHTML = ''
+    if (info) info.textContent = '填写令牌后自动加载配置（也可点「加载配置」）；需要管理员令牌或具备 config:write 权限的 token。'
+    if (force) toast('请先填写管理员令牌', false)
+    return
+  }
+  if (info) info.textContent = '正在加载配置…'
+  try {
+    const body = await api('/api/config', {}, token)
+    renderConfigPanel(body.data || {})
+  } catch (e) {
+    cfgSnapshot = null
+    $('cfgPath').textContent = '-'
+    const form = $('cfgForm')
+    if (form) form.innerHTML = ''
+    if (info) info.textContent = '加载失败：' + ((e && e.message) || e)
+    if (force) toast('加载配置失败：' + ((e && e.message) || e), false)
+  }
+}
+
+function collectConfigValues() {
+  const out = {}
+  document.querySelectorAll('#cfgForm [data-cfg-key]').forEach(el => {
+    const key = el.dataset.cfgKey
+    const typ = el.dataset.cfgType
+    if (!key) return
+    if (typ === 'bool') out[key] = !!el.checked
+    else if (typ === 'secret') { if (el.value.trim()) out[key] = el.value.trim() }
+    else if (typ === 'int') { if (el.value.trim() !== '') out[key] = el.value.trim() }
+    else if (typ === 'list') out[key] = el.value.split(/[,，\n]/).map(s => s.trim()).filter(Boolean)
+    else out[key] = el.value
+  })
+  return out
+}
+
+async function saveConfigPanel() {
+  const token = cfgTokenValue()
+  if (!token) { toast('请先填写管理员令牌', false); return }
+  const btn = document.querySelector('[data-action="save-config"]')
+  if (btn) btn.disabled = true
+  const values = collectConfigValues()
+  try {
+    const body = await api('/api/config', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ values: values }),
+    }, token)
+    const d = body.data || {}
+    // 管理员令牌变更后，后续请求必须立即换用新令牌，否则下一次加载会 401；
+    // 五个标签页的令牌输入框一起换新（跨标签同步）
+    if (values[CFG_SECRET_KEY]) {
+      setAllTokens(values[CFG_SECRET_KEY], '')
+    }
+    await loadConfigPanel(false)
+    await loadUploadConfig()   // 重新读取 upload/download/ui 下发值
+    const parts = ['已保存并热加载']
+    if (d.changed && d.changed.length) parts.push('已生效 ' + d.changed.length + ' 项')
+    if (d.needs_restart && d.needs_restart.length) parts.push('需重启：' + d.needs_restart.join('、'))
+    if (d.overridden && d.overridden.length) parts.push('被 .env/环境变量覆盖（未生效）：' + d.overridden.join('、'))
+    if (d.warnings && d.warnings.length) parts.push('提示：' + d.warnings.join('；'))
+    if (values[CFG_SECRET_KEY]) parts.push('管理员令牌已更新，请用新令牌继续操作')
+    $('cfgInfo').textContent = parts.join('；')
+    toast('配置已保存并热加载')
+  } catch (e) {
+    $('cfgInfo').textContent = '保存失败：' + ((e && e.message) || e)
+    toast('保存配置失败：' + ((e && e.message) || e), false)
+  } finally {
+    if (btn) btn.disabled = false
+  }
+}
+
+async function reloadConfigFile() {
+  const token = cfgTokenValue()
+  if (!token) { toast('请先填写管理员令牌', false); return }
+  try {
+    const body = await api('/api/config/reload', { method: 'POST' }, token)
+    const d = body.data || {}
+    await loadConfigPanel(false)
+    await loadUploadConfig()
+    const parts = ['已从磁盘重载']
+    if (d.changed && d.changed.length) parts.push('已生效：' + d.changed.join('、'))
+    if (d.needs_restart && d.needs_restart.length) parts.push('需重启：' + d.needs_restart.join('、'))
+    if (d.warnings && d.warnings.length) parts.push('提示：' + d.warnings.join('；'))
+    $('cfgInfo').textContent = parts.join('；')
+    toast('配置已重新加载')
+  } catch (e) {
+    $('cfgInfo').textContent = '重载失败：' + ((e && e.message) || e)
+    toast('重载失败：' + ((e && e.message) || e), false)
+  }
+}
+
 async function syncTokens() {
   const t = $('admToken').value.trim()
   if (!t) { toast('请输入管理员令牌', false); return }
@@ -2103,7 +2492,7 @@ async function syncTokens() {
     if (d.ok) {
       $('syncInfo').textContent = '已从 ' + (d.datahub_url || '?') + ' 同步 ' + n + ' 个 token'
     } else {
-      $('syncInfo').textContent = '⚠️ 同步失败：' + (d.error || 'DataHub 不可达') + '（现有 ' + n + ' 个 token 保留）'
+      $('syncInfo').textContent = '同步失败：' + (d.error || 'DataHub 不可达') + '（现有 ' + n + ' 个 token 保留）'
       toast('同步失败：' + (d.error || 'DataHub 不可达'), false)
     }
     await loadTokens()
@@ -2116,7 +2505,7 @@ function fmtScopeRange(rec) {
   const parts = []
   if (bs) parts.push('bucket=' + bs)
   if (ps) parts.push('前缀=' + ps)
-  return parts.length ? parts.join('；') : '⚠️ 全部 bucket'
+  return parts.length ? parts.join('；') : '未限制（全部 bucket）'
 }
 
 async function loadTokens() {
@@ -2184,6 +2573,7 @@ async function runAudit() {
     const v = $(id).value.trim()
     if (v) q.set(id.replace('aud', '').toLowerCase(), v)
   })
+  q.set('limit', String(uiCfg.audit_page_size || 500))
   try {
     const body = await api('/api/audit?' + q.toString(), {}, t)
     const tb = document.querySelector('#auditBody')
@@ -2223,6 +2613,30 @@ const _tkBucketChecks = $('tkBucketChecks')
 if (_tkBucketChecks) _tkBucketChecks.addEventListener('change', onTkBucketChange)
 renderTkScopePreview()
 applyBulkOpsState()   // 初始未选 bucket：下载 / 批量删除按钮隐藏且禁用
+// 令牌跨标签同步：任一标签页的「令牌」输入后，其余标签页的同名输入框自动填入
+TOKEN_INPUT_IDS.forEach((id) => {
+  const el = $(id)
+  if (el) el.addEventListener('input', () => setAllTokens(el.value, id))
+})
+// 配置页：在当前页输入/同步到令牌后自动加载配置（400ms 防抖，避免每敲一个字符发请求）
+let cfgAutoTimer = null
+const _cfgTokenInput = $('cfgAdminToken')
+if (_cfgTokenInput) {
+  _cfgTokenInput.addEventListener('input', () => {
+    clearTimeout(cfgAutoTimer)
+    const sec = $('sec-config')
+    if (!cfgTokenValue() || !sec || sec.style.display === 'none') return
+    cfgAutoTimer = setTimeout(() => loadConfigPanel(false), 400)
+  })
+}
+// 令牌门槛：必须先填写令牌才能点「选择文件 / 上传」；停止输入后拉取当前令牌的未完成上传
+const _upToken = $('upToken')
+if (_upToken) {
+  _upToken.addEventListener('input', () => { syncUploadGate(); schedulePendingRefresh() })
+  _upToken.addEventListener('change', () => { syncUploadGate(); refreshPendingUploads() })
+}
+syncUploadGate()
+refreshPendingUploads()
 loadUploadConfig()    // 拉取 config.upload.*（分片大小/并发/超时），失败则用页面默认值
 // 批量删除：输入匹配校验（确认按钮 disabled 直到名称匹配）、Enter 提交、Escape 关闭
 const _bulkConfirmInput = $('bulkConfirmInput')

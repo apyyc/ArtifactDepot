@@ -14,11 +14,13 @@ from typing import List, Optional
 from artifactdepot import netutil, storage
 from artifactdepot.auth import (
     Principal, ensure_can_grant, extract_token, optional_read_principal,
-    read_requires_token, require_admin, require_scope, resolve_principal,
+    read_requires_token, require_scope, resolve_principal,
     resource_allowed,
 )
-from artifactdepot.config import (get_config, public_download_settings,
-                                  public_upload_settings, reload_config)
+from artifactdepot.config import (ConfigError, config_snapshot, get_config,
+                                  public_download_settings, public_token_settings,
+                                  public_ui_settings, public_upload_settings,
+                                  reload_config, update_config_file)
 from artifactdepot.observability import render_metrics
 from artifactdepot.permissions import (
     DEFAULT_ROLE, PERMISSION_CATALOG, PUBLIC_CATALOG, ROLE_PRESETS,
@@ -28,13 +30,19 @@ router = APIRouter(tags=["System"])
 
 
 def _mask_token(token: str) -> str:
-    """脱敏 token；带短哈希后缀，避免不同 token 脱敏后同名导致返回 dict 覆盖。"""
+    """脱敏 token：只显示前 2 位与后 4 位，其余替换为 ****。
+
+    - 长度 > 6：`前2 + **** + 后4`
+    - 长度 <= 6（极短旧 token）：`前2 + ****`，不暴露后 4 位以免与前缀重叠
+    - 空串返回空串
+
+    唯一性由 `list_tokens` 在 key 冲突时追加短哈希兜底（正常情况下不显示哈希后缀）。
+    """
     if not token:
         return ""
-    suffix = hashlib.sha256(token.encode("utf-8")).hexdigest()[:6]
-    if len(token) <= 8:
-        return token[:2] + "****" + suffix
-    return token[:4] + "****" + token[-4:] + "-" + suffix
+    if len(token) <= 6:
+        return token[:2] + "****"
+    return token[:2] + "****" + token[-4:]
 
 
 def _public_catalog():
@@ -59,6 +67,10 @@ async def permissions_catalog():
         "upload": public_upload_settings(),
         # 下载参数（分段大小/并发/请求超时），供网页与桌面客户端动态读取
         "download": public_download_settings(),
+        # 网页分页参数（文件列表/审计查询），供网页动态读取
+        "ui": public_ui_settings(),
+        # 新建 token 的长度上下限（服务端自动生成与显式创建都受此约束）
+        "token": public_token_settings(),
     }}
 
 
@@ -116,20 +128,71 @@ async def metrics():
 
 
 @router.post("/api/config/reload")
-async def config_reload(request: Request, actor: str = Depends(require_admin)):
-    """手动重新加载 config/config.json + config/.env（仅管理员共享 token）。
+async def config_reload(request: Request,
+                        actor: Principal = Depends(require_scope("config:write"))):
+    """手动重新加载 config/config.json + config/.env。
 
+    鉴权：管理员共享 token，或具备 `config:write` 权限点的 token。
     返回 data = {ok, error, changed, needs_restart, warnings}：
     changed 已即时生效；needs_restart 值变了但需重启（保留旧值）。
     """
     result = reload_config()
-    storage.audit("config_reload", "", "", actor,
+    storage.audit("config_reload", "", "", actor.actor,
                   request.client.host if request.client else "",
                   extra={"changed": result.get("changed"),
                          "needs_restart": result.get("needs_restart")})
     if not result.get("ok"):
         raise HTTPException(400, detail=result.get("error") or "配置重载失败")
     return {"code": 0, "message": "success", "data": result}
+
+
+class ConfigUpdateRequest(BaseModel):
+    values: dict
+
+
+@router.get("/api/config", include_in_schema=False)
+async def get_runtime_config(actor: Principal = Depends(require_scope("config:write"))):
+    """读取配置快照（管理员共享 token 或具备 `config:write` 的 token）。
+
+    返回 config.json 文件值、当前生效值、每个字段的来源（config.json / .env / 环境变量）、
+    需重启项与告警；`access_token` 等密钥一律脱敏。该接口不进入 OpenAPI；
+    读取快照是安全修改配置的前提，因此与写入共用 `config:write` 权限点。
+    """
+    return {"code": 0, "message": "success", "data": config_snapshot()}
+
+
+@router.post("/api/config", include_in_schema=False)
+async def update_runtime_config(body: ConfigUpdateRequest, request: Request,
+                                actor: Principal = Depends(require_scope("config:write"))):
+    """在线修改 config.json 并热加载（管理员共享 token 或具备 `config:write` 的 token）。
+
+    只接受已知配置项；写盘原子、重载失败自动回滚。`access_token` 留空或提交脱敏占位符
+    表示保持原值。被 .env / 环境变量覆盖的字段会写入文件但不会生效，响应 `overridden`
+    会明确列出。该接口不进入 OpenAPI，避免改变对外操作数。
+    """
+    values = body.values or {}
+    # 防提权：config:write 只允许改配置项，不允许轮换管理员共享令牌
+    # （access_token 是超级管理员凭据，轮换等价于接管整个实例）。
+    if not actor.is_admin and isinstance(values, dict):
+        raw_tok = values.get("access_token")
+        if raw_tok is not None and str(raw_tok).strip() not in ("", "********"):
+            raise HTTPException(
+                403,
+                detail="仅管理员共享令牌可修改 access_token（config:write 不能轮换管理员令牌）",
+            )
+    try:
+        result = update_config_file(values)
+    except ConfigError as e:
+        raise HTTPException(400, detail=str(e)) from e
+    except OSError as e:
+        raise HTTPException(500, detail=f"写入配置文件失败：{e}") from e
+    storage.audit("config_update", "", "", actor.actor,
+                  request.client.host if request.client else "",
+                  extra={"changed": result.get("changed"),
+                         "needs_restart": result.get("needs_restart"),
+                         "overridden": result.get("overridden")})
+    return {"code": 0, "message": "success", "data": result}
+
 
 
 @router.get("/api/buckets")
@@ -186,8 +249,22 @@ async def list_tokens(request: Request,
     for tok, rec in mapping.items():
         # 默认一律脱敏；仅管理员且 reveal=true 时回明文 key / 明文 token
         plain = bool(reveal and is_admin)
-        key = tok if plain else _mask_token(tok)
-        data[key] = _record_public(tok, rec, plain)
+        if plain:
+            data[tok] = _record_public(tok, rec, True)
+            continue
+        # 脱敏 key 冲突（前 2 + 后 4 相同）时追加短哈希兜底，避免互相覆盖；
+        # 正常情况下展示的就是「前2 + **** + 后4」，不带任何后缀。
+        key = _mask_token(tok)
+        if key in data:
+            digest = hashlib.sha256(tok.encode("utf-8")).hexdigest()[:6]
+            key = f"{_mask_token(tok)}-{digest}"
+            n = 2
+            while key in data:
+                key = f"{_mask_token(tok)}-{digest}-{n}"
+                n += 1
+        item = _record_public(tok, rec, False)
+        item["token"] = key          # 展示值与 dict key 保持一致（前端按 key 移除）
+        data[key] = item
     return {"code": 0, "message": "success", "data": data}
 
 

@@ -2,6 +2,7 @@
   "depot_dir": "/data/depot",
   "meta_dir": "/data/state",
   "datahub_url": "http://127.0.0.1:8002/api/data",
+  "datahub_sync_interval_seconds": 60,
   "host": "0.0.0.0",
   "port": 8004,
   "access_token": "admin",
@@ -13,6 +14,11 @@
   "audit_backups": 5,
   "cors_origins": [],
   "allowed_hosts": ["*"],
+  "require_read_token": false,
+  "ui": {
+    "file_page_size": 200,
+    "audit_page_size": 500
+  },
   "signed_links": {
     "count_min": 1,
     "count_max": 10,
@@ -24,6 +30,7 @@
     "chunk_concurrency": 4,
     "file_concurrency": 3,
     "request_timeout_seconds": 86400,
+    "session_cleanup_interval_seconds": 600,
     "max_chunk_mb": 64,
     "max_chunks": 100000,
     "max_session_gb": 200,
@@ -35,5 +42,9 @@
     "chunk_size_mb": 8,
     "chunk_concurrency": 4,
     "request_timeout_seconds": 3600
+  },
+  "token": {
+    "min_length": 5,
+    "max_length": 30
   }
 }
