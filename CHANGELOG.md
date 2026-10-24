@@ -1,9 +1,114 @@
 # Changelog
 
-ArtifactDepot v0.8.0 — 所有对本项目的重要更改都将记录在此文件中。
+ArtifactDepot v0.10.0 — 所有对本项目的重要更改都将记录在此文件中。
 
 本日志格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本号遵循 [语义化版本规范](https://semver.org/lang/zh-CN/)。
+
+---
+
+## [0.10.0] - 2026-10-24
+
+### 目录一键下载（单文件直下 / 流式 ZIP）
+
+#### Added
+
+- **一键下载目录接口** `GET /api/objects/download-bulk`（DownloadBulk）：下载当前浏览目录的全部内容；
+  **复用权限点 `object:download`（不新增权限点、角色预设不变）**，token 可走 query `?token=` 或
+  `Authorization: Bearer`，并校验 bucket/prefix 资源范围（越界 `403`）；不接入签名链接。
+- **直下 vs ZIP 规则**：目录内只有 1 个可见文件且无可见子目录 → 直下原文件（原文件名、`Content-Type`、
+  Range/206、ETag/304）；其他非空情况 → 打包 ZIP；空目录 / 不存在 / 不是目录 → `404`
+  （不返回 0 字节 ZIP）。
+- **ZIP 结构**：顶层为与目录同名的文件夹（bucket 根用 bucket 名），内含相对路径的文件与子目录条目；
+  空目录也保留条目（名称以 `/` 结尾）；**文件条目保留源文件 mtime**（目录条目为当前时间）；跳过隐藏文件/目录
+  （含 `.keep`、`.warehouse.json`）与符号链接（不跟随、不打包）；每层先子目录（深度优先）再文件、名称排序，输出稳定。
+- **流式与内存**：`zipstream.py` 用后台线程 + 非 seekable 队列 writer + 有界队列（8 块 × 256 KiB）实现背压，
+  `ZIP_STORED` + `allowZip64`，无 `Content-Length`、**不落临时文件、不整包进内存**；文件按 256 KiB 分块读取；
+  客户端中断时停止遍历/读取、线程退出，审计仍写一条并标记 `aborted=true`。
+- **响应头**：`Content-Disposition: attachment; filename="<ascii 回退>.zip"; filename*=UTF-8''<percent-encoded>`，
+  中文目录名走 RFC 5987（ASCII 回退为 `download.zip`）。
+- **安全与上限**：`prefix` 解析（含符号链接）后必须仍在本 bucket 内（否则 `400`）；隐藏项一律跳过；
+  单次 `files + dirs` 上限 `MAX_BULK_DOWNLOAD_ITEMS = 100000`，超限 `400`；失败请求不写审计、不计指标。
+- **网页 UI**：目录浏览页面包屑卡片新增 **「下载本目录」** 按钮（`data-action="download-dir"`，只读、
+  无确认弹窗），仅选中 bucket 后可用，bucket 根即下载整个 bucket；读取令牌框，空则提示先填写；
+  用隐藏 `<a>` 触发浏览器原生下载（不把 ZIP 读进内存），toast 提示单文件直下 / 多文件或含子目录自动打包 ZIP。
+- **审计与指标**：直下写 `download`（`extra` 含 `bulk=true`、`mode=file`）；ZIP 在流结束（含中断）写
+  `download_bulk`（`key` 为规范化 prefix、`size` 为实际发送字节数、`extra` 含 `mode/files/dirs/aborted`）；
+  `DOWNLOADS` 指标成功请求 +1（失败与 `304` 不计）。
+- **测试**：新增 `tests/test_bulk_download.py`（13 个测试函数，覆盖契约 §2.4 的 11 项要求），覆盖单文件直下
+  （Range/ETag）、流式 ZIP 结构与空目录、隐藏项/符号链接跳过、顶层命名、401/403/400/404 矩阵、审计与指标、
+  项数上限、中断审计、UI 标记。
+- **文档**：`docs/api_rules.md` 新增 §2.13（端点 / 鉴权 / 直下与 ZIP 规则 / ZIP 结构 / 流式 / 错误码 / 安全 /
+  审计），并同步 §1.6、§7、§8、§10、§11.5；`docs/architecture.md` 补 API 契约、流式 ZIP 可靠性与安全要点；
+  `README.md` 补核心特性、权限口径、API 参考、网页 UI 与测试清单。
+
+#### Changed
+
+- **版本号统一提升到 `0.10.0`**（`VERSION` / `main.py` 兜底 / `build_image.conf` / `deploy_container.sh` /
+  `README` / `docs`）。
+- **权限模型未变**：一键下载复用 `object:download`，不新增权限点，`viewer` / `downloader` / `operator`
+  等角色预设保持不变。
+
+#### Fixed
+
+- **`upload.session_ttl_seconds` 绝对有效期生效**：新增 `cleanup_expired_chunk_sessions()`，按
+  `.session.json.created_at` 清理绝对过期会话；新建会话和后台任务同时执行“空闲 TTL + 绝对 TTL”清理。
+- **OBJ-003/OBJ-005 修复**：直接上传目标 key 已是目录/父路径是文件、complete 目标 key
+  已是目录时返回 `409`（不再 500）；complete 失败清理本次分片会话，并同步移除对应已知缺陷标记。
+- **key 控制字符加固**：`validate_key()` 拒绝 CR/LF/TAB 等控制字符；下载响应头文件名做安全替换，
+  防止日志污染/header 注入。
+- **上传临时文件清理**：`finalize_chunk_upload` 在成功或进入合并/落盘阶段后的硬失败（I/O、磁盘满等）时
+  删除本次 `/tmp/dw_chunks/<upload_id>` 与合并临时文件；**校验类失败（缺片、超限、权限、409）保留会话**，
+  允许补齐/调整后重试或续传；`store_chunk` 复制失败清理 `.part.tmp`；直传/分片请求读取异常也会清理本次请求的
+  临时文件；服务启动时清理所有遗留分片会话（容器/进程重启即释放历史残留，避免几十 GB 分片长期占盘）；
+  后台任务每 10 分钟清理超过 upload.session_idle_ttl_seconds（默认 24h）没有分片写入的会话（浏览器被杀/断网无 abort 的兜底）。
+  `abort` 路径保持原清理行为。
+- **测试**：新增 `tests/test_upload_cleanup.py`（7 个用例：成功/落盘硬失败/缺片保留/`.part.tmp`
+  失败清理/启动清理/lifespan 启动清理/空闲清理不误删活跃会话）。
+- **文档**：`docs/api_rules.md` §3.3、`docs/architecture.md` 可靠性要点、`README.md` 上传特性同步说明。
+
+---
+
+## [0.9.0] - 2026-10-24
+
+### 目录批量删除（一键清空）
+
+#### Added
+
+- **批量删除目录内容接口** `POST /api/objects/bulk-delete`（BulkDelete）：清理指定目录（`bucket` + `prefix`，
+  `prefix` 为空或 `"/"` 表示 bucket 根）的**内容**，目录本身始终保留。`mode=files` 只删当前目录的直接文件
+  （子目录及其内容、`.keep`、隐藏项保留）；`mode=all` 递归删除全部文件与子目录（隐藏项一并删除，
+  但 bucket 根 `.warehouse.json` 永不删除）。支持 `dry_run=true` 只预览「文件数 / 目录数 / 总大小」，
+  预览不落盘、不写审计；响应返回 `files/dirs/bytes/errors/elapsed_ms`，部分失败仍返回 `200`
+  并在 `errors` 中给出明细（最多 20 条）。
+- **服务端确认校验**：执行（`dry_run=false`；省略 `dry_run` 即为执行）必须携带 `confirm`，且等于目录名
+  （`prefix` 最后一段；bucket 根目录为 `bucket` 名），缺失 / 不匹配返回 `400` 且不做任何改动；
+  网页端确认按钮在输入匹配前禁用，服务端仍二次校验（前端禁用不能替代服务端）。
+- **安全与上限**：不跟随符号链接（只删链接本身）；单次最多处理 `files + dirs = 50000` 项
+  （`dry_run` 预览同样受限），超限 `400`；并发删除导致的 `FileNotFoundError` 视为已不存在跳过，
+  其余 `OSError` 记入 `errors` 并继续；`prefix` 不存在或不是目录 `404`；路径穿越 / 隐藏路径段由
+  `validate_key` 拦截 `400`。
+- **新权限点 `object:delete_bulk`**（分组「对象删除」）：对应 `POST /api/objects/bulk-delete`，
+  并校验 bucket / prefix 资源范围；`admin` 自动含全部权限点，`operator` 角色预设同步加入。
+- **网页 UI**：目录浏览页面包屑卡片新增「清空本目录文件」（`files`）与「删除本目录全部内容」（`all`）
+  两个危险按钮（危险样式，仅选中 bucket 后可用）；`#bulkDeleteModal` 先 `dry_run` 预览文件数 / 目录数 /
+  总大小并提示不可恢复，输入目录名后确认按钮才可用；成功后 toast 汇总并刷新列表，
+  `errors` 非空时红色 toast 提示部分失败。事件委托 + `data-action`，无内联 JS，兼容严格 CSP。
+- **审计与指标**：执行写 `delete_bulk` 审计（`bucket` / 规范化后的 `prefix` / actor / 客户端 IP /
+  `size=bytes`，`extra` 含 `mode` / `files` / `dirs`）；`dry_run` 不写审计；`DELETES` 指标每次执行 +1。
+- **测试**：新增 `tests/test_bulk_delete.py`（13 个测试函数，对应契约 §2.4 的 10 项要求），覆盖
+  files / all 预览与执行、清单清理、确认名称校验、401/403/200 权限矩阵与资源范围、`operator` 预设、
+  404 / 400、项数上限、审计与 `DELETES` 指标、符号链接不跟随、UI 标记。
+- **文档**：`docs/api_rules.md` 新增 §2.12（端点 / 鉴权 / 请求响应 / files 与 all 语义 / 确认规则 /
+  错误码 / 审计），并同步 §1.6、§7、§8、§10、§12.2、§12.3；`docs/architecture.md` 补 API 契约、
+  可靠性与安全要点；`README.md` 补核心特性、权限口径、API 参考、调用示例与 FAQ。
+
+#### Changed
+
+- **`operator` 角色预设**新增 `object:delete_bulk`（`admin` 自动包含；`publisher` / `user` / `uploader`
+  等其余预设保持不变），运营方无需单独勾选即可使用批量删除。
+- **版本号统一提升到 `0.9.0`**（`VERSION` / `main.py` 兜底 / `build_image.conf` / `deploy_container.sh` /
+  `README` / `docs`）。
 
 ---
 
@@ -74,6 +179,31 @@ ArtifactDepot v0.8.0 — 所有对本项目的重要更改都将记录在此文�
 - **`docs/api_rules.md` 按实现逐条校对**：修正 19 处与实现不符的描述（`public_ip` 被忽略、`ETag` 回退规则、错误码表补 `503` 与「未配置 access_token → 401」、`auth/check` 成功/失败字段差异、`config/reload` 失败为 `400`、Token 注册表返回结构、§8 总表补全并统一 `{link_id}`、`user` 角色补签名链接权限等），并登记 4 个已知缺陷（`OBJ-001/002/003~005/006`）。
 - 版本号统一提升到 `0.8.0`（`VERSION` / `main.py` 兜底 / `build_image.conf` / `deploy_container.sh` / `README` / `docs`）。
 ## [Unreleased]
+
+### 上传参数配置化（config.json）
+
+#### Added
+
+- **`upload.*` 配置组**：`chunk_size_mb`（默认 8）、`chunk_concurrency`（默认 4）、
+  `file_concurrency`（默认 3）、`request_timeout_seconds`（默认 **86400 = 24h**）、
+  `max_chunk_mb`（默认 64）、`max_chunks`（默认 100000）、`max_session_gb`（默认 200）、
+  `session_ttl_seconds`（默认 86400）、`session_idle_ttl_seconds`（默认 86400，且不小于请求超时）。
+  支持 `config.json`、`.env` 点号写法（`upload.chunk_size_mb=8`）与
+  `ARTIFACT_DEPOT_UPLOAD_*` 环境变量；`POST /api/config/reload` 后即时生效。
+- **服务端下发配置**：`GET /api/auth/permissions` 与 `POST /api/objects/initiate`
+  返回 `chunk_size` / `chunk_concurrency` / `file_concurrency` /
+  `request_timeout_seconds` / `max_chunk_size` 等，网页和 CLI 以服务端返回值为准。
+- **网页**：加载时读取 `upload.*`；分片大小、分片并发、文件并发默认值、
+  分片/合并请求超时（默认 24h）均按配置执行。
+- **CLI**：`initiate` 读取服务端 `request_timeout_seconds`，分片与 complete
+  超时默认 24h，不再写死 600s / 7200s。
+- **测试**：新增 `tests/test_upload_config.py`（默认值、自定义值、上限、热重载、
+  `.env` 点号覆盖、前端读取标记）。
+
+#### Changed
+
+- 单分片上限/会话上限校验改为「配置值 + 代码常量兜底」：配置只能调小，
+  不会被网页/CLI 放大到不安全范围（分片 ≤64MB、并发 ≤16、会话 ≤200GB）。
 
 ### 许可证署名工程化（无接口变更）
 

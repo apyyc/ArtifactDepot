@@ -50,7 +50,7 @@ def _new_token(c, **body):
 
 def test_permission_catalog_is_public(client):
     d = client.get("/api/auth/permissions").json()["data"]
-    assert len(d["permissions"]) == 21
+    assert len(d["permissions"]) == 22
     assert {p["key"] for p in d["permissions"]} >= {
         "object:upload", "object:download", "object:delete", "link:create", "token:write"}
     assert d["public"] and d["roles"] and d["default_role"] == "user"

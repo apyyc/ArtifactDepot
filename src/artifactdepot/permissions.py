@@ -46,6 +46,9 @@ PERMISSION_CATALOG = [
     # ---- 删除 ----
     {"key": "object:delete", "group": "对象删除", "label": "删除对象 / 空目录",
      "method": "DELETE", "path": "/api/objects", "write": True},
+    {"key": "object:delete_bulk", "group": "对象删除",
+     "label": "批量删除目录内容（一键清空，需输入名称确认）",
+     "method": "POST", "path": "/api/objects/bulk-delete", "write": True},
 
     # ---- 签名链接 ----
     {"key": "link:create", "group": "签名链接", "label": "生成签名下载链接",
@@ -112,7 +115,8 @@ ROLE_PRESETS = {
         "scopes": ["bucket:list", "bucket:create", "object:list", "object:head",
                    "object:download", "object:upload", "upload:initiate", "upload:chunk",
                    "upload:complete", "upload:abort", "object:mkdir", "object:rename",
-                   "object:delete", "link:create", "link:list", "link:revoke"],
+                   "object:delete", "object:delete_bulk",
+                   "link:create", "link:list", "link:revoke"],
     },
     "auditor": {
         "label": "审计只读（浏览 + 审计 + 查看 token）",

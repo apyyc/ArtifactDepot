@@ -39,3 +39,23 @@
   .doc-link:hover { color: #409eff; border-color: #409eff; }
   .modal-mask { position: fixed; inset: 0; background: rgba(0,0,0,.4); display: flex; align-items: center; justify-content: center; z-index: 1000; }
   .modal { background: #fff; padding: 18px 22px; border-radius: 8px; min-width: 380px; box-shadow: 0 4px 20px rgba(0,0,0,.2); }
+  /* 目录批量删除（一键清空）：入口按钮与确认弹窗 */
+  .breadcrumb .crumb-ops { float: right; display: inline-flex; align-items: center; gap: 6px; }
+  .breadcrumb #bulkOps { align-items: center; gap: 6px; }
+  button.danger:disabled { color: #c0c4cc; border-color: #e4e7ed; background: #fff; cursor: not-allowed; }
+  button.danger-solid { background: #f56c6c; color: #fff; border-color: #f56c6c; }
+  button.danger-solid:hover:not(:disabled) { background: #f78989; border-color: #f78989; }
+  button.danger-solid:disabled { background: #fbc4c4; border-color: #fbc4c4; cursor: not-allowed; }
+  .modal-wide { min-width: 480px; max-width: 620px; }
+  .bulk-preview { font-size: 13px; line-height: 1.7; background: #f4f6f8; border: 1px solid #e4e7ed; border-radius: 4px; padding: 8px 10px; }
+  .bulk-preview-err { color: #c45656; background: #fef0f0; border-color: #fbc4c4; }
+  .bulk-warning { margin-top: 8px; font-size: 12px; line-height: 1.6; color: #c45656; background: #fef0f0; border: 1px solid #fbc4c4; border-radius: 4px; padding: 8px 10px; }
+  .bulk-hint { margin-top: 6px; font-size: 12px; color: #909399; }
+  .bulk-hint.ok { color: #67c23a; }
+  .bulk-hint.bad { color: #f56c6c; }
+  /* 单文件下载：进度弹窗 + 进度条（并行 Range 分块下载） */
+  #dlModal .modal { min-width: 460px; }
+  .dl-name { font-size: 13px; color: #303133; margin-bottom: 10px; word-break: break-all; }
+  .dl-bar { height: 14px; background: #eef2f7; border: 1px solid #dcdfe6; border-radius: 7px; overflow: hidden; }
+  .dl-bar > span { display: block; width: 0; height: 100%; background: linear-gradient(90deg, #409eff, #67c23a); transition: width .2s ease; }
+  .dl-stat { margin-top: 8px; font-size: 12px; color: #909399; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }

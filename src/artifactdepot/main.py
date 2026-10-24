@@ -6,9 +6,10 @@
 行业定位：对象存储/工件仓库（S3 模型）。收存处理产物（视频等），
 提供上传/列表/下载(Range)/删除/预签名 URL API + 网页浏览。
 """
+import asyncio
 import logging
 import os
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -21,7 +22,7 @@ from artifactdepot import storage
 from artifactdepot.api.docs import router as docs_router
 from artifactdepot.api.objects import router as objects_router
 from artifactdepot.api.system import router as system_router
-from artifactdepot.config import config_warnings, get_config
+from artifactdepot.config import config_warnings, get_config, get_upload_settings
 from artifactdepot.logging_utils import install_access_log_redaction
 from artifactdepot.observability import ObservabilityMiddleware, install_observability
 from artifactdepot.web.ui import router as web_router
@@ -46,10 +47,36 @@ def _app_version() -> str:
                     return v
     except OSError:
         pass
-    return "0.8.0"
+    return "0.10.0"
 
 
 APP_VERSION = _app_version()
+
+# 后台清理间隔（秒）：浏览器被杀/断网时没有 abort 请求，只能靠空闲超时兜底
+CHUNK_CLEANUP_INTERVAL = 600
+
+
+async def _chunk_cleanup_loop() -> None:
+    """定期清理超过 config.upload.session_idle_ttl_seconds 没有分片写入的会话。"""
+    while True:
+        await asyncio.sleep(CHUNK_CLEANUP_INTERVAL)
+        try:
+            settings = get_upload_settings()
+            removed_idle = await asyncio.to_thread(
+                storage.cleanup_stale_chunk_sessions,
+                settings["session_idle_ttl_seconds"],
+            )
+            removed_expired = await asyncio.to_thread(
+                storage.cleanup_expired_chunk_sessions,
+                settings["session_ttl_seconds"],
+            )
+            removed = removed_idle + removed_expired
+            if removed:
+                logger.info("[清理] 后台清理分片会话：空闲 %s 个、绝对过期 %s 个",
+                            removed_idle, removed_expired)
+        except Exception:
+            # 清理失败不能影响主服务
+            logger.warning("[清理] 后台清理分片会话失败", exc_info=True)
 
 
 @asynccontextmanager
@@ -66,8 +93,22 @@ async def lifespan(app: FastAPI):
     # 确保仓库根目录存在，并从 DataHub 拉取用户 token（启动即最新）
     root = storage.get_root()
     root.mkdir(parents=True, exist_ok=True)
+    # 容器/进程重启时不可能还有活跃上传：清理上次进程遗留的 /tmp/dw_chunks/<id>
+    # （浏览器被杀、容器重启、complete 失败等），避免几十 GB 分片长期占盘。
+    try:
+        removed_sessions = storage.cleanup_all_chunk_sessions()
+        if removed_sessions:
+            logger.info("[清理] 启动清理遗留分片会话：%s 个", removed_sessions)
+    except OSError as e:
+        logger.warning("[清理] 启动清理分片会话失败：%s", e)
     await storage.sync_tokens_from_datahub(get_config().get("datahub_url", ""), force=True)
-    yield
+    cleanup_task = asyncio.create_task(_chunk_cleanup_loop())
+    try:
+        yield
+    finally:
+        cleanup_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await cleanup_task
 
 
 _STATIC_DIR = Path(__file__).resolve().parent / "resources" / "static"

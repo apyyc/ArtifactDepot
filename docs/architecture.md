@@ -1,6 +1,6 @@
 # ArtifactDepot 架构说明
 
-> 版本 **0.8.0**
+> 版本 **0.10.0**
 
 ## 定位
 
@@ -56,7 +56,8 @@ ArtifactDepot/
 └── src/artifactdepot/
     ├── main.py                 # FastAPI 入口 + lifespan（确保仓库根存在）
     ├── config/                 # 配置包：__init__.py（加载/手动重载）+ config.json + config.production.json + .env(.example)
-    ├── storage.py              # 对象存储引擎：路径安全 / put/list/delete / manifest / 预签名 / 签名链接注册表 / token 注册表 / 审计 / DataHub 同步 / meta_dir
+    ├── storage.py              # 对象存储引擎：路径安全 / put/list/delete/bulk_delete / bulk_download_scan / manifest / 预签名 / 签名链接注册表 / token 注册表 / 审计 / DataHub 同步 / meta_dir
+    ├── zipstream.py            # 流式 ZIP（后台线程 + 有界队列 + 背压；目录一键下载，不落临时文件）
     ├── auth.py                 # 写操作 token 校验（query / Bearer）
     ├── api/
     │   ├── objects.py          # S3-like 对象 API
@@ -109,7 +110,9 @@ ArtifactDepot/
 | POST | `/api/objects/mkdir` | 新建目录（key 可含 `/` 多级） | - |
 | GET | `/api/objects/list` | 列对象（bucket/prefix） | ListObjects |
 | GET | `/api/objects/download` | 下载，Range 206，需 token（签名链接免） | GetObject |
+| GET | `/api/objects/download-bulk` | 一键下载目录：单文件直下 / 多文件或含子目录流式 ZIP（复用 `object:download`；见下「可靠性要点」） | - |
 | DELETE | `/api/objects` | 删除对象/空目录（权限点 `object:delete`） | DeleteObject |
+| POST | `/api/objects/bulk-delete` | 批量删除目录内容（`object:delete_bulk`；保留目录本身、需输入名称确认；见下「可靠性要点」） | - |
 | POST | `/api/objects/presign` | 生成签名链接（count/time/permanent） | Presigned URL |
 | GET/POST/DELETE/PUT | `/api/tokens` | Token 注册表管理（`token:read/write/delete`） | - |
 | GET | `/api/auth/permissions` | 权限点/接口目录（公开） | - |
@@ -131,7 +134,25 @@ ArtifactDepot/
 
 - 状态文件（`tokens.json` / `signed_links.json` / `.warehouse.json`）统一原子写（临时文件 + `fsync` + `os.replace`），
   并用 `storage.state_lock()`（进程内 `threading` 锁 + 跨进程 `fcntl.flock`）串行化读-改-写，避免并发丢更新 / 半截 JSON。
-- 分片上传会话绑定创建者，`upload_id` 严格校验；单分片 ≤64MB，会话总量受 `max_upload_mb`（默认 200GB 兜底）约束。
+- 分片上传会话绑定创建者，`upload_id` 严格校验；单分片 ≤64MB（`upload.max_chunk_mb`），会话总量受 `max_upload_mb` / `upload.max_session_gb`（默认 200GB）约束；分片大小、并发、请求超时（默认 24h）均可由 `upload.*` 配置。
+- **分片上传临时文件清理**：`finalize_chunk_upload` 在成功或进入合并/落盘阶段后的硬失败（I/O、磁盘满等）时
+  删除本次 `/tmp/dw_chunks/<upload_id>` 与合并临时文件；校验类失败（缺片 / 超限 / 权限 / 409）保留会话以便重试；
+  `store_chunk` 复制失败清理 `.part.tmp`；直传/分片请求读取异常清理临时文件；
+  服务启动时 `cleanup_all_chunk_sessions()` 清理所有历史遗留会话（容器/进程重启即释放，避免几十 GB 分片长期占盘）；
+  后台任务每 10 分钟清理超过 `upload.session_idle_ttl_seconds`（默认 24h）没有分片写入的会话（浏览器被杀/断网的兜底）。
+- **批量删除目录内容**（`storage.bulk_delete`，`POST /api/objects/bulk-delete`）：先**只读收集**目标并检查上限
+  （`MAX_BULK_DELETE_ITEMS = 50000`，`files + dirs` 超限 `400`，`dry_run` 预览同样受限），再执行删除；
+  `dry_run=true` 在删除前返回统计，不落盘、不写审计。执行时 `FileNotFoundError` 视为「已不存在」跳过
+  （并发删除幂等），其余 `OSError` 记入 `errors` 继续；符号链接只删链接本身、**不跟随**；
+  先删文件、再自底向上删目录；`prefix` 目录本身与 bucket 根 `.warehouse.json` 始终保留；
+  清单在 `state_lock()` 内一次性清理「被删文件 key」与「被删目录前缀下的条目」。
+- **目录一键下载流式 ZIP**（`zipstream.py` + `storage.bulk_download_scan`，`GET /api/objects/download-bulk`）：
+  zipfile 在**后台线程**写入一个非 seekable 的队列 writer（`ZIP_STORED` + `allowZip64`，自动 data descriptor），
+  异步生成器从**有界队列**（8 块 × 256 KiB）取块 `yield` 给 `StreamingResponse`；队列满时生产线程阻塞形成**背压**，
+  内存占用恒定，**不落临时 ZIP、无 `Content-Length`**。读文件固定 256 KiB 块，绝不整文件 `read()`；
+  客户端中断置位 `threading.Event`，生产线程退出并由 `finish_once()` 兜底写一条 `aborted=true` 审计。
+  预检只读扫描（`bulk_download_scan`）决定「单文件直下 / ZIP」，隐藏项与符号链接跳过、不跟随；
+  `prefix` 解析（含符号链接）后必须仍在本 bucket 内，单次 `files + dirs` 上限 `MAX_BULK_DOWNLOAD_ITEMS = 100000`。
 - 容器以非 root 用户 `artifactdepot(10001)` 运行；绑定宿主机目录时由 `deploy_container.sh` 以宿主 UID/GID + `--userns=keep-id` 运行，保证卷可写。
 
 ## 可观测性
@@ -144,15 +165,20 @@ ArtifactDepot/
 ## 安全要点
 
 - 路径穿越防护：bucket 名校验 + key 拒绝绝对路径/`..`/空段/反斜杠/点前缀，解析后校验落在仓库根内。
-- 上传上限：`max_upload_mb`（0 不限）。
+- 上传上限：`max_upload_mb`（0 不限）；分片/并发/超时见 `upload.*`（`request_timeout_seconds` 默认 24h）。
 - 写令牌：UTF-8 字节常量时间比较（hmac.compare_digest，非 ASCII 安全）。
 - 预签名：HMAC-SHA256(secret=access_token, bucket|key|expires)，过期即拒。
 - 删除：权限点 `object:delete`（管理员共享 token 默认拥有）；目录仅空可删（防误删）。
+- 批量删除：权限点 `object:delete_bulk`（`operator` 预设包含），服务端二次校验 `confirm`
+  （目录名 / 根目录为 bucket 名），只清内容不删目录本身，bucket 根 `.warehouse.json` 受保护。
+- 一键下载：复用 `object:download` + bucket/前缀范围；只打包可见项（隐藏文件/目录、`.keep`、`.warehouse.json`、
+  符号链接一律跳过且不跟随），`prefix` 解析后不得越出 bucket；ZIP 条目名来自真实相对路径，中文名用 RFC 5987
+  `filename*`；流式生成、单次上限 100000 项。
 
 ## 部署
 
 - **build → save → 拷贝 → load → deploy**：
-  - 开发机 `./build_image.sh`（构建 + 自动导出 `artifactdepot-0.8.0.tar`）
+  - 开发机 `./build_image.sh`（构建 + 自动导出 `artifactdepot-0.10.0.tar`）
   - 拷贝 tar 到生产机 → `podman load -i` → `./deploy_container.sh --token <你的管理员token>`
 - **host 网络默认**：容器共享宿主网络，`datahub_url` 用 `127.0.0.1:8002` 直连同机 DataHub；
   `--port-map` 可改回端口映射（不推荐，rootless 桥接常不通）。

@@ -68,14 +68,8 @@ RENAME_MANIFEST_REASON = (
     "已上报缺陷 OBJ-002（P2）：rename overwrite=true 覆盖既有文件/目录后未更新 "
     ".warehouse.json，sha256/size/mtime 与实际文件不符；head/list/ETag 返回陈旧值"
 )
-UPLOAD_500_REASON = (
-    "已上报缺陷 OBJ-003（P2）：upload 目标 key 已是目录 / 父路径是文件时抛未捕获异常 → 500"
-)
 MKDIR_500_REASON = (
     "已上报缺陷 OBJ-004（P2）：mkdir 的 key 或父路径已是文件时抛未捕获异常 → 500"
-)
-COMPLETE_500_REASON = (
-    "已上报缺陷 OBJ-005（P2）：complete 目标 key 已是目录时抛未捕获异常 → 500"
 )
 PRESIGN_URL_REASON = (
     "已上报缺陷 OBJ-006（P2）：presign / signed-links 拼装的 url 未做 URL 编码，"
@@ -699,7 +693,6 @@ def test_upload_validation_and_limits(ctx):
     assert _up(c, "demo", "a/k.txt", b"x", token=nobody).status_code == 403
 
 
-@pytest.mark.xfail(strict=True, reason=UPLOAD_500_REASON)
 def test_upload_type_conflict_should_not_500(ctx):
     """B/D：upload 目标 key 已是目录、或父路径是文件 → 应 400/409，而不是 500。"""
     c, _, depot, _ = ctx
@@ -1395,7 +1388,6 @@ def test_complete_total_size_limit(ctx):
     c.post("/api/objects/abort", params={"token": actor}, data={"upload_id": uid})
 
 
-@pytest.mark.xfail(strict=True, reason=COMPLETE_500_REASON)
 def test_complete_type_conflict_should_not_500(ctx):
     """B/D：complete 目标 key 已是目录 → 应 400/409，而不是 500。"""
     c, _, depot, _ = ctx
@@ -1407,7 +1399,8 @@ def test_complete_type_conflict_should_not_500(ctx):
     _chunk(c, actor, uid, 0, b"DATA")
     r = _complete(c, actor, uid, "demo", "dir", 1)
     assert r.status_code in (400, 409), f"complete 目标为目录时返回 {r.status_code}（未处理异常 → 500）"
-    c.post("/api/objects/abort", params={"token": actor}, data={"upload_id": uid})
+    # 目录冲突属于不可恢复失败：本次会话应清理，避免 /tmp 残留
+    assert not _session_path(uid).is_dir()
 
 
 # ===========================================================================

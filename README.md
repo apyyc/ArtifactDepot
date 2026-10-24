@@ -1,8 +1,8 @@
 # ArtifactDepot — 对象存储仓库站点
 
-> 版本 0.8.0，端口 8004，独立服务
+> 版本 0.10.0，端口 8004，独立服务
 
-**一句话**：按行业标准（对象存储 / S3 模型）设计的文件仓库站点，收存处理产物（视频 / 文件），提供上传、列表、Range 下载、删除、新建目录、签名链接与审计，并带网页界面。业务 JSON 数据在 DataHub，**本服务不承担业务逻辑**。
+**一句话**：按行业标准（对象存储 / S3 模型）设计的文件仓库站点，收存处理产物（视频 / 文件），提供上传、列表、Range 下载、一键下载目录、删除、新建目录、签名链接与审计，并带网页界面。业务 JSON 数据在 DataHub，**本服务不承担业务逻辑**。
 
 ---
 
@@ -28,19 +28,19 @@
 | 类别 | 能力 |
 |---|---|
 | 存储模型 | S3 风格：`bucket`（= 项目）+ `key`（= 任务/文件路径）扁平命名，文件系统为唯一事实源 |
-| 上传 | multipart 流式落盘 + SHA-256 + `max_upload_mb` 上限；**整页拖拽上传**（多文件排队、上传前先校验 token、并发数可调）；文件列表新增**上传者**列（按 token 识别）；**大文件自动多线程分片上传**（>8MB 分片并行合并） |
-| 下载 | Starlette `FileResponse` 原生 **Range(206)**（视频可拖动、断点续传）；**需有效 token**（签名链接免 token） |
+| 上传 | multipart 流式落盘 + SHA-256 + `max_upload_mb` 上限；**整页拖拽上传**（多文件排队、上传前先校验 token、并发数可调）；文件列表新增**上传者**列（按 token 识别）；**大文件自动多线程分片上传**（按 `upload.chunk_size_mb`，默认 8MB；分片并发/请求超时由 `upload.*` 配置，超时默认 24h）；**成功/硬失败清理 `/tmp` 临时分片**（校验类失败保留会话可重试；启动清理历史遗留；后台 10 分钟回收默认 24h 无写入会话） |
+| 下载 | Starlette `FileResponse` 原生 **Range(206)**（视频可拖动、断点续传）；**需有效 token**（签名链接免 token）；**一键下载目录**（`GET /api/objects/download-bulk`，复用 `object:download`）：单文件直下，多文件/含子目录**流式打包 ZIP**（顶层保留目录结构，跳过隐藏项与符号链接） |
 | 缓存/条件请求 | 下载/探测返回 **ETag**（基于 SHA-256），支持 `If-None-Match` → **304**，重复访问省流量 |
-| 目录管理 | **新建目录**（`key` 含 `/` 自动多级）；**删除仅允许空目录**（含内容拒绝，防误删） |
+| 目录管理 | **新建目录**（`key` 含 `/` 自动多级）；**删除仅允许空目录**（含内容拒绝，防误删）；**批量删除目录内容**（`object:delete_bulk`）：`files` 只删当前目录的直接文件、`all` 递归清空文件与子目录，保留目录本身、保护 `.warehouse.json`，执行前必须输入目录名确认 |
 | 目录信息 | 目录项显示**递归大小**（本目录 + 全部嵌套子目录的文件总字节，`fmtSize`）与**最新修改时间**（所有文件里最新的 mtime，`fmtTime`）；跳过 `.keep` 等隐藏占位文件 |
 | 签名链接 | 注册表驱动：**按次数(1-10) / 按时效 / 永久** 三种时效；管理员可作废全部、创建者可作废自己的；上下限可配置 |
-| 身份识别 | 按令牌识别「谁」：共享 token 识别为「系统/工具」；用户 token 识别为用户名；**管理员 token 为全集**；删除为权限点 `object:delete`（默认仅管理员有） |
+| 身份识别 | 按令牌识别「谁」：共享 token 识别为「系统/工具」；用户 token 识别为用户名；**管理员 token 为全集**；删除为权限点 `object:delete`（默认仅管理员共享 token 有）；批量删除为独立权限点 `object:delete_bulk`（`operator` 预设包含） |
 | 审计日志 | 每次上传/下载/删除/建目录/签名/作废追加 `audit.log`（JSONL），**双 IP**（局域网 + 公网）、**UTC 时间**；按 `audit_max_mb` 自动轮转 |
 | 可观测性 | `X-Request-ID` 透传 + JSON 结构化访问日志；`/metrics`（Prometheus 文本）；`/health/live`（存活）/ `/health/ready`（可写就绪） |
 | Token 同步 | 从 DataHub `users.json` 拉取用户 token（collab 权威源，本地副本，只增不删；DataHub 不可达时明确提示） |
 | 状态文件可迁移 | `meta_dir` 配置项把 `tokens.json` / `signed_links.json` / `audit.log` 移出仓库根，与业务文件隔离、便于备份 |
 | 生产部署 | 脚本**构建完自动导出 tar**（`--no-save` 跳过）；部署默认 **host 网络**（容器内 `127.0.0.1` = 宿主机，同机连 DataHub 最稳）；Podman 走 systemd user 自启，Docker 走 `--restart=always`；`--config` / `VOLUME_MAPS` 可挂载外部 config.json |
-| 网页 UI | bucket 点击选中 + 高亮、整页拖拽、新建目录、签名链接管理、Token 管理、审计、文件列表 **「加载更多」分页**；标签栏右侧提供 **Swagger / ReDoc** 入口（静态资源自托管，内网/离线可用）；前端脚本/样式外置 + 严格 **CSP**（`script-src 'self'`）；自定义确认框 |
+| 网页 UI | bucket 点击选中 + 高亮、整页拖拽、新建目录、**一键下载目录（单文件直下，多文件/含子目录流式 ZIP，无确认）**、**批量删除（两个危险按钮 + 预览 + 输入目录名确认）**、签名链接管理、Token 管理、审计、文件列表 **「加载更多」分页**；标签栏右侧提供 **Swagger / ReDoc** 入口（静态资源自托管，内网/离线可用）；前端脚本/样式外置 + 严格 **CSP**（`script-src 'self'`）；自定义确认框 |
 | 跳转免填 | 支持 URL 携带 token/bucket 直接进入：`/?token=<api_token>[&bucket=<bucket>]` 自动填充令牌并进入目标 bucket，落地即清除地址栏 token（协作平台「任务数据」跳转自动认证） |
 
 ---
@@ -53,8 +53,10 @@
 - ArtifactDepot（FastAPI :8004）由 `storage.py` 负责 bucket/key 落盘 + 元数据清单 + 签名链接注册表 + 审计：
   - `POST /api/objects` 上传（token 认证，可先 `/api/auth/check` 校验）
   - `POST /api/objects/mkdir` 新建目录
+  - `POST /api/objects/bulk-delete` 批量删除目录内容（保留目录本身，需输入名称确认）
   - `GET /api/objects/list` 列文件
   - `GET /api/objects/download` 下载（需 token；签名链接免）
+  - `GET /api/objects/download-bulk` 一键下载目录（单文件直下 / 多文件或含子目录流式打包 ZIP）
   - `POST /api/objects/presign` 生成签名链接
   - `GET /` 网页浏览
 - 消费方：用户浏览器 / ProjectCollab「任务数据」模块
@@ -69,7 +71,9 @@
 - **管理员 token 是全集**：上传 / 下载 / 签名 / 建目录 / 删除 / 作废 / 管理 全部操作
 - 上传 / 下载 / 签名 / 建目录：任一有效 token（管理员或用户）
 - 下载：任一有效 token；签名链接（`link`+`tk` / 旧式 `expires`+`sig`）免 token
+- 一键下载目录：复用 `object:download`（**不新增权限点**，旧 token 立即生效）；仅支持 token（不接签名链接）；范围按 bucket/prefix 校验
 - 删除：权限点 `object:delete`（默认仅管理员共享 token 有）；且**目录仅空可删**（含文件/子目录拒绝）
+- 批量删除：权限点 `object:delete_bulk`（`operator` 预设包含）；执行必须输入目录名（bucket 根目录输入 bucket 名）并由服务端二次校验；只清内容不删目录本身，bucket 根 `.warehouse.json` 受保护
 - 签名链接作废：管理员可作废全部，创建者可作废自己的
 
 ### 生产部署与升级流程
@@ -80,20 +84,20 @@
 
 ```bash
 cd ArtifactDepot
-./build_image.sh                     # 构建 localhost/artifactdepot:0.8.0 + 自动导出 artifactdepot-0.8.0.tar
+./build_image.sh                     # 构建 localhost/artifactdepot:0.10.0 + 自动导出 artifactdepot-0.10.0.tar
 ```
 
 2. 把 tar 拷到生产机
 
 ```bash
-scp artifactdepot-0.8.0.tar apyyc@<生产机>:~/SERVER/artifactdepot/
+scp artifactdepot-0.10.0.tar apyyc@<生产机>:~/SERVER/artifactdepot/
 ```
 
 3. 生产机导入并部署
 
 ```bash
 cd ~/SERVER/artifactdepot
-podman load -i artifactdepot-0.8.0.tar
+podman load -i artifactdepot-0.10.0.tar
 cd ArtifactDepot
 ./deploy_container.sh --token <你的管理员token>   # 默认 host 网络；datahub_url 用挂载的 config.json
 ```
@@ -116,17 +120,22 @@ cd ArtifactDepot
 
 ## 安装
 
-### 本地安装依赖
+### 本地安装依赖（推荐 uv 本地虚拟环境）
 
 ```bash
-pip install -r requirements.txt
+# 在 ArtifactDepot 仓库或其上级工作区创建 .venv 均可（启动脚本会自动识别）
+uv venv .venv --python /usr/bin/python3.13
+uv pip install --python .venv/bin/python -r requirements.txt
 ```
+
+> 本工作区已自带 uv：`/home/apyyc/work/ArtifactDepot/.tools/uv`。
+> 若系统 Python 已装依赖，也可继续用 `pip install -r requirements.txt`；但不建议依赖系统环境。
 
 ### 构建镜像（自动导出 tar）
 
 ```bash
 cd ArtifactDepot
-./build_image.sh                      # 构建 + 自动导出 artifactdepot-0.8.0.tar
+./build_image.sh                      # 构建 + 自动导出 artifactdepot-0.10.0.tar
 ```
 
 常用参数：
@@ -136,7 +145,7 @@ cd ArtifactDepot
 | `--no-save` | 只构建，不导出 tar |
 | `--save /path/to/out.tar` | 指定导出路径（默认同目录 `artifactdepot-<tag>.tar`） |
 | `--no-cache` | 不用构建缓存（依赖层有改动时用） |
-| `--tag <版本>` | 自定义版本标签（默认 0.8.0） |
+| `--tag <版本>` | 自定义版本标签（默认 0.10.0） |
 | `--load /path/to/in.tar` | 不构建，直接导入已有 tar |
 | `--list` | 只列出本地镜像 |
 
@@ -146,9 +155,9 @@ cd ArtifactDepot
 
 ```bash
 # 导出（等价于 build_image.sh 的自动步骤）
-podman save -o artifactdepot-0.8.0.tar localhost/artifactdepot:0.8.0
+podman save -o artifactdepot-0.10.0.tar localhost/artifactdepot:0.10.0
 # 目标机导入
-podman load -i artifactdepot-0.8.0.tar
+podman load -i artifactdepot-0.10.0.tar
 ```
 
 ---
@@ -159,6 +168,7 @@ podman load -i artifactdepot-0.8.0.tar
 
 ```bash
 cd ArtifactDepot
+./dev_start_headless.sh check       # 确认使用本地 venv（打印 sys.executable）
 ./dev_start_headless.sh start       # 后台启动 + 日志
 ./dev_start_headless.sh status      # 查看状态
 ./dev_start_headless.sh tail        # 跟踪日志
@@ -166,10 +176,10 @@ cd ArtifactDepot
 ```
 
 端口默认 8004，可用环境变量 `AD_PORT` 覆盖（`AD_PORT=8090 ./dev_start_headless.sh start`）。
-启动命令等价于（需要当前环境里的 `python3` 已装 `uvicorn`/`fastapi`）：
+启动脚本会自动选择本地 venv（`$AD_PYTHON` > 项目 `.venv` > 工作区根 `../.venv` > `python3`），也可用 `AD_PYTHON=/path/to/python` 显式覆盖。等价于（以 `check` 输出为准；venv 在工作区根时把 `.venv` 换成 `../.venv`）：
 
 ```bash
-PYTHONPATH=src python3 -m uvicorn artifactdepot.main:app --host 0.0.0.0 --port 8004
+PYTHONPATH=src .venv/bin/python -m uvicorn artifactdepot.main:app --host 0.0.0.0 --port 8004
 ```
 
 ### 容器部署（带自启）
@@ -206,7 +216,7 @@ PYTHONPATH=src python3 -m uvicorn artifactdepot.main:app --host 0.0.0.0 --port 8
 1. 打开 `http://<主机>:8004/`，页面自动列出 bucket，点击即选中进入
 2. 顶部**令牌框**填入你的 api_token 或管理员 access_token（上传/下载/签名/删除/建目录通用；管理员可做全部）
 3. 选文件或**拖拽到页面任意位置**，松手自动上传（先校验 token）
-4. 点「新建目录」输入目录名（可含 `/` 多级）组织文件；目录「删除」仅空目录可删
+4. 点「新建目录」输入目录名（可含 `/` 多级）组织文件；目录「删除」仅空目录可删；需要清空当前目录时用**「清空本目录文件」/「删除本目录全部内容」**，弹窗先预览文件数/目录数/总大小，再输入目录名确认；需要整目录取回时点**「下载本目录」**（bucket 根即整桶；单文件直接下载，多文件或含子目录自动打包 ZIP）
 5. 需要分享时点文件「签名链接」，弹窗选按时效/按次数/永久，生成后内嵌显示、可复制
 6. 管理员在「签名链接」页可看全部链接（含每行复制）、作废；「Token 管理」页同步/登记
 7. 需要查接口说明时点标签栏右侧的 **Swagger / ReDoc**（由 FastAPI 依据实际路由生成，可在线调试）
@@ -227,6 +237,13 @@ ARTIFACT_DEPOT_CONFIG=$(mktemp) PYTHONPATH=src python3 -m pytest tests/test_acce
 - `tests/test_acceptance_batch4.py` 按业务语义验证：ETag/304、Range、分页边界、
   可观测性（`/metrics`、`/health/live|ready`、`X-Request-ID`）、CSP、配置重载
   （changed/needs_restart/坏 JSON 保留旧配置）、权限/越权、路径穿越、联动与数据一致性。
+- `tests/test_bulk_delete.py` 覆盖批量删除：`files`/`all` 预览与执行、确认名称服务端校验、
+  401/403 与资源范围、项数上限 400、审计与指标、符号链接不跟随、UI 标记。
+- `tests/test_bulk_download.py` 覆盖一键下载：单文件直下（Range/ETag）、流式 ZIP 结构与空目录、
+  隐藏项/符号链接跳过、顶层文件夹命名、空目录 404、401/403/400/404 矩阵、审计与指标、
+  项数上限、中断审计、UI 标记。
+- `tests/test_upload_cleanup.py` 覆盖上传临时文件清理：成功/落盘硬失败删除会话、缺片保留会话、
+  `.part.tmp` 失败清理、启动清理历史遗留会话。
 
 ---
 
@@ -248,7 +265,7 @@ ARTIFACT_DEPOT_CONFIG=$(mktemp) PYTHONPATH=src python3 -m pytest tests/test_acce
 - **`.env` 里的空值视为「未设置」**，不会覆盖 `config.json`。例：`config.json` 有 `access_token=abc`，`.env` 写 `access_token=`（空），最终仍是 `abc`
 - **`.env` 支持点号嵌套**：`signed_links.count_max=99` 直接写进嵌套字段
 - **未知配置项只告警不报错**：启动时提示 `未知配置项：xxx（已忽略）`
-- **只有 6 个字段有环境变量入口**：`depot_dir` / `meta_dir` / `datahub_url` / `access_token` / `port` / `max_upload_mb`；其余（如 `ui_enabled`、`signed_links`、`audit_max_mb`）只能靠 `config.json` 或 `.env`
+- **环境变量入口**：`depot_dir` / `meta_dir` / `datahub_url` / `access_token` / `port` / `max_upload_mb`，以及 `upload.*` 的 9 个上传参数（见下表）；其余（如 `ui_enabled`、`signed_links`、`audit_max_mb`）只能靠 `config.json` 或 `.env`（`.env` 支持 `upload.chunk_size_mb=8` 点号写法）
 - **相对路径按「项目根」解析，不是按配置文件所在目录**。`"depot_dir": "./data"` 会解析成 `<仓库根>/data`；**容器部署必须写绝对路径**（如 `/data/depot`）
 
 容器部署时，`deploy_container.sh` 注入第 4 层环境变量：
@@ -276,7 +293,7 @@ ARTIFACT_DEPOT_ACCESS_TOKEN=...                 # 仅在使用 --token 时注入
 配置文件：`src/artifactdepot/config/config.json`（非敏感项，会进镜像）；**隐私项放 `src/artifactdepot/config/.env`**（字段名=值，如 `access_token=...`，不进 git/镜像）。可用 `ARTIFACT_DEPOT_CONFIG` 指定外部 config.json、`ARTIFACT_DEPOT_ENV` 指定外部 .env。
 
 > **优先级**：内置默认 < `config.json` < `.env` < 真实环境变量。
-> **手动重载**：网页「Token 管理」页有 **「重新加载配置」** 按钮（仅管理员），或调 `POST /api/config/reload`；`access_token`/`max_upload_mb`/`signed_links`/`require_read_token`/`ui_enabled`/`metrics_enabled`/`trusted_proxies`/`audit_*`/`datahub_url` 即时生效，`host`/`port`/`depot_dir`/`meta_dir`/`cors_origins`/`allowed_hosts` 需重启。
+> **手动重载**：网页「Token 管理」页有 **「重新加载配置」** 按钮（仅管理员），或调 `POST /api/config/reload`；`access_token`/`max_upload_mb`/`upload.*`/`signed_links`/`require_read_token`/`ui_enabled`/`metrics_enabled`/`trusted_proxies`/`audit_*`/`datahub_url` 即时生效，`host`/`port`/`depot_dir`/`meta_dir`/`cors_origins`/`allowed_hosts` 需重启。
 
 ### config.json 字段详解
 
@@ -300,6 +317,17 @@ ARTIFACT_DEPOT_ACCESS_TOKEN=...                 # 仅在使用 --token 时注入
     "count_max": 10,
     "expire_min_seconds": 60,
     "expire_max_seconds": 604800
+  },
+  "upload": {
+    "chunk_size_mb": 8,
+    "chunk_concurrency": 4,
+    "file_concurrency": 3,
+    "request_timeout_seconds": 86400,
+    "max_chunk_mb": 64,
+    "max_chunks": 100000,
+    "max_session_gb": 200,
+    "session_ttl_seconds": 86400,
+    "session_idle_ttl_seconds": 86400
   }
 }
 ```
@@ -325,6 +353,15 @@ ARTIFACT_DEPOT_ACCESS_TOKEN=...                 # 仅在使用 --token 时注入
 | `signed_links.count_max` | `10` | 签名链接**次数**上限 |
 | `signed_links.expire_min_seconds` | `60` | 签名链接**时效**下限（秒） |
 | `signed_links.expire_max_seconds` | `604800` | 签名链接**时效**上限（秒，604800 = 7 天） |
+| `upload.chunk_size_mb` | `8` | 分片大小（1–64MB）；浏览器/CLI 以 `initiate` 返回值为准 |
+| `upload.chunk_concurrency` | `4` | 浏览器每个文件同时上传的分片数（1–16） |
+| `upload.file_concurrency` | `3` | 浏览器同时上传的文件数（1–10，网页下拉框默认值） |
+| `upload.request_timeout_seconds` | `86400` | 分片/合并请求超时（默认 24h） |
+| `upload.max_chunk_mb` | `64` | 单片硬上限（1–64MB） |
+| `upload.max_chunks` | `100000` | 单文件最大分片数（上限 100000） |
+| `upload.max_session_gb` | `200` | 会话总量上限（`max_upload_mb=0` 时生效，上限 200GB） |
+| `upload.session_ttl_seconds` | `86400` | 分片会话绝对有效期（默认 24h） |
+| `upload.session_idle_ttl_seconds` | `86400` | 无分片写入的空闲清理阈值（默认 24h，且不小于请求超时） |
 
 > **次数与时效互斥**：签名链接类型为「按时效 / 按次数 / 永久」三选一。选按时效时次数不生效，选按次数时效不生效。越界返回 400；前端按配置显示 min/max 提示并拦截。
 
@@ -340,6 +377,15 @@ ARTIFACT_DEPOT_ACCESS_TOKEN=...                 # 仅在使用 --token 时注入
 | `ARTIFACT_DEPOT_ACCESS_TOKEN` | `access_token` |
 | `ARTIFACT_DEPOT_PORT` | `port` |
 | `ARTIFACT_DEPOT_MAX_UPLOAD_MB` | `max_upload_mb` |
+| `ARTIFACT_DEPOT_UPLOAD_CHUNK_SIZE_MB` | `upload.chunk_size_mb` |
+| `ARTIFACT_DEPOT_UPLOAD_CHUNK_CONCURRENCY` | `upload.chunk_concurrency` |
+| `ARTIFACT_DEPOT_UPLOAD_FILE_CONCURRENCY` | `upload.file_concurrency` |
+| `ARTIFACT_DEPOT_UPLOAD_REQUEST_TIMEOUT_SECONDS` | `upload.request_timeout_seconds` |
+| `ARTIFACT_DEPOT_UPLOAD_MAX_CHUNK_MB` | `upload.max_chunk_mb` |
+| `ARTIFACT_DEPOT_UPLOAD_MAX_CHUNKS` | `upload.max_chunks` |
+| `ARTIFACT_DEPOT_UPLOAD_MAX_SESSION_GB` | `upload.max_session_gb` |
+| `ARTIFACT_DEPOT_UPLOAD_SESSION_TTL_SECONDS` | `upload.session_ttl_seconds` |
+| `ARTIFACT_DEPOT_UPLOAD_SESSION_IDLE_TTL_SECONDS` | `upload.session_idle_ttl_seconds` |
 
 > 优先级：**环境变量 > 配置文件 > 内置默认**。容器部署用 `-e` 传环境变量即可，无需改代码/文件。
 
@@ -375,6 +421,17 @@ cp src/artifactdepot/config/config.production.json ~/SERVER/artifactdepot/config
     "count_max": 10,
     "expire_min_seconds": 60,
     "expire_max_seconds": 604800
+  },
+  "upload": {
+    "chunk_size_mb": 8,
+    "chunk_concurrency": 4,
+    "file_concurrency": 3,
+    "request_timeout_seconds": 86400,
+    "max_chunk_mb": 64,
+    "max_chunks": 100000,
+    "max_session_gb": 200,
+    "session_ttl_seconds": 86400,
+    "session_idle_ttl_seconds": 86400
   }
 }
 ```
@@ -404,19 +461,20 @@ ArtifactDepot/
 - src/artifactdepot/
   - main.py                      # FastAPI 入口 + lifespan（建目录 + 启动同步）
   - config/                      # 配置包：__init__.py（加载/手动重载）+ config.json + config.production.json + .env(.example)
-  - storage.py                   # 核心引擎：路径安全 / bucket-key / manifest / 签名链接注册表 / token 注册表 / 审计 / DataHub 同步 / mkdir / meta_dir
+  - storage.py                   # 核心引擎：路径安全 / bucket-key / manifest / 签名链接注册表 / token 注册表 / 审计 / DataHub 同步 / mkdir / 一键下载扫描 / meta_dir
+  - zipstream.py                 # 流式 ZIP：后台线程 + 有界队列 + 背压（目录一键下载，不落临时文件）
   - auth.py                      # 认证：管理员 token（UTF-8 比较）、用户 token、惰性同步
   - permissions.py               # 权限点目录与角色预设
   - logging_utils.py / netutil.py / observability.py  # 日志脱敏 / 网络工具 / 指标与健康检查
   - api/
-    - objects.py                 # 对象 API（上传/列表/下载/删除/mkdir/签名/作废）
+    - objects.py                 # 对象 API（上传/列表/下载/一键下载目录/删除/mkdir/签名/作废）
     - system.py                  # /health /api/buckets /api/tokens /api/audit /api/auth/check
     - docs.py                    # /api/docs 文档清单与内容（公开只读，含许可证）
   - web/ui.py                    # 网页 UI（读 resources/index.html）
   - resources/
     - index.html                 # 单页界面（拖拽/新建目录/签名/Token/审计）
     - static/                    # 外置 app.js / app.css + 自托管 Swagger UI / ReDoc 资源
-- tests/                         # pytest 回归测试（83 例，含 conftest 隔离真实 .env）
+- tests/                         # pytest 回归测试（含 conftest 隔离真实 .env）
 ```
 
 > 文档相关：`docs/api_rules.md` 是对外接口文档；`docs/architecture.md` 是架构说明。
@@ -450,9 +508,10 @@ ArtifactDepot/
 | 模块 | 职责 |
 |---|---|
 | `config/__init__.py` | 合并 默认 < config.json < .env < 环境变量；相对路径按项目根解析；支持 `meta_dir` / 手动 `reload_config()` |
-| `storage.py` | **核心引擎**：bucket/key 落盘、路径穿越防护、SHA-256、`.warehouse.json` 清单、签名链接注册表（创建/校验/次数递减/作废）、token 注册表、审计日志（双 IP + UTC）、DataHub 同步、mkdir、空目录删除策略、`_dir_recursive_info()` 目录递归统计（大小/最新 mtime）、`_meta_path` 状态文件定位（meta_dir） |
+| `storage.py` | **核心引擎**：bucket/key 落盘、路径穿越防护、SHA-256、`.warehouse.json` 清单、签名链接注册表（创建/校验/次数递减/作废）、token 注册表、审计日志（双 IP + UTC）、DataHub 同步、mkdir、空目录删除策略、**批量删除目录内容（`bulk_delete`）**、**一键下载只读扫描（`bulk_download_scan`）**、`_dir_recursive_info()` 目录递归统计（大小/最新 mtime）、`_meta_path` 状态文件定位（meta_dir） |
+| `zipstream.py` | **流式 ZIP 生成**（目录一键下载）：后台线程写非 seekable 队列 writer + 有界队列消费（背压），`ZIP_STORED`/Zip64、256 KiB 分块读取、不落临时文件；客户端中断可取消，审计恰好一次 |
 | `auth.py` | `check_admin_token`（UTF-8 字节常量时间比较，非 ASCII 安全）、`resolve_actor`、`resolve_actor_with_sync`（惰性同步）、`require_write_token` / `require_admin` |
-| `api/objects.py` | 对象 API：上传（multipart）、列表、下载（token 鉴权 + Range）、删除（`object:delete` + 空目录）、mkdir、签名链接（presign / config / list / revoke） |
+| `api/objects.py` | 对象 API：上传（multipart）、列表、下载（token 鉴权 + Range）、删除（`object:delete` + 空目录）、**批量删除目录内容（`object:delete_bulk`）**、**一键下载目录（`download-bulk`，复用 `object:download`）**、mkdir、签名链接（presign / config / list / revoke） |
 | `api/system.py` | 健康检查、bucket 列表、Token 注册表 CRUD、`/api/tokens/sync`（含 ok/error）、`/api/auth/check`、审计查询 |
 | `web/ui.py` | 网页：bucket 点击选中高亮、整页拖拽、新建目录、签名弹窗、Token 管理、审计双 IP 列 |
 | `main.py` | 应用组装 + lifespan（确保根目录存在、启动即拉取用户 token） |
@@ -493,17 +552,17 @@ ArtifactDepot/
 
 #### 分片上传（多线程）— `POST /api/objects/initiate|chunk|complete|abort`
 
-用于**单个大文件多线程并行上传**：文件拆成 8MB 分片，多路并发传至服务端，最后合并落盘。
+用于**单个大文件多线程并行上传**：文件按 `upload.chunk_size_mb`（默认 8MB）拆分，多路并发传至服务端，最后合并落盘；分片/合并超时默认 24h（`upload.request_timeout_seconds`）。
 
 | 接口 | 方法 | 说明 |
 |---|---|---|
-| `initiate` | `POST /api/objects/initiate` | 创建分片会话，返回 `data:{upload_id, chunk_size}` |
+| `initiate` | `POST /api/objects/initiate` | 创建分片会话，返回 `data:{upload_id, chunk_size, chunk_concurrency, file_concurrency, request_timeout_seconds, ...}`；默认 8MB/4 并发/24h 超时，来自 `config.json` 的 `upload.*` |
 | `chunk` | `POST /api/objects/chunk` | multipart：`upload_id`、`index`、`chunk`（分片文件） |
 | `complete` | `POST /api/objects/complete` | multipart/form-data：`upload_id`、`bucket`、`key`、`total_chunks`、`source_url`、`overwrite`、`public_ip`；合并并落盘 |
 | `abort` | `POST /api/objects/abort` | `upload_id`；放弃并清理临时分片 |
 
 > 说明：`complete` 会校验所有分片齐全、合并后复用 `put_object` 写 `.warehouse.json` 与审计；
-> 前端对 `>8MB` 文件自动走分片流程（并发 4 路），`<=8MB` 走普通 `POST /api/objects`。
+> 前端对大于 `upload.chunk_size_mb`（默认 8MB）的文件自动走分片流程，分片并发/超时也读取服务端配置（默认 4 路、24h）；`<=` 该阈值走普通 `POST /api/objects`。
 
 #### 新建目录 — `POST /api/objects/mkdir`
 
@@ -533,6 +592,16 @@ ArtifactDepot/
 | 错误 | `401` 无有效凭证；`404` 对象不存在 |
 | 说明 | 每次下载写审计 |
 
+#### 一键下载目录 — `GET /api/objects/download-bulk`（DownloadBulk）
+
+| 项 | 说明 |
+|---|---|
+| 鉴权 | 复用 `object:download`（**不新增权限点**；管理员共享 token 放行全部；按 token 的 bucket/前缀范围校验，范围外 `403`）；仅支持 token（不接签名链接） |
+| 请求 | Query：`bucket`(必)、`prefix`(空 / `"/"` = 当前 bucket 根)、`token`（或 `Authorization: Bearer`） |
+| 成功 | 目录内**只有 1 个可见文件且无可见子目录** → 直下原文件（原文件名、**Range 206**、ETag/304）；否则 → **流式 ZIP**（`application/zip`，无 Content-Length，顶层文件夹为目录名，bucket 根用 bucket 名；含空目录条目；跳过隐藏项/符号链接） |
+| 错误 | `400` prefix 非法 / 解析后越出 bucket / `files + dirs` 超过 100000 项；`401` 无有效 token；`403` 缺权限点或超出资源范围；`404` bucket/prefix 不存在、`prefix` 是文件、**目录为空**（不返回 0 字节 ZIP） |
+| 说明 | 只读、不落临时文件；ZIP 用 `ZIP_STORED` + Zip64、256 KiB 分块流式输出（不整包进内存）；ZIP 结束（含客户端中断）写 `download_bulk` 审计（含 `mode/files/dirs/aborted`），单文件直下写 `download` + `extra.bulk=true`；`/metrics` 下载计数 +1；`Content-Disposition` 用 ASCII 回退 + `filename*=UTF-8''` |
+
 #### 删除对象/目录 — `DELETE /api/objects`（DeleteObject）
 
 | 项 | 说明 |
@@ -542,6 +611,16 @@ ArtifactDepot/
 | 成功 | `data:{...}` |
 | 错误 | `400` 目录非空（需先清空内容才能删）；`404` 不存在 |
 | 说明 | 安全策略：**目录仅允许删除空目录**（隐藏 `.keep` 不算内容，自动一并移除），防误删 |
+
+#### 批量删除目录内容 — `POST /api/objects/bulk-delete`（BulkDelete）
+
+| 项 | 说明 |
+|---|---|
+| 鉴权 | 权限点 `object:delete_bulk`（管理员共享 token 放行全部；按 token 的 bucket/前缀范围校验，范围外 `403`） |
+| 请求 | JSON：`{"bucket", "prefix", "mode": "files|all", "dry_run": true|false, "confirm": "目录名"}`；`prefix` 空 / `"/"` = bucket 根；`dry_run` 默认 `false`（省略即执行） |
+| 成功 | `data:{bucket, prefix, mode, dry_run, files, dirs, bytes, errors, elapsed_ms}`；预览返回「将删除」统计，执行返回「实际删除」统计 |
+| 错误 | `400` `mode` 非法 / `confirm` 缺失或不匹配 / `prefix` 非法 / `files + dirs` 超过 50000 项；`401` 无有效 token；`403` 缺权限点或超出资源范围；`404` bucket 不存在 / `prefix` 不存在或不是目录 |
+| 说明 | **只清理目录内容、目录本身保留**；`files` 只删当前目录的直接文件（子目录及其内容、`.keep`、隐藏项保留），`all` 递归删除文件与子目录（隐藏项也删，但 bucket 根 `.warehouse.json` 永不删除）；不跟随符号链接；执行必须输入目录名（bucket 根目录输入 bucket 名）并由服务端二次校验；`dry_run=true` 不落盘、不写审计；执行写 `delete_bulk` 审计并计入 `/metrics` 的删除计数 |
 
 #### 生成签名链接 — `POST /api/objects/presign`
 
@@ -595,7 +674,7 @@ Query：`bucket`/`key`/`actor`/`since`(YYYY-MM-DD 起)/`limit`(默认 500)。返
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/` | 网页控制台（bucket 选择、整页拖拽上传、新建目录、签名链接/Token/审计管理；标签栏右侧含 Swagger/ReDoc 入口） |
+| GET | `/` | 网页控制台（bucket 选择、整页拖拽上传、新建目录、一键下载目录、批量删除、签名链接/Token/审计管理；标签栏右侧含 Swagger/ReDoc 入口） |
 
 ### 调用示例
 
@@ -620,23 +699,36 @@ curl -G "$BASE/api/objects/list" --data-urlencode "bucket=音视门carryVdeio"
 # 下载（需 token）
 curl -o out.mp4 "$BASE/api/objects/download?bucket=音视门carryVdeio&key=任务1/video.mp4&token=$USER"
 
+# 一键下载目录（需 object:download；单文件直下，多文件/含子目录自动打包 ZIP）
+curl -fL -o 交付物.zip "$BASE/api/objects/download-bulk?bucket=音视门carryVdeio&prefix=任务1/交付物&token=$USER"
+
 # 签名链接 —— 按时效
 curl -X POST -H "Content-Type: application/json" -H "Authorization: Bearer $USER" \
-  -d '{"bucket":"音视门carryVdeio","key":"artifactdepot_0.8.0.tar","mode":"time","expires":3600}' \
+  -d '{"bucket":"音视门carryVdeio","key":"artifactdepot_0.10.0.tar","mode":"time","expires":3600}' \
   "$BASE/api/objects/presign"
 
 # 签名链接 —— 按次数（3 次）
 curl -X POST -H "Content-Type: application/json" -H "Authorization: Bearer $USER" \
-  -d '{"bucket":"音视门carryVdeio","key":"artifactdepot_0.8.0.tar","mode":"count","count":3}' \
+  -d '{"bucket":"音视门carryVdeio","key":"artifactdepot_0.10.0.tar","mode":"count","count":3}' \
   "$BASE/api/objects/presign"
 
 # 签名链接 —— 永久
 curl -X POST -H "Content-Type: application/json" -H "Authorization: Bearer $USER" \
-  -d '{"bucket":"音视门carryVdeio","key":"artifactdepot_0.8.0.tar","mode":"permanent"}' \
+  -d '{"bucket":"音视门carryVdeio","key":"artifactdepot_0.10.0.tar","mode":"permanent"}' \
   "$BASE/api/objects/presign"
 
 # 删除（需 object:delete；目录仅空可删）
 curl -X DELETE "$BASE/api/objects?bucket=音视门carryVdeio&key=任务1/video.mp4&token=$ADMIN"
+
+# 批量删除（需 object:delete_bulk）——先预览
+curl -X POST -H "Content-Type: application/json" -H "Authorization: Bearer $ADMIN" \
+  -d '{"bucket":"音视门carryVdeio","prefix":"任务1","mode":"files","dry_run":true}' \
+  "$BASE/api/objects/bulk-delete"
+
+# 批量删除——执行（必须 confirm=目录名；根目录为 bucket 名）
+curl -X POST -H "Content-Type: application/json" -H "Authorization: Bearer $ADMIN" \
+  -d '{"bucket":"音视门carryVdeio","prefix":"任务1","mode":"all","confirm":"任务1"}' \
+  "$BASE/api/objects/bulk-delete"
 
 # 审计（管理员）
 curl -G "$BASE/api/audit" --data-urlencode "bucket=音视门carryVdeio" --data-urlencode "token=$ADMIN"
@@ -654,7 +746,7 @@ curl -X POST -H "Authorization: Bearer $ADMIN" "$BASE/api/tokens/sync"
 - **配置驱动**：所有环境差异（token、DataHub 地址、端口、路径、状态文件位置、签名链接上下限）走 `config.json` / 环境变量，代码不写死结构；**环境变量优先级高于配置文件**，镜像内不预设会被挂载配置盖掉的默认值
 - **单一事实源**：文件系统为存储事实源；`tokens.json` / `signed_links.json` 是可管理副本；`audit.log` 只增不改；`meta_dir` 让「可再生状态」与「业务数据」分层
 - **分层**：`api/`（HTTP 契约）、`storage.py`（存储引擎）、`config/`（配置包）；`auth.py` 只做认证、不碰业务
-- **安全默认**：写操作必带令牌（管理员/用户）；下载需 token（签名链接除外）；删除需 `object:delete` + 目录仅空可删；路径穿越防护；令牌比较 UTF-8 常量时间；签名链接限时/限次/可作废
+- **安全默认**：写操作必带令牌（管理员/用户）；下载需 token（签名链接除外）；删除需 `object:delete` + 目录仅空可删；批量删除需 `object:delete_bulk` + 输入名称确认（保留目录本身、保护 `.warehouse.json`）；一键下载复用 `object:download` 且跳过隐藏项/符号链接、`prefix` 解析不得越出 bucket；路径穿越防护；令牌比较 UTF-8 常量时间；签名链接限时/限次/可作废
 - **命名**：S3 语义命名（bucket/key/object/mkdir），对外 API 与 S3 一一对应，便于未来迁移 MinIO/OSS
 - **可部署性**：脚本约定统一（`build_image.sh` 自动导出、`deploy_container.sh` host 网络默认 + `--config`/`VOLUME_MAPS`），生产问题可用 `check_ad_sync.sh` 定位
 
@@ -669,7 +761,8 @@ curl -X POST -H "Authorization: Bearer $ADMIN" "$BASE/api/tokens/sync"
 | 上传/下载提示「无效的访问令牌」 | token 未登记（先 `POST /api/tokens` 或从 DataHub 同步）或 `access_token` 未设；`/api/auth/check` 可先自测 |
 | 下载提示「无效的访问令牌」 | 0.4.0 起下载需有效 token；直链需带 `&token=`；分享请走签名链接 |
 | 删除提示「权限不足：需要 object:delete」 | 0.7.0 起删除是权限点 `object:delete`：管理员共享 `access_token` 始终可删；普通用户 token 需由管理员在「Token 管理」页勾选该权限点。缺权限返回 403，无效 token 返回 401。 |
-| 删除目录提示「目录非空」 | 0.4.0 起目录仅空可删（防误删）；先进去删文件/子目录，清空后再删目录 |
+| 删除目录提示「目录非空」 | 0.4.0 起目录仅空可删（防误删）；先进去删文件/子目录，清空后再删目录；或用「删除本目录全部内容」批量清空（保留目录本身） |
+| 批量删除提示「权限不足：需要 object:delete_bulk」 | 批量删除是独立权限点 `object:delete_bulk`：管理员共享 token 与 `operator` 角色预设包含；普通用户 token 需在「Token 管理」页勾选该权限点，且 bucket/前缀在授权范围内，否则 403（缺权限点或越界） |
 | 签名链接提示「次数已用完」/「链接已作废」 | 次数耗尽或已被作废；重新生成或换时效/永久 |
 | 复制链接没反应 | `navigator.clipboard` 在 HTTP 下不可用时自动降级 `execCommand`；仍不行就手动选中链接复制 |
 | 点生成/作废/删除没弹窗 | 浏览器拦截原生 `confirm/prompt`；已全部改用**页面内自定义弹窗**，不依赖浏览器原生 |

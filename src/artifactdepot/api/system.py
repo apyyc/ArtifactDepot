@@ -17,7 +17,8 @@ from artifactdepot.auth import (
     read_requires_token, require_admin, require_scope, resolve_principal,
     resource_allowed,
 )
-from artifactdepot.config import get_config, reload_config
+from artifactdepot.config import (get_config, public_download_settings,
+                                  public_upload_settings, reload_config)
 from artifactdepot.observability import render_metrics
 from artifactdepot.permissions import (
     DEFAULT_ROLE, PERMISSION_CATALOG, PUBLIC_CATALOG, ROLE_PRESETS,
@@ -54,6 +55,10 @@ async def permissions_catalog():
                   for k, v in ROLE_PRESETS.items()],
         "default_role": DEFAULT_ROLE,
         "require_read_token": read_requires_token(),
+        # 上传参数（分片大小/并发/请求超时/上限），供网页与 CLI 动态读取
+        "upload": public_upload_settings(),
+        # 下载参数（分段大小/并发/请求超时），供网页与桌面客户端动态读取
+        "download": public_download_settings(),
     }}
 
 

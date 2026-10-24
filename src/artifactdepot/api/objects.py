@@ -10,20 +10,21 @@
 """
 import mimetypes
 import tempfile
+import time
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, Response, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
-from artifactdepot import storage
+from artifactdepot import storage, zipstream
 from artifactdepot.auth import (
     Principal, ensure_scope, extract_form_token, extract_token, optional_read_principal,
     require_scope, resolve_principal, resource_allowed,
 )
 from artifactdepot import netutil
 from artifactdepot.observability import DELETES, DOWNLOADS, UPLOADS
-from artifactdepot.config import get_config
+from artifactdepot.config import get_config, public_upload_settings
 
 router = APIRouter(prefix="/api/objects", tags=["Objects"])
 
@@ -35,6 +36,12 @@ def _client_ip(request: Request) -> str:
 def _public_ip(request: Request) -> str:
     # 只采信可信代理的 X-Forwarded-For，忽略客户端自报的 public_ip 参数
     return netutil.resolved_public_ip(request)
+
+
+def _safe_header_filename(name: str) -> str:
+    """FileResponse 的 filename 会进入 Content-Disposition；去掉 CR/LF/控制字符防 header 注入。"""
+    clean = "".join(ch if (ord(ch) >= 32 and ord(ch) != 127) else "_" for ch in (name or ""))
+    return clean or "download"
 
 
 def _etag_matches(if_none_match: str, etag: str) -> bool:
@@ -52,6 +59,38 @@ def _etag_matches(if_none_match: str, etag: str) -> bool:
         if part.strip().strip('"') == target:
             return True
     return False
+
+
+def _range_span(range_header: str, total: int):
+    """解析单区间 Range（bytes=a-b / bytes=a- / bytes=-n），返回 (start, end) 闭区间。
+
+    分块并发下载按单区间请求；多区间（逗号列表）或非法/不可满足的区间返回 None，
+    由 Starlette FileResponse 自行返回 400/416。审计只记录可解析区间的实际字节数。
+    """
+    if not range_header or total <= 0:
+        return None
+    value = range_header.strip()
+    if not value.lower().startswith("bytes="):
+        return None
+    spec = value[len("bytes="):].strip()
+    if not spec or "," in spec:
+        return None
+    first, sep, last = spec.partition("-")
+    if not sep:
+        return None
+    try:
+        if first == "":
+            suffix = int(last)
+            if suffix <= 0:
+                return None
+            return max(0, total - suffix), total - 1
+        start = int(first)
+        end = int(last) if last else total - 1
+        if start < 0 or end < start or start >= total:
+            return None
+        return start, min(end, total - 1)
+    except ValueError:
+        return None
 
 
 # 读接口鉴权统一走 auth.optional_read_principal（fail-closed）：
@@ -81,23 +120,22 @@ async def upload(
 
     max_mb = get_config().get("max_upload_mb", 0) or 0
     suffix = Path(file.filename or "").suffix
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        size = 0
-        while chunk := await file.read(1024 * 1024):
-            size += len(chunk)
-            if max_mb and size > max_mb * 1024 * 1024:
-                tmp.close()
-                Path(tmp.name).unlink(missing_ok=True)
-                raise HTTPException(413, detail=f"超过单文件上传上限 {max_mb}MB")
-            tmp.write(chunk)
-        tmp_path = Path(tmp.name)
-
+    tmp_path = None
     try:
-        result = storage.put_object(bucket, key, tmp_path, source_url, overwrite, uploader=principal.actor)
-    except HTTPException:
-        raise
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp_path = Path(tmp.name)
+            size = 0
+            while chunk := await file.read(1024 * 1024):
+                size += len(chunk)
+                if max_mb and size > max_mb * 1024 * 1024:
+                    raise HTTPException(413, detail=f"超过单文件上传上限 {max_mb}MB")
+                tmp.write(chunk)
+        result = storage.put_object(bucket, key, tmp_path, source_url, overwrite,
+                                    uploader=principal.actor)
     finally:
-        tmp_path.unlink(missing_ok=True)
+        # 读取/超限/落盘任一阶段失败都删除临时文件（Starlette spool 由框架自行关闭）
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
 
     storage.audit("upload", bucket, key, principal.actor, _client_ip(request),
                   size=result["size"], sha256=result["sha256"],
@@ -143,6 +181,7 @@ async def head(request: Request, response: Response, bucket: str, key: str,
     return {"code": 0, "message": "success", "data": data}
 
 
+@router.head("/download", include_in_schema=False)
 @router.get("/download")
 async def download(
     request: Request,
@@ -186,17 +225,89 @@ async def download(
     # ETag / 条件请求：命中 If-None-Match 直接 304，不再传输文件体
     etag = storage.object_etag(bucket, key)
     if _etag_matches(request.headers.get("if-none-match", ""), etag):
+        extra = {"not_modified": True}
+        if request.method.upper() == "HEAD":
+            extra["head"] = True
         storage.audit("download", bucket, key, actor=actor, ip=_client_ip(request),
-                      size=0, public_ip=_public_ip(request), extra={"not_modified": True})
+                      size=0, public_ip=_public_ip(request), extra=extra)
         return Response(status_code=304, headers={"ETag": etag})
 
-    storage.audit("download", bucket, key,
-                  actor=actor, ip=_client_ip(request),
-                  size=p.stat().st_size, public_ip=_public_ip(request))
-    DOWNLOADS.inc()
+    try:
+        total = p.stat().st_size
+    except OSError:
+        raise HTTPException(404, detail=f"对象不存在：{bucket}/{key}")
+    ip = _client_ip(request)
+    public_ip = _public_ip(request)
+    range_header = request.headers.get("range", "").strip()
+
+    if request.method.upper() == "HEAD":
+        # 分块下载的元信息探测：只返回头（Content-Length/Accept-Ranges/ETag），不算一次下载
+        storage.audit("download", bucket, key, actor=actor, ip=ip, size=0,
+                      public_ip=public_ip, extra={"head": True})
+    elif range_header:
+        # 分块并发下载：每个 Range 请求写一条审计，size 记实际区间字节数（不再记整文件大小）
+        span = _range_span(range_header, total)
+        sent = (span[1] - span[0] + 1) if span else 0
+        storage.audit("download", bucket, key, actor=actor, ip=ip, size=sent,
+                      public_ip=public_ip,
+                      extra={"partial": True, "range": range_header})
+        if span is not None:
+            DOWNLOADS.inc()
+    else:
+        storage.audit("download", bucket, key, actor=actor, ip=ip, size=total,
+                      public_ip=public_ip)
+        DOWNLOADS.inc()
+
     media = mimetypes.guess_type(p.name)[0] or "application/octet-stream"
-    return FileResponse(p, media_type=media, filename=p.name,
+    return FileResponse(p, media_type=media, filename=_safe_header_filename(p.name),
                         headers={"ETag": etag} if etag else {})
+
+
+@router.get("/download-bulk")
+async def download_bulk(request: Request, bucket: str, prefix: str = "",
+                        actor: Principal = Depends(require_scope("object:download"))):
+    """一键下载当前目录（DownloadBulk）。需要 object:download，沿用资源范围校验。
+
+    规则（契约 §1.2）：
+    - 目录里只有 1 个可见文件且没有可见子目录 → FileResponse 直下（原文件名、支持 Range）；
+    - 其他非空情况 → 流式 ZIP（ZIP_STORED/ZIP64、无 Content-Length、不落临时文件）；
+    - 空目录 / 不存在 / 不是目录 → 404；prefix 解析到 bucket 外 → 400。
+    """
+    ensure_scope(actor, "object:download", bucket=bucket, key=prefix)
+    scan = storage.bulk_download_scan(bucket, prefix)
+    ip = _client_ip(request)
+    public_ip = _public_ip(request)
+
+    single = scan["single_file"]
+    if single is not None:
+        key = scan["single_file_key"]
+        p = single["path"]
+        etag = storage.object_etag(bucket, key)
+        if _etag_matches(request.headers.get("if-none-match", ""), etag):
+            storage.audit("download", bucket, key, actor.actor, ip, size=0,
+                          public_ip=public_ip,
+                          extra={"bulk": True, "mode": "file", "not_modified": True})
+            return Response(status_code=304, headers={"ETag": etag} if etag else {})
+        storage.audit("download", bucket, key, actor.actor, ip,
+                      size=single["size"], public_ip=public_ip,
+                      extra={"bulk": True, "mode": "file"})
+        DOWNLOADS.inc()
+        media = mimetypes.guess_type(p.name)[0] or "application/octet-stream"
+        return FileResponse(p, media_type=media, filename=_safe_header_filename(p.name),
+                            headers={"ETag": etag} if etag else {})
+
+    # ZIP：审计在流结束（含客户端中断）时写，size 为实际发送字节数
+    def _audit_zip(sent: int, files: int, dirs: int, aborted: bool) -> None:
+        storage.audit("download_bulk", bucket, scan["prefix"], actor.actor, ip,
+                      size=sent, public_ip=public_ip,
+                      extra={"mode": "zip", "files": files,
+                             "dirs": dirs, "aborted": aborted})
+
+    DOWNLOADS.inc()
+    headers = {"Content-Disposition": zipstream.content_disposition(scan["root_name"])}
+    return StreamingResponse(
+        zipstream.zip_stream(scan["entries"], scan["root_name"], _audit_zip),
+        media_type="application/zip", headers=headers)
 
 
 @router.delete("")
@@ -208,6 +319,48 @@ async def delete(bucket: str, key: str,
     storage.audit("delete", bucket, key, actor.actor, _client_ip(request), public_ip=_public_ip(request))
     DELETES.inc()
     return {"code": 0, "message": "success", "data": result}
+
+
+class BulkDeleteRequest(BaseModel):
+    """批量删除目录内容（一键清空）请求体，字段见契约 §1.2。"""
+    bucket: str
+    prefix: str = ""
+    mode: str                       # files = 只删直接文件；all = 递归删文件+子目录
+    dry_run: bool = False
+    confirm: str = ""               # 执行时必填：prefix 最后一段（根目录为 bucket 名）
+
+
+@router.post("/bulk-delete")
+async def bulk_delete(body: BulkDeleteRequest, request: Request,
+                      actor: Principal = Depends(require_scope("object:delete_bulk"))):
+    """批量删除当前目录内容（一键清空）。需要 object:delete_bulk。
+
+    - `dry_run=true` 只预览统计，不落盘、不写审计；
+    - 执行（`dry_run=false`）必须在服务端二次校验 `confirm`（目录名 / 根目录为 bucket 名）；
+    - 只清理 prefix 目录的**内容**，prefix 目录本身保留；bucket 根 `.warehouse.json` 永不删除。
+    """
+    # 资源范围先校验（越界 403），再做参数/确认校验
+    ensure_scope(actor, "object:delete_bulk", bucket=body.bucket, key=body.prefix)
+    prefix = storage.validate_key(body.prefix)
+    if body.mode not in ("files", "all"):
+        raise HTTPException(400, detail=f"非法 mode：{body.mode!r}（仅支持 files / all）")
+    expected = prefix.split("/")[-1] if prefix else body.bucket
+    if not body.dry_run and body.confirm.strip() != expected:
+        raise HTTPException(400, detail=f"确认名称不匹配：请输入「{expected}」后再执行")
+
+    started = time.perf_counter()
+    result = storage.bulk_delete(body.bucket, prefix, body.mode, body.dry_run)
+    elapsed_ms = max(0, int(round((time.perf_counter() - started) * 1000)))
+
+    if not body.dry_run:
+        storage.audit("delete_bulk", result["bucket"], result["prefix"],
+                      actor.actor, _client_ip(request), size=result["bytes"],
+                      public_ip=_public_ip(request),
+                      extra={"mode": result["mode"], "files": result["files"],
+                             "dirs": result["dirs"]})
+        DELETES.inc()
+    data = {**result, "elapsed_ms": elapsed_ms}
+    return {"code": 0, "message": "success", "data": data}
 
 
 class MkdirRequest(BaseModel):
@@ -328,16 +481,17 @@ async def revoke_link(link_id: str, request: Request,
 # 多线程分片上传
 # ---------------------------------------------------------------------------
 
-CHUNK_SIZE = 8 * 1024 * 1024
+CHUNK_SIZE = 8 * 1024 * 1024  # 兼容旧调用；实际值以 config.upload.chunk_size_mb 为准
 
 
 @router.post("/initiate")
 async def initiate_upload(request: Request,
                           actor: Principal = Depends(require_scope("upload:initiate"))):
-    """创建分片上传会话，返回 upload_id 与 chunk_size"""
+    """创建分片上传会话，返回 upload_id 与上传配置（chunk_size/并发/超时）"""
     upload_id = storage.create_chunk_session(owner=actor.actor)
+    # 前端/CLI 以服务端返回为准：分片大小、并发、请求超时（默认 24h）都可从 config.json 调整
     return {"code": 0, "message": "success",
-            "data": {"upload_id": upload_id, "chunk_size": CHUNK_SIZE}}
+            "data": {"upload_id": upload_id, **public_upload_settings()}}
 
 
 @router.post("/chunk")
@@ -354,15 +508,18 @@ async def upload_chunk(
     ensure_scope(principal, "upload:chunk")
     storage.touch_token(tok)
     suffix = Path(chunk.filename or "").suffix or ".bin"
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        while part := await chunk.read(1024 * 1024):
-            tmp.write(part)
-        tmp_path = Path(tmp.name)
+    tmp_path = None
     try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp_path = Path(tmp.name)
+            while part := await chunk.read(1024 * 1024):
+                tmp.write(part)
         result = storage.store_chunk(upload_id, index, tmp_path,
                                       actor=principal.actor, is_admin=principal.is_admin)
     finally:
-        tmp_path.unlink(missing_ok=True)
+        # 读取失败 / 配额失败 / 落盘失败都删除本次请求的临时文件
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
     return {"code": 0, "message": "success", "data": result}
 
 

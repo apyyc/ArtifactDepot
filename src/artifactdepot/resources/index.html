@@ -49,13 +49,20 @@
         <label>并发数: <select id="upConcurrency"><option value="1">1</option><option value="2">2</option><option value="3" selected>3</option><option value="5">5</option></select></label>
         <button id="upBtn" data-action="do-upload">上传</button>
       </div>
-      <div class="muted" style="margin-top:4px;">上传到：<span id="upTarget">（当前 bucket + 位置）</span>；token 在协作平台成员列表"查看我的Token"获取。<br />支持多选，或把文件<strong>拖拽到页面任意位置</strong>，松手自动上传（上传前先校验 token）。单个文件 &gt;8MB 时自动启用多线程分片上传。</div>
+      <div class="muted" style="margin-top:4px;">上传到：<span id="upTarget">（当前 bucket + 位置）</span>；token 在协作平台成员列表"查看我的Token"获取。<br />支持多选，或把文件<strong>拖拽到页面任意位置</strong>，松手自动上传（上传前先校验 token）。单个文件大于配置的分片大小（默认 8MB）时自动启用多线程分片上传；分片并发/请求超时由服务端 config.json 的 upload.* 决定。<br />下载时，文件大于分片大小（默认 8MB）自动多线程分块下载：支持「另存为」的浏览器（Chrome/Edge）边下边写盘，其它浏览器在内存拼好后保存；进度弹窗可随时取消。分片大小/并发/超时由服务端 config.json 的 download.* 决定。</div>
       <div id="upQueue"></div>
     </div>
 
     <div class="card">
       <div class="breadcrumb">位置：<span id="crumb">（先选择 bucket）</span>
-        <button class="ghost" style="float:right;" data-action="open-mkdir">新建目录</button>
+        <span class="crumb-ops">
+          <button class="ghost" data-action="open-mkdir">新建目录</button>
+          <button id="downloadDirBtn" class="ghost" style="display:none;" data-action="download-dir" title="下载当前目录：仅 1 个文件时直接下载；多文件或含子目录时自动打包 ZIP（浏览器原生下载，无确认）">下载本目录</button>
+          <span id="bulkOps" style="display:none;">
+            <button class="danger" data-action="bulk-delete" data-mode="files" title="仅删除当前目录下的直接文件；子目录及其内容保留">清空本目录文件</button>
+            <button class="danger" data-action="bulk-delete" data-mode="all" title="递归删除当前目录下的全部文件与子目录；当前目录本身保留">删除本目录全部内容</button>
+          </span>
+        </span>
       </div>
       <table id="tbl">
         <thead><tr><th>名称</th><th>大小</th><th>时间</th><th>来源</th><th>上传者</th><th>操作</th></tr></thead>
@@ -207,6 +214,23 @@
     </div>
   </div>
 
+  <div id="bulkDeleteModal" class="modal-mask" style="display:none;">
+    <div class="modal modal-wide">
+      <h3 style="margin:0 0 8px;font-size:15px;">⚠️ <span id="bulkTitle">批量删除</span></h3>
+      <div class="muted" id="bulkTarget" style="margin-bottom:8px;"></div>
+      <div id="bulkPreview" class="bulk-preview">（正在统计将删除的内容…）</div>
+      <div class="bulk-warning" id="bulkWarning"></div>
+      <div class="row" style="margin-top:10px;">
+        <input id="bulkConfirmInput" placeholder="" autocomplete="off" spellcheck="false" style="flex:1;" />
+      </div>
+      <div class="bulk-hint" id="bulkNameHint"></div>
+      <div class="row" style="margin-top:12px;">
+        <button id="bulkDoBtn" class="danger-solid" data-action="do-bulk-delete" disabled>确认删除</button>
+        <button class="ghost" data-action="close-bulk-delete">取消</button>
+      </div>
+    </div>
+  </div>
+
   <div id="presignModal" class="modal-mask" style="display:none;">
     <div class="modal">
       <h3 style="margin:0 0 8px;font-size:15px;">生成签名链接</h3>
@@ -237,6 +261,22 @@
       <div class="row" style="margin-top:12px;">
         <button id="psGenBtn" data-action="do-presign">生成</button>
         <button class="ghost" data-action="close-presign">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 单文件下载：进度弹窗（并行 Range 分块时显示；小文件/不支持 Range 时走浏览器原生单流下载，不弹窗）。
+       文件行的下载按钮由 app.js 的 renderRows() 渲染为 data-action="download-file" data-key="<key>"：
+       token 不再拼进 href / DOM，改由 fetch 的 Authorization 头发送，避免出现在访问日志与页面源码里。 -->
+  <div id="dlModal" class="modal-mask" style="display:none;">
+    <div class="modal modal-wide">
+      <h3 style="margin:0 0 8px;font-size:15px;">正在下载</h3>
+      <div class="dl-name" id="dlName"></div>
+      <div class="dl-bar" id="dlBar"><span id="dlBarFill"></span></div>
+      <div class="dl-stat" id="dlStat">准备中…</div>
+      <div class="muted" style="margin-top:8px;">文件大于分片大小时自动多线程分块下载；取消会立即中止所有在途请求并丢弃未完成的部分。</div>
+      <div class="row" style="margin-top:12px;">
+        <button class="ghost" data-action="cancel-download">取消下载</button>
       </div>
     </div>
   </div>

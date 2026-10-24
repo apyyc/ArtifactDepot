@@ -33,7 +33,9 @@ DEFAULT = {
     "datahub_url": "http://127.0.0.1:8002/api/data",  # 从 DataHub users.json 拉取用户 token
     "host": "0.0.0.0",                        # 监听地址
     "port": 8004,                             # 服务端口
-    "access_token": "",                       # 管理员/工具共享令牌；为空=无管理员（生产必须显式配置）
+    "access_token": "admin",                  # 管理员/工具共享令牌；内置默认 admin（开箱即用）
+                                              # 生产/公网部署必须改成 >=16 位随机串（否则启动告警，
+                                              # 设 ARTIFACT_DEPOT_STRICT_CONFIG=1 会直接拒绝启动）
     "max_upload_mb": 0,                       # 单文件上传上限（0 = 不限）
     "ui_enabled": True,                       # 是否启用网页 UI
     "metrics_enabled": True,                  # 是否暴露 /metrics（Prometheus 文本格式）
@@ -48,6 +50,22 @@ DEFAULT = {
         "count_max": 10,
         "expire_min_seconds": 60,             # 最短时效（1 分钟）
         "expire_max_seconds": 604800,         # 最长时效（7 天）
+    },
+    "upload": {                               # 上传分片/并发/超时（改后即时生效，无需重启）
+        "chunk_size_mb": 8,                   # 每片大小（1-64MB；服务端返回给前端/CLI）
+        "chunk_concurrency": 4,               # 浏览器每个文件同时上传几片（1-16）
+        "file_concurrency": 3,                # 浏览器同时上传几个文件（1-10；网页下拉框默认值）
+        "request_timeout_seconds": 86400,     # 单次分片/合并请求超时（默认 24h）
+        "max_chunk_mb": 64,                   # 单片硬上限（1-64MB，受代码常量兜底）
+        "max_chunks": 100000,                 # 单文件最大分片数（上限 100000）
+        "max_session_gb": 200,                # 会话总量上限（max_upload_mb=0 时生效，上限 200GB）
+        "session_ttl_seconds": 86400,         # 分片会话绝对有效期（默认 24h）
+        "session_idle_ttl_seconds": 86400,    # 空闲清理阈值（默认 24h，且不小于请求超时）
+    },
+    "download": {                             # 下载分块/并发/超时（改后即时生效，无需重启）
+        "chunk_size_mb": 8,                   # 每片大小（1-64MB；客户端按此切 Range）
+        "chunk_concurrency": 4,               # 同时下载几片（1-16）
+        "request_timeout_seconds": 3600,      # 单次分片请求超时（默认 1h）
     },
 }
 
@@ -181,6 +199,20 @@ _ENV_MAP = {
     "ARTIFACT_DEPOT_ACCESS_TOKEN": "access_token",
     "ARTIFACT_DEPOT_PORT": "port",
     "ARTIFACT_DEPOT_MAX_UPLOAD_MB": "max_upload_mb",
+    # 上传分片/并发/超时（支持 .env 点号写法与真实环境变量）
+    "ARTIFACT_DEPOT_UPLOAD_CHUNK_SIZE_MB": "upload.chunk_size_mb",
+    "ARTIFACT_DEPOT_UPLOAD_CHUNK_CONCURRENCY": "upload.chunk_concurrency",
+    "ARTIFACT_DEPOT_UPLOAD_FILE_CONCURRENCY": "upload.file_concurrency",
+    "ARTIFACT_DEPOT_UPLOAD_REQUEST_TIMEOUT_SECONDS": "upload.request_timeout_seconds",
+    "ARTIFACT_DEPOT_UPLOAD_MAX_CHUNK_MB": "upload.max_chunk_mb",
+    "ARTIFACT_DEPOT_UPLOAD_MAX_CHUNKS": "upload.max_chunks",
+    "ARTIFACT_DEPOT_UPLOAD_MAX_SESSION_GB": "upload.max_session_gb",
+    "ARTIFACT_DEPOT_UPLOAD_SESSION_TTL_SECONDS": "upload.session_ttl_seconds",
+    "ARTIFACT_DEPOT_UPLOAD_SESSION_IDLE_TTL_SECONDS": "upload.session_idle_ttl_seconds",
+    # 下载分块/并发/超时（支持 .env 点号写法与真实环境变量）
+    "ARTIFACT_DEPOT_DOWNLOAD_CHUNK_SIZE_MB": "download.chunk_size_mb",
+    "ARTIFACT_DEPOT_DOWNLOAD_CHUNK_CONCURRENCY": "download.chunk_concurrency",
+    "ARTIFACT_DEPOT_DOWNLOAD_REQUEST_TIMEOUT_SECONDS": "download.request_timeout_seconds",
     # 兼容旧前缀
     "WAREHOUSE_DIR": "depot_dir",
     "WAREHOUSE_META_DIR": "meta_dir",
@@ -215,6 +247,9 @@ def _load_config_full(strict: bool = False):
         val = os.getenv(env, "").strip()
         if not val:
             continue
+        if "." in key:
+            _apply_env_field(cfg, key, val, warnings, f"环境变量 {env}")
+            continue
         try:
             cfg[key] = int(val) if key in ("port", "max_upload_mb") else val
         except ValueError:
@@ -246,6 +281,110 @@ def get_config() -> dict:
     if _CONFIG is None:
         _CONFIG = load_config()
     return _CONFIG
+
+
+# 上传配置的合法区间（越界自动夹紧，避免把服务端/浏览器调崩）
+_UPLOAD_INT_LIMITS = {
+    "chunk_size_mb": (1, 64),
+    "chunk_concurrency": (1, 16),
+    "file_concurrency": (1, 10),
+    "request_timeout_seconds": (60, 7 * 24 * 3600),
+    "max_chunk_mb": (1, 64),
+    "max_chunks": (1, 100000),
+    "max_session_gb": (1, 200),
+    "session_ttl_seconds": (60, 7 * 24 * 3600),
+    "session_idle_ttl_seconds": (60, 7 * 24 * 3600),
+}
+
+
+def _upload_int(raw: dict, key: str, default: int) -> int:
+    """读取 upload.* 整数值；非法值回退默认值，并按 _UPLOAD_INT_LIMITS 夹紧。"""
+    lo, hi = _UPLOAD_INT_LIMITS[key]
+    try:
+        val = int(raw.get(key, default))
+    except (TypeError, ValueError):
+        val = default
+    return max(lo, min(hi, val))
+
+
+def get_upload_settings() -> dict:
+    """返回归一化后的上传配置（config.json 的 upload.*，缺省用内置默认值）。
+
+    每次调用都读当前配置，因此 `POST /api/config/reload` 后立即生效，无需重启。
+    对外只暴露安全范围：分片 1–64MB、并发 1–16、超时 60s–7d、会话上限 ≤200GB。
+    """
+    raw = get_config().get("upload")
+    if not isinstance(raw, dict):
+        raw = {}
+    d = DEFAULT["upload"]
+    settings = {key: _upload_int(raw, key, int(d[key]))
+                for key in _UPLOAD_INT_LIMITS}
+    # 分片大小不能超过单片硬上限
+    settings["chunk_size_mb"] = min(settings["chunk_size_mb"],
+                                    settings["max_chunk_mb"])
+    # 空闲清理不能早于请求超时，否则可能把“仍在传但暂时没写分片”的会话删掉
+    settings["session_idle_ttl_seconds"] = max(
+        settings["session_idle_ttl_seconds"],
+        settings["request_timeout_seconds"],
+    )
+    return settings
+
+
+def public_upload_settings() -> dict:
+    """下发给浏览器/CLI 的上传配置（字节单位 + 秒），不含任何密钥。"""
+    s = get_upload_settings()
+    return {
+        "chunk_size": s["chunk_size_mb"] * 1024 * 1024,
+        "chunk_concurrency": s["chunk_concurrency"],
+        "file_concurrency": s["file_concurrency"],
+        "request_timeout_seconds": s["request_timeout_seconds"],
+        "max_chunk_size": s["max_chunk_mb"] * 1024 * 1024,
+        "max_chunks": s["max_chunks"],
+        "max_session_gb": s["max_session_gb"],
+        "max_upload_mb": int(get_config().get("max_upload_mb", 0) or 0),
+    }
+
+
+# 下载配置的合法区间（越界自动夹紧，避免把客户端/服务端调崩）
+_DOWNLOAD_INT_LIMITS = {
+    "chunk_size_mb": (1, 64),
+    "chunk_concurrency": (1, 16),
+    "request_timeout_seconds": (60, 7 * 24 * 3600),
+}
+
+
+def _download_int(raw: dict, key: str, default: int) -> int:
+    """读取 download.* 整数值；非法值回退默认值，并按 _DOWNLOAD_INT_LIMITS 夹紧。"""
+    lo, hi = _DOWNLOAD_INT_LIMITS[key]
+    try:
+        val = int(raw.get(key, default))
+    except (TypeError, ValueError):
+        val = default
+    return max(lo, min(hi, val))
+
+
+def get_download_settings() -> dict:
+    """返回归一化后的下载配置（config.json 的 download.*，缺省用内置默认值）。
+
+    每次调用都读当前配置，因此 `POST /api/config/reload` 后立即生效，无需重启。
+    对外只暴露安全范围：分片 1–64MB、并发 1–16、超时 60s–7d。
+    """
+    raw = get_config().get("download")
+    if not isinstance(raw, dict):
+        raw = {}
+    d = DEFAULT["download"]
+    return {key: _download_int(raw, key, int(d[key]))
+            for key in _DOWNLOAD_INT_LIMITS}
+
+
+def public_download_settings() -> dict:
+    """下发给浏览器/CLI 的下载配置（字节单位 + 秒），不含任何密钥。"""
+    s = get_download_settings()
+    return {
+        "chunk_size": s["chunk_size_mb"] * 1024 * 1024,
+        "chunk_concurrency": s["chunk_concurrency"],
+        "request_timeout_seconds": s["request_timeout_seconds"],
+    }
 
 
 def reload_config() -> dict:

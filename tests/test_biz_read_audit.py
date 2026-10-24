@@ -897,7 +897,7 @@ def test_public_permissions_catalog(ctx):
     data = body["data"]
     assert {"permissions", "public", "roles", "default_role",
             "require_read_token"} <= set(data)
-    assert len(data["permissions"]) == len(PERMISSION_CATALOG) == 21
+    assert len(data["permissions"]) == len(PERMISSION_CATALOG) == 22
     assert len(data["public"]) == len(PUBLIC_CATALOG) == 6
     assert data["default_role"] == "user"
     assert [r0["key"] for r0 in data["roles"]] == list(ROLE_PRESETS)
@@ -906,7 +906,7 @@ def test_public_permissions_catalog(ctx):
     spec = c.get("/openapi.json").json()
     ops = {(method.upper(), _norm_path(path))
            for path, item in spec["paths"].items() for method in item}
-    assert len(ops) == 33                                   # 33 条 OpenAPI 操作
+    assert len(ops) == 35                                   # 35 条 OpenAPI 操作
     for item in data["permissions"] + data["public"]:
         assert (item["method"].upper(), _norm_path(item["path"])) in ops, item
 

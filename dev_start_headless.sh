@@ -7,17 +7,22 @@
 # ArtifactDepot 开发环境一键启动脚本（无图形 / SSH 版）
 # 后台运行数据仓库服务，日志写到 logs/ 目录
 #
-#  服务           命令                                                  端口    日志文件
-#  ArtifactDepot  python3 -m uvicorn artifactdepot.main:app --port 8004  8004    logs/artifactdepot.log
+#  服务           命令                                                          端口    日志文件
+#  ArtifactDepot  <项目本地 venv>/python -m uvicorn artifactdepot.main:app      8004    logs/artifactdepot.log
 #
 # 用法：
 #   ./dev_start_headless.sh            # 后台启动
+#   ./dev_start_headless.sh check      # 检查本地 Python 环境（解释器/依赖/是否 venv）
 #   ./dev_start_headless.sh status     # 查看是否在跑
 #   ./dev_start_headless.sh tail       # 跟踪日志（Ctrl+C 退出）
 #   ./dev_start_headless.sh logs       # 查看日志文件列表
 #   ./dev_start_headless.sh stop       # 停止
 #
-# 依赖：bash、python3（含 uvicorn/fastapi/httpx/python-multipart）
+# 依赖：bash + 项目本地 venv（推荐用 uv 创建）：
+#   cd /home/apyyc/work/ArtifactDepot
+#   .tools/uv venv .venv --python /usr/bin/python3.13
+#   .tools/uv pip install --python .venv/bin/python -r ArtifactDepot/requirements.txt
+# 解释器解析顺序：$AD_PYTHON > ./ .venv（项目内）> ../.venv（工作区根）> python3
 # ============================================================
 
 set -uo pipefail
@@ -30,8 +35,62 @@ mkdir -p "$LOGDIR"
 SERVICE_DIR="${ROOT}"
 HOST_PORT="${AD_PORT:-8004}"           # 服务端口（可用 AD_PORT 环境变量覆盖）
 CONFIG_FILE="${ARTIFACT_DEPOT_CONFIG:-${ROOT}/src/artifactdepot/config/config.json}"
+
+# ---------- 本地 Python 环境解析（优先项目/工作区 venv，避免误用系统 Python） ----------
+_abs_python() {
+  local p="$1"
+  (cd "$(dirname "$p")" 2>/dev/null && printf '%s/%s' "$PWD" "$(basename "$p")")
+}
+
+resolve_python() {
+  if [ -n "${AD_PYTHON:-}" ]; then
+    PYTHON_BIN="$AD_PYTHON"
+    if [ -x "$PYTHON_BIN" ]; then
+      PYTHON_BIN="$(_abs_python "$PYTHON_BIN")"
+    fi
+    return
+  fi
+  for candidate in \
+    "${ROOT}/.venv/bin/python" \
+    "${ROOT}/../.venv/bin/python" \
+    "${ROOT}/../../.venv/bin/python"; do
+    if [ -x "$candidate" ]; then
+      PYTHON_BIN="$(_abs_python "$candidate")"
+      [ -n "$PYTHON_BIN" ] || PYTHON_BIN="$candidate"
+      return
+    fi
+  done
+  PYTHON_BIN="$(command -v python3 2>/dev/null || true)"
+}
+resolve_python
+
+check_env() {
+  echo "项目根目录: $ROOT"
+  echo "配置来源:   $CONFIG_FILE"
+  if [ -z "${PYTHON_BIN:-}" ] || [ ! -x "$PYTHON_BIN" ]; then
+    echo "ERROR: 未找到可执行的 Python 解释器（可用 AD_PYTHON=/path/to/python 指定）"
+    return 1
+  fi
+  echo "Python:     $PYTHON_BIN"
+  PYTHON_PREFIX="$("$PYTHON_BIN" -c 'import sys; print(sys.prefix)' 2>/dev/null || true)"
+  if [ -n "$PYTHON_PREFIX" ] && [ -f "$PYTHON_PREFIX/pyvenv.cfg" ]; then
+    echo "环境:       本地虚拟环境（venv）: $PYTHON_PREFIX"
+  else
+    echo "环境:       系统 Python（非 venv；建议用 uv 创建本地 .venv）"
+  fi
+  "$PYTHON_BIN" - <<'PY' || return 1
+import sys
+try:
+    import fastapi, uvicorn, httpx, multipart
+except Exception as exc:  # noqa: BLE001
+    print(f"ERROR: 缺少运行依赖: {exc}")
+    raise SystemExit(1)
+print(f"sys.executable: {sys.executable}")
+print(f"版本: Python {sys.version.split()[0]}, fastapi {fastapi.__version__}, uvicorn {uvicorn.__version__}")
+PY
+}
 # 直接以源码模式启动（不再依赖 scripts/start.sh；PYTHONPATH 指向 src）
-START_CMD="env PYTHONPATH=src ARTIFACT_DEPOT_CONFIG=${CONFIG_FILE} python3 -m uvicorn artifactdepot.main:app --host 0.0.0.0 --port ${HOST_PORT}"
+START_CMD="env PYTHONPATH=src ARTIFACT_DEPOT_CONFIG=${CONFIG_FILE} ${PYTHON_BIN} -m uvicorn artifactdepot.main:app --host 0.0.0.0 --port ${HOST_PORT}"
 
 # ---------- 当前主机 IP（打印服务地址用） ----------
 HOST_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
@@ -88,6 +147,7 @@ do_start() {
   echo "日志目录:   $LOGDIR"
   echo ""
   echo "后台启动数据仓库 ..."
+  check_env || { echo "ERROR: 本地环境检查未通过，启动中止"; exit 1; }
 
   # 先停旧进程 + 端口预检
   load_pid
@@ -135,6 +195,11 @@ case "$CMD" in
     do_stop
     ;;
 
+  check)
+    check_env
+    exit $?
+    ;;
+
   restart)
     echo "重启数据仓库 ..."
     do_stop
@@ -144,6 +209,7 @@ case "$CMD" in
 
   status)
     echo "服务状态："
+    echo "  Python: $PYTHON_BIN"
     load_pid
     pid="${SERVICED_PID:-}"
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
@@ -174,6 +240,6 @@ case "$CMD" in
     ;;
 
   *)
-    echo "用法: $0 [start|stop|restart|status|logs|tail]"
+    echo "用法: $0 [start|check|stop|restart|status|logs|tail]"
     ;;
 esac

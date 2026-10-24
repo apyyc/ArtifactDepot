@@ -38,7 +38,7 @@ import httpx
 
 from fastapi import HTTPException
 
-from artifactdepot.config import get_config
+from artifactdepot.config import get_config, get_upload_settings
 
 # 隐藏清单文件名（上传/列表均跳过）
 MANIFEST = ".warehouse.json"
@@ -179,6 +179,10 @@ def validate_key(key: str) -> str:
         return ""
     if "\\" in k:
         raise HTTPException(400, detail=f"非法 key：{key!r}")
+    # 与 bucket 一致：控制字符（含 CR/LF/TAB）不能进入 key；否则会污染日志/审计，
+    # 并在下载响应 Content-Disposition 中触发 header 注入或 500。
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in k):
+        raise HTTPException(400, detail=f"非法 key（不允许控制字符）：{key!r}")
     segs = k.split("/")
     if any(s in ("", "..", ".") for s in segs):
         raise HTTPException(400, detail=f"非法 key：{key!r}")
@@ -295,10 +299,17 @@ def put_object(bucket: str, key: str, src_path: Path, source_url: str = "",
     validate_bucket(bucket)
     k = validate_key(key)
     dst = object_path(bucket, k)
+    if dst.is_dir():
+        # 目录不能当对象覆盖；明确 409，避免 shutil.copyfile 抛 IsADirectoryError -> 500
+        raise HTTPException(409, detail=f"目标路径是目录，不能写入对象：{bucket}/{key}")
     if dst.exists() and not overwrite:
         raise HTTPException(409, detail=f"对象已存在：{bucket}/{key}")
 
-    dst.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+    except (FileExistsError, NotADirectoryError, OSError) as e:
+        # 父路径是文件/不可创建目录：返回可理解的冲突，而不是未捕获 500
+        raise HTTPException(409, detail=f"父路径不是目录，不能写入对象：{bucket}/{key}") from e
     # 计算 SHA-256 + 大小（流式，避免大文件占内存）
     h = hashlib.sha256()
     size = 0
@@ -472,6 +483,266 @@ def delete_object(bucket: str, key: str) -> dict:
             _manifest_save(bucket, manifest)
         p.unlink()
     return {"deleted": f"{bucket}/{k}"}
+
+
+# 批量删除（一键清空目录内容）单次最多处理的项数：files + dirs 超过即 400，
+# 避免误点把整个大仓库扫一遍（dry_run 预览也受限，防止预览本身成为扫描炸弹）。
+MAX_BULK_DELETE_ITEMS = 50000
+
+# errors 明细最多返回条数（契约 §1.3：最多 20 条，剩余失败只影响计数不刷屏）
+_MAX_BULK_DELETE_ERRORS = 20
+
+
+def _bulk_error(errors: list, bucket_root: Path, path: Path, exc: OSError) -> None:
+    """记录一条部分失败明细（key 相对 bucket 根），超过上限后不再追加。"""
+    if len(errors) >= _MAX_BULK_DELETE_ERRORS:
+        return
+    try:
+        key = path.relative_to(bucket_root).as_posix()
+    except ValueError:
+        key = path.as_posix()
+    errors.append({"key": key, "error": str(exc)})
+
+
+def _bulk_walk(root_dir: Path, bucket_root: Path, errors: list) -> tuple[list, list]:
+    """递归收集 root_dir 下全部待删项（不修改磁盘）。
+
+    - 返回 (files, dirs)：files 为 [(Path, size)]；dirs **自底向上**排列，便于 rmdir；
+    - 符号链接用 `is_symlink()` 识别，按文件处理（只删链接本身），**绝不跟随**；
+    - 隐藏文件/隐藏目录一并收集（mode=all 语义）；
+    - bucket 根目录的 `.warehouse.json` 永不收集（清单文件受保护）；
+    - 目录遍历失败记入 errors 并跳过该目录，不中断整体。
+    """
+    files = []
+    stack = [root_dir]
+    preorder = []           # 先序访问顺序：父目录一定排在子目录之前
+    while stack:
+        d = stack.pop()
+        preorder.append(d)
+        try:
+            with os.scandir(d) as it:
+                entries = sorted(it, key=lambda e: e.name)
+        except OSError as e:
+            _bulk_error(errors, bucket_root, d, e)
+            continue
+        for entry in entries:
+            p = Path(entry.path)
+            if p == bucket_root / MANIFEST:
+                continue                  # 保护 bucket 根清单
+            try:
+                if entry.is_symlink():
+                    files.append((p, entry.stat(follow_symlinks=False).st_size))
+                elif entry.is_dir(follow_symlinks=False):
+                    stack.append(p)
+                else:
+                    files.append((p, entry.stat(follow_symlinks=False).st_size))
+            except OSError as e:
+                _bulk_error(errors, bucket_root, p, e)
+    # 反转先序 = 子目录优先；去掉 root_dir 自身（prefix 目录必须保留）
+    return files, list(reversed(preorder[1:]))
+
+
+def bulk_delete(bucket: str, prefix: str = "", mode: str = "files",
+                dry_run: bool = True) -> dict:
+    """批量删除目录内容（一键清空）。prefix 目录本身保留；返回统计与错误明细。
+
+    - mode="files"：只删 base 的直接**普通文件**；子目录、符号链接、隐藏项
+      （含 `.keep`）与 `.warehouse.json` 全部保留；
+    - mode="all"：递归删除 base 下所有文件与子目录（含隐藏项）；符号链接只删链接、
+      不跟随；base 本身保留；bucket 根 `.warehouse.json` 永不删除；
+    - 先收集目标并检查项数上限，再执行（dry_run 在删除前返回）；
+    - 先删文件、再自底向上删目录；清单在 state_lock 内一次性清理；
+    - FileNotFoundError 视为「已不存在」跳过，其余 OSError 记入 errors 继续。
+    """
+    validate_bucket(bucket)
+    k = validate_key(prefix)
+    if mode not in ("files", "all"):
+        raise HTTPException(400, detail=f"非法 mode：{mode!r}（仅支持 files / all）")
+    root = bucket_dir(bucket)
+    if not root.is_dir():
+        raise HTTPException(404, detail=f"bucket 不存在：{bucket}")
+    base = object_path(bucket, k) if k else root
+    # 安全加固：object_path 只保证解析结果落在**仓库根**内。若 bucket 内手工放了
+    # 指向其他 bucket 的符号链接，prefix 会解析到别的 bucket；批量递归删除绝不能
+    # 跨 bucket 生效（否则会清空别人数据、清单却记在当前 bucket），一律拒绝。
+    if not base.is_relative_to(root):
+        raise HTTPException(400, detail="prefix 越界：符号链接指向 bucket 之外")
+    if not base.exists() or not base.is_dir():
+        raise HTTPException(404, detail=f"目录不存在：{bucket}/{k}")
+
+    errors: list = []
+    if mode == "files":
+        files: list = []
+        dirs: list = []
+        try:
+            children = sorted(base.iterdir(), key=lambda p: p.name)
+        except OSError as e:
+            _bulk_error(errors, root, base, e)
+            children = []
+        for child in children:
+            if child.name.startswith(".") or child.name == MANIFEST:
+                continue                  # 跳过隐藏项与清单
+            try:
+                if child.is_symlink() or not child.is_file():
+                    continue              # 子目录/符号链接保留（files 模式不递归）
+                files.append((child, child.stat().st_size))
+            except OSError as e:
+                _bulk_error(errors, root, child, e)
+    else:
+        files, dirs = _bulk_walk(base, root, errors)
+
+    total = len(files) + len(dirs)
+    if total > MAX_BULK_DELETE_ITEMS:
+        raise HTTPException(
+            400,
+            detail=f"目录过大（共 {total} 项，单次上限 {MAX_BULK_DELETE_ITEMS} 项），请缩小范围后再试")
+
+    if dry_run:
+        return {"bucket": bucket, "prefix": k, "mode": mode, "dry_run": True,
+                "files": len(files), "dirs": len(dirs),
+                "bytes": sum(size for _, size in files), "errors": errors}
+
+    deleted_files = deleted_dirs = deleted_bytes = 0
+    deleted_keys: list = []
+    for path, size in files:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            continue                      # 并发删除：已不存在，不计错误
+        except OSError as e:
+            _bulk_error(errors, root, path, e)
+            continue
+        deleted_files += 1
+        deleted_bytes += size
+        try:
+            deleted_keys.append(path.relative_to(root).as_posix())
+        except ValueError:
+            pass
+
+    dir_keys: list = []
+    for d in dirs:
+        try:
+            d.rmdir()
+        except FileNotFoundError:
+            continue
+        except OSError as e:
+            _bulk_error(errors, root, d, e)
+            continue
+        deleted_dirs += 1
+        try:
+            dir_keys.append(d.relative_to(root).as_posix())
+        except ValueError:
+            pass
+
+    # 清单一次性清理：被删文件 key + 被删目录前缀下的全部条目
+    if deleted_keys or dir_keys:
+        with state_lock():
+            manifest = _manifest_load(bucket)
+            new_manifest = dict(manifest)
+            for key in deleted_keys:
+                new_manifest.pop(key, None)
+            dir_prefixes = tuple(dk + "/" for dk in dir_keys)
+            for mkey in list(new_manifest):
+                if mkey in dir_keys or mkey.startswith(dir_prefixes):
+                    new_manifest.pop(mkey, None)
+            if new_manifest != manifest:
+                _manifest_save(bucket, new_manifest)
+
+    return {"bucket": bucket, "prefix": k, "mode": mode, "dry_run": False,
+            "files": deleted_files, "dirs": deleted_dirs,
+            "bytes": deleted_bytes, "errors": errors}
+
+
+# 一键下载（ZIP 打包）单次最多包含的项数（files + dirs），防御异常大的目录
+MAX_BULK_DOWNLOAD_ITEMS = 100000
+
+
+def bulk_download_scan(bucket: str, prefix: str = "") -> dict:
+    """只读扫描「一键下载」目标目录：返回可见文件/子目录清单与统计。
+
+    供 API 层做「单文件直下 / ZIP」判定与 ZIP 打包，不修改任何数据：
+    - 隐藏项（名字以 "." 开头，含 `.keep` / `.warehouse.json`）与符号链接全部跳过；
+    - prefix 解析（含符号链接）后必须仍在 bucket 内，否则 400（防跨 bucket 读取）；
+    - bucket / prefix 不存在或不是目录 → 404；没有任何可见内容 → 404；
+    - files + dirs 超过 MAX_BULK_DOWNLOAD_ITEMS → 400；
+    - 输出顺序稳定：每层先子目录（深度优先）再本层文件；目录名不带结尾 "/"，
+      由 zip 生成器统一拼接。entries 项：{"name", "path", "is_dir", "size"}。
+    """
+    validate_bucket(bucket)
+    k = validate_key(prefix)
+    bdir = bucket_dir(bucket)
+    if not bdir.is_dir():
+        raise HTTPException(404, detail=f"bucket 不存在：{bucket}")
+    if k:
+        base = (bdir / k).resolve()
+        # 关键加固：符号链接解析后必须仍在**本 bucket** 内，不能借 prefix 读别的 bucket
+        if not base.is_relative_to(bdir):
+            raise HTTPException(400, detail=f"prefix 越界（解析到 bucket 之外）：{prefix!r}")
+    else:
+        base = bdir
+    if not base.exists() or not base.is_dir():
+        raise HTTPException(404, detail=f"目录不存在：{bucket}/{k}")
+
+    entries: list = []
+    counts = {"files": 0, "dirs": 0}
+
+    def _check_limit() -> None:
+        if counts["files"] + counts["dirs"] > MAX_BULK_DOWNLOAD_ITEMS:
+            raise HTTPException(
+                400,
+                detail=f"目录过大（超过 {MAX_BULK_DOWNLOAD_ITEMS} 项），请缩小范围后再下载")
+
+    def _walk(d: Path, rel: str) -> None:
+        try:
+            with os.scandir(d) as it:
+                children = sorted(it, key=lambda e: e.name)
+        except OSError:
+            return                                # 目录读不了：跳过（不阻断其余内容）
+        subdirs = []
+        level_files = []
+        for entry in children:
+            if entry.name.startswith("."):
+                continue                          # 跳过隐藏文件/目录（.keep/.warehouse.json）
+            try:
+                if entry.is_symlink():
+                    continue                      # 符号链接不跟随、不打包
+                rel_name = f"{rel}/{entry.name}" if rel else entry.name
+                if entry.is_dir(follow_symlinks=False):
+                    st = entry.stat(follow_symlinks=False)
+                    counts["dirs"] += 1
+                    _check_limit()
+                    entries.append({"name": rel_name, "path": Path(entry.path),
+                                    "is_dir": True, "size": 0,
+                                    "mtime": st.st_mtime})
+                    subdirs.append((Path(entry.path), rel_name))
+                else:
+                    st = entry.stat(follow_symlinks=False)
+                    counts["files"] += 1
+                    _check_limit()
+                    level_files.append({"name": rel_name, "path": Path(entry.path),
+                                        "is_dir": False, "size": st.st_size,
+                                        "mtime": st.st_mtime})
+            except OSError:
+                continue                          # 并发删除/权限问题：跳过该项
+        for sub_path, sub_rel in subdirs:
+            _walk(sub_path, sub_rel)
+        entries.extend(level_files)
+
+    _walk(base, "")
+    if counts["files"] == 0 and counts["dirs"] == 0:
+        raise HTTPException(404, detail="目录为空，没有可下载的内容")
+
+    single_file = None
+    single_file_key = ""
+    if counts["files"] == 1 and counts["dirs"] == 0:
+        single_file = entries[0]
+        single_file_key = f"{k}/{single_file['name']}" if k else single_file["name"]
+
+    return {"bucket": bucket, "prefix": k, "base": base,
+            "root_name": k.split("/")[-1] if k else bucket,
+            "files": counts["files"], "dirs": counts["dirs"],
+            "entries": entries,
+            "single_file": single_file, "single_file_key": single_file_key}
 
 
 def create_bucket(bucket: str) -> dict:
@@ -1296,6 +1567,17 @@ MAX_SESSION_BYTES = 200 * 1024 ** 3      # max_upload_mb=0 时的会话硬上限
 _SESSION_META = ".session.json"
 
 
+def _max_chunk_bytes() -> int:
+    """单分片上限：config.upload.max_chunk_mb，同时受代码常量 MAX_CHUNK_BYTES 兜底。"""
+    cfg = get_upload_settings()
+    return min(cfg["max_chunk_mb"] * 1024 * 1024, MAX_CHUNK_BYTES)
+
+
+def _max_total_chunks() -> int:
+    """分片总数上限：config.upload.max_chunks，同时受代码常量 MAX_TOTAL_CHUNKS 兜底。"""
+    return min(get_upload_settings()["max_chunks"], MAX_TOTAL_CHUNKS)
+
+
 def _validate_upload_id(upload_id: str) -> str:
     uid = (upload_id or "").strip()
     if not _UPLOAD_ID_RE.match(uid):
@@ -1378,18 +1660,27 @@ def create_chunk_session(owner: str = "") -> str:
         "created_at": _utc_now_iso(),
         "received_bytes": 0,
     })
-    cleanup_stale_chunk_sessions()
+    cleanup_stale_chunk_sessions(get_upload_settings()["session_idle_ttl_seconds"])
+    cleanup_expired_chunk_sessions(get_upload_settings()["session_ttl_seconds"])
     return upload_id
 
 
-CHUNK_SESSION_TTL = 24 * 3600  # 分片会话有效期（秒）：超时视为客户端已放弃
+CHUNK_SESSION_TTL = 24 * 3600  # 分片会话绝对有效期（秒）：超过即视为放弃
+CHUNK_SESSION_IDLE_TTL = 6 * 3600  # 代码兜底；实际默认取 config.upload.session_idle_ttl_seconds（24h）
 
 
-def cleanup_stale_chunk_sessions() -> int:
-    """删除过期分片会话目录（目录 mtime 超过 CHUNK_SESSION_TTL），返回删除数
+def cleanup_stale_chunk_sessions(ttl_seconds=None) -> int:
+    """删除过期分片会话目录（目录 mtime 超过 TTL），返回删除数
 
-    惰性触发（每次 initiate 顺手执行）而非后台定时，服务小流量场景够用；
-    会在新会话目录创建之后运行，绝不误删本次的会话（刚建 mtime 必然最新）。"""
+    - 默认 `CHUNK_SESSION_TTL`（24h，可由 config.upload.session_ttl_seconds 覆盖）；
+    - 传 `CHUNK_SESSION_IDLE_TTL`（代码兜底 6h；实际默认取
+      `config.upload.session_idle_ttl_seconds`，默认 24h 且不小于请求超时）：
+      供后台任务定期清理浏览器被杀/断网后没有后续请求的会话。
+    活跃上传每写一个分片都会更新会话目录 mtime，因此不会误删正在上传的会话。
+    """
+    if ttl_seconds is None:
+        ttl_seconds = get_upload_settings()["session_ttl_seconds"]
+    ttl = int(ttl_seconds)
     root = _chunk_dir()
     if not root.exists():
         return 0
@@ -1399,7 +1690,7 @@ def cleanup_stale_chunk_sessions() -> int:
         if not d.is_dir() or d.is_symlink():
             continue
         try:
-            if now - d.stat().st_mtime < CHUNK_SESSION_TTL:
+            if now - d.stat().st_mtime < ttl:
                 continue
         except OSError:
             continue
@@ -1408,10 +1699,72 @@ def cleanup_stale_chunk_sessions() -> int:
     return removed
 
 
+def cleanup_expired_chunk_sessions(ttl_seconds=None) -> int:
+    """删除超过绝对有效期的分片会话（按 .session.json 的 created_at）。
+
+    `cleanup_stale_chunk_sessions()` 按目录 mtime 清理“多久没写入”，用于空闲兜底；
+    本函数按会话创建时间清理“总寿命”，即使客户端一直有分片写入，也不能超过
+    config.upload.session_ttl_seconds。两者职责不同，启动/新建/后台任务都会同时执行。
+    """
+    if ttl_seconds is None:
+        ttl_seconds = get_upload_settings()["session_ttl_seconds"]
+    ttl = int(ttl_seconds)
+    root = _chunk_dir()
+    if not root.exists():
+        return 0
+    now = time.time()
+    removed = 0
+    for d in root.iterdir():
+        if not d.is_dir() or d.is_symlink():
+            continue
+        meta = {}
+        try:
+            p = d / _SESSION_META
+            if p.is_file():
+                val = json.loads(p.read_text(encoding="utf-8"))
+                if isinstance(val, dict):
+                    meta = val
+        except Exception:
+            meta = {}
+        created = _parse_ts(meta.get("created_at", ""))
+        try:
+            created_ts = created.timestamp() if created is not None else d.stat().st_mtime
+            if now - created_ts < ttl:
+                continue
+        except (OSError, ValueError, OverflowError):
+            continue
+        shutil.rmtree(d, ignore_errors=True)
+        removed += 1
+    return removed
+
+
+def cleanup_all_chunk_sessions() -> int:
+    """删除全部分片会话目录（服务启动时调用）。
+
+    容器/进程重启时不可能还有活跃上传，上一次进程留下的
+    ``/tmp/dw_chunks/<upload_id>`` 可能占几十 GB（浏览器被杀、容器重启等），
+    在这里一次性释放；正常上传的成功/失败路径由 finalize/abort 负责清理。
+    返回删除的会话数。
+    """
+    root = _chunk_dir()
+    if not root.exists():
+        return 0
+    removed = 0
+    for d in root.iterdir():
+        if not d.is_dir() or d.is_symlink():
+            continue
+        shutil.rmtree(d, ignore_errors=True)
+        removed += 1
+    return removed
+
+
 def _session_size_limit() -> int:
-    """会话总大小上限：优先 max_upload_mb，未配置时用 MAX_SESSION_BYTES 兜底。"""
+    """会话总大小上限：优先 max_upload_mb；否则 config.upload.max_session_gb（≤200GB 兜底）。"""
     max_mb = int(get_config().get("max_upload_mb", 0) or 0)
-    return max_mb * 1024 * 1024 if max_mb else MAX_SESSION_BYTES
+    if max_mb:
+        return max_mb * 1024 * 1024
+    cfg_bytes = get_upload_settings()["max_session_gb"] * 1024 ** 3
+    return min(cfg_bytes, MAX_SESSION_BYTES)
 
 
 def store_chunk(upload_id: str, index: int, src_path: Path,
@@ -1422,12 +1775,13 @@ def store_chunk(upload_id: str, index: int, src_path: Path,
     绕过 max_upload_mb、或把 /tmp 写满。
     """
     size = src_path.stat().st_size
-    if size > MAX_CHUNK_BYTES:
+    max_chunk = _max_chunk_bytes()
+    if size > max_chunk:
         raise HTTPException(413,
-            detail=f"单个分片超过上限 {MAX_CHUNK_BYTES // (1024 * 1024)}MB")
+            detail=f"单个分片超过上限 {max_chunk // (1024 * 1024)}MB")
     with state_lock():
         _d, meta = _assert_session_access(upload_id, actor, is_admin)
-        if not isinstance(index, int) or index < 0 or index >= MAX_TOTAL_CHUNKS:
+        if not isinstance(index, int) or index < 0 or index >= _max_total_chunks():
             raise HTTPException(400, detail=f"非法分片索引：{index}")
         part = _chunk_part_path(upload_id, index)
         old_size = part.stat().st_size if part.exists() else 0
@@ -1436,10 +1790,17 @@ def store_chunk(upload_id: str, index: int, src_path: Path,
         if total - old_size + size > limit:
             raise HTTPException(413,
                 detail=f"超过单文件上传上限 {limit // (1024 * 1024)}MB")
-        # 原子写入
+        # 原子写入；失败时清理 .part.tmp，避免分片写失败留下残片
         tmp = part.with_suffix(".part.tmp")
-        shutil.copyfile(src_path, tmp)
-        tmp.rename(part)
+        try:
+            shutil.copyfile(src_path, tmp)
+            tmp.rename(part)
+        except BaseException:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
         meta["received_bytes"] = total - old_size + size
         _write_session_meta(upload_id, meta)
     return {"upload_id": upload_id, "index": index, "size": size}
@@ -1469,11 +1830,18 @@ def finalize_chunk_upload(upload_id: str, bucket: str, key: str, total_chunks: i
                           source_url: str = "", uploader: str = "",
                           overwrite: bool = True,
                           actor: str = "", is_admin: bool = False) -> dict:
-    """合并分片并写入仓库"""
+    """合并分片并写入仓库；成功或硬失败时清理本次会话。
+
+    - 校验类失败（缺片 / total_chunks 越界 / 超出 max_upload_mb / 权限 / 409 冲突）
+      **保留会话**，允许补齐分片或调整参数后重试/续传；
+    - 进入合并、sha256、put_object 落盘阶段后的硬失败（磁盘满、I/O 异常、未知异常）
+      以及成功，**清理**本次会话与合并临时文件，避免 72GB 级残留长期占 /tmp。
+    """
     d, _meta = _assert_session_access(upload_id, actor, is_admin)
-    if not isinstance(total_chunks, int) or total_chunks < 1 or total_chunks > MAX_TOTAL_CHUNKS:
+    max_chunks = _max_total_chunks()
+    if not isinstance(total_chunks, int) or total_chunks < 1 or total_chunks > max_chunks:
         raise HTTPException(400,
-            detail=f"total_chunks 必须在 1-{MAX_TOTAL_CHUNKS} 之间")
+            detail=f"total_chunks 必须在 1-{max_chunks} 之间")
     # 检查分片齐全
     for i in range(total_chunks):
         if not _chunk_part_path(upload_id, i).exists():
@@ -1483,16 +1851,27 @@ def finalize_chunk_upload(upload_id: str, bucket: str, key: str, total_chunks: i
     total_size = _sum_chunk_sizes(upload_id, total_chunks)
     if max_mb and total_size > max_mb * 1024 * 1024:
         raise HTTPException(413, detail=f"超过单文件上传上限 {max_mb}MB")
-    # 合并到临时文件
-    with tempfile.NamedTemporaryFile(delete=False) as tmp:
-        _merge_chunks(upload_id, total_chunks, Path(tmp.name))
+
+    merged = None
+    keep_session = False
     try:
-        result = put_object(bucket, key, Path(tmp.name), source_url, overwrite, uploader=uploader)
+        # 合并到临时文件（失败属于硬失败，finally 会清理）
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            merged = Path(tmp.name)
+        _merge_chunks(upload_id, total_chunks, merged)
+        try:
+            return put_object(bucket, key, merged, source_url, overwrite, uploader=uploader)
+        except HTTPException as e:
+            # overwrite=false 且目标已存在：可改参数重试，保留分片会话；
+            # 目标本身是目录属于不可恢复冲突，清理会话（避免残留分片）。
+            if e.status_code == 409 and not object_path(bucket, key).is_dir():
+                keep_session = True
+            raise
     finally:
-        Path(tmp.name).unlink(missing_ok=True)
-    # 清理会话
-    shutil.rmtree(d, ignore_errors=True)
-    return result
+        if merged is not None:
+            merged.unlink(missing_ok=True)
+        if not keep_session:
+            shutil.rmtree(d, ignore_errors=True)
 
 
 def abort_chunk_session(upload_id: str, actor: str = "", is_admin: bool = False) -> dict:

@@ -4,7 +4,7 @@
   "datahub_url": "http://127.0.0.1:8002/api/data",
   "host": "0.0.0.0",
   "port": 8004,
-  "access_token": "y",
+  "access_token": "admin",
   "max_upload_mb": 0,
   "ui_enabled": true,
   "metrics_enabled": true,
@@ -18,5 +18,21 @@
     "count_max": 10,
     "expire_min_seconds": 60,
     "expire_max_seconds": 604800
+  },
+  "upload": {
+    "chunk_size_mb": 8,
+    "chunk_concurrency": 4,
+    "file_concurrency": 3,
+    "request_timeout_seconds": 86400,
+    "max_chunk_mb": 64,
+    "max_chunks": 100000,
+    "max_session_gb": 200,
+    "session_ttl_seconds": 86400,
+    "session_idle_ttl_seconds": 86400
+  },
+  "download": {
+    "chunk_size_mb": 8,
+    "chunk_concurrency": 4,
+    "request_timeout_seconds": 3600
   }
 }
