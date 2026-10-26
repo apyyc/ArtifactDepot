@@ -1994,6 +1994,7 @@ def list_owner_sessions(owner: str = "") -> list[dict]:
     if not owner:
         return []
     items: list[dict] = []
+    now = time.time()
     for d in list(_iter_live_sessions()):
         meta = _read_meta_dir(d)
         if (meta.get("owner") or "").strip() != owner:
@@ -2009,6 +2010,11 @@ def list_owner_sessions(owner: str = "") -> list[dict]:
             pct = min(100, max(0, int(received * 100 / size)))
         else:
             pct = 0
+        # 最后一次分片写入距今秒数（服务端时钟）：页面刷新/浏览器断开后，前端据此把
+        # 「未完成会话」区分为「最近有分片写入」与「已中断（未在传输）」，避免把断点
+        # 误展示成仍在传输的上传任务。解析不出时间时给 -1（前端显示为未知）。
+        last_ts = _metadata_ts(meta)
+        idle_seconds = max(0, int(now - last_ts)) if last_ts > 0 else -1
         items.append({
             "upload_id": d.name,
             "bucket": bucket,
@@ -2022,6 +2028,7 @@ def list_owner_sessions(owner: str = "") -> list[dict]:
             "chunk_size": int(meta.get("chunk_size") or 0),
             "created_at": str(meta.get("created_at") or ""),
             "updated_at": str(meta.get("updated_at") or ""),
+            "idle_seconds": idle_seconds,
         })
     # 最近写入的排前面（ISO8601 UTC 字符串可直接比较）
     items.sort(key=lambda it: (it.get("updated_at") or "", it.get("created_at") or ""),

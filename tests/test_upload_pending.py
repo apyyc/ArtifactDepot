@@ -10,12 +10,14 @@
 覆盖：
 - 无 token → 401；缺 upload:abort → 403；同一 token 可见、其它 token/管理员不可见
 - 返回字段：upload_id / bucket / key / name / size / received_bytes / percent /
-  uploaded_chunks；不泄露服务端绝对路径
+  uploaded_chunks / idle_seconds；不泄露服务端绝对路径
+- idle_seconds 反映最后分片写入距今秒数（页面据此显示「已中断（未在传输）」/最后活动时间）
 - 取消（POST /api/objects/abort）后列表立即消失
-- 权限目录仍 22 条、OpenAPI 操作仍 35 条（该接口 include_in_schema=False）
+- 权限目录仍 23 条、OpenAPI 操作仍 35 条（该接口 include_in_schema=False）
 """
 import json
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -104,6 +106,10 @@ def test_list_is_scoped_to_current_token(ctx):
     assert item["percent"] == 50
     assert item["uploaded_chunks"] == [0]
     assert item["total_chunks"] == 2
+    # 最后分片写入距今秒数：刚上传完应为很小的非负整数，页面据此判断是否「已中断」
+    assert isinstance(item["idle_seconds"], int)
+    assert 0 <= item["idle_seconds"] <= 30
+    assert item["created_at"] and item["updated_at"]
     assert "dir" not in item                      # 不返回服务端绝对路径字段
     assert str(Path(item["upload_id"]).parent) == "."   # upload_id 只是会话目录名
 
@@ -118,6 +124,24 @@ def test_list_is_scoped_to_current_token(ctx):
     assert [it["upload_id"] for it in admin_items] == [admin_uid]
     alice_items = c.get("/api/objects/uploads", params={"token": alice}).json()["data"]["items"]
     assert [it["upload_id"] for it in alice_items] == [uid]
+
+
+def test_idle_seconds_marks_orphaned_session(ctx, monkeypatch):
+    """浏览器断开后会话仍保留，但 idle_seconds 变大，前端据此显示「已中断（未在传输）」。"""
+    c = ctx
+    tok = _token(c, "idle-user")
+    uid = _init(c, tok)
+    _chunk(c, tok, uid)
+    item = c.get("/api/objects/uploads", params={"token": tok}).json()["data"]["items"][0]
+    assert item["idle_seconds"] <= 30
+
+    # 模拟最后分片写入发生在 2 小时前（页面刷新/浏览器断开后不再有 chunk）
+    from artifactdepot import storage
+    monkeypatch.setattr(storage, "_metadata_ts", lambda meta: time.time() - 2 * 3600)
+    item = c.get("/api/objects/uploads", params={"token": tok}).json()["data"]["items"][0]
+    assert 7195 <= item["idle_seconds"] <= 7205
+    assert item["received_bytes"] == CHUNK   # 断点分片仍然保留，可续传
+    assert item["upload_id"] == uid
 
 
 def test_cancel_pending_upload_removes_it(ctx):

@@ -412,10 +412,10 @@ GET /api/objects/uploads
 { "items": [{ "upload_id": "...", "bucket": "b", "key": "a/f.bin",
   "name": "f.bin", "size": 100, "received_bytes": 50, "percent": 50,
   "uploaded_chunks": [0], "total_chunks": 2, "chunk_size": 8388608,
-  "created_at": "...", "updated_at": "..." }], "count": 1 }
+  "created_at": "...", "updated_at": "...", "idle_seconds": 12 }], "count": 1 }
 ```
 
-会话保存在服务端，进程重启后仍可续传；超过 `upload.session_ttl_seconds`（绝对）或 `upload.session_idle_ttl_seconds`（空闲）会被清理，后台按 `upload.session_cleanup_interval_seconds` 周期执行。
+会话保存在服务端，进程重启后仍可续传；超过 `upload.session_ttl_seconds`（绝对）或 `upload.session_idle_ttl_seconds`（空闲）会被清理，后台按 `upload.session_cleanup_interval_seconds` 周期执行。`idle_seconds` 是服务端时钟下「最后分片写入距今秒数」（无法解析时为 `-1`）：网页据此把页面刷新/浏览器断开后已无传输的断点显示为「已中断（未在传输）」，并给出「最后活动」时间；`idle_seconds <= 15` 显示为「最近有分片写入」。断点会话不占用前端上传队列，因此没有「暂停上传」，只能「继续上传」（重新选择同一文件）或「取消上传」。
 
 ---
 

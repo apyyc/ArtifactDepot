@@ -40,9 +40,18 @@
   .up-item .up-act { padding: 2px 8px; font-size: 12px; line-height: 1.4; }
   .up-item .up-act:disabled { opacity: .55; cursor: not-allowed; }
   .up-pending-head { font-size: 13px; font-weight: bold; color: #606266; margin-bottom: 2px; }
-  .up-item.pending .nm { flex: 0 0 170px; }
-  .up-item.pending .st { flex: 0 0 180px; }
-  .up-item .pending-key { flex: 0 0 210px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .up-pending-tip { margin: 2px 0 6px; line-height: 1.5; }
+  .up-item.pending .nm { flex: 0 0 150px; }
+  .up-item.pending .st { flex: 0 0 190px; }
+  /* 断点会话状态：最近有分片写入（可能其它页面在传）/ 已中断（本页已无传输） */
+  .up-item.pending .pending-state { flex: 0 0 auto; padding: 1px 8px; border-radius: 9px; font-size: 12px; line-height: 18px; white-space: nowrap; }
+  .up-item.pending.live .pending-state { color: #409eff; background: #ecf5ff; border: 1px solid #b3d8ff; }
+  .up-item.pending.stalled .pending-state { color: #b88230; background: #fdf6ec; border: 1px solid #f3d19e; }
+  .up-item.pending.stalled progress { opacity: .7; accent-color: #e6a23c; }
+  .up-item.pending.live progress { accent-color: #409eff; }
+  .pending-sub { display: flex; gap: 12px; margin: 2px 0 8px 0; font-size: 12px; color: #909399; }
+  .pending-sub .pending-key { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pending-sub .pending-ago { flex: 0 0 auto; }
   #upTokenHint { color: #e6a23c; }
   #upFile:disabled { opacity: .55; cursor: not-allowed; }
   /* 配置标签页：按分组渲染全部配置项，含「需重启 / 被 .env 覆盖」标记 */

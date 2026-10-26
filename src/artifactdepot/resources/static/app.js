@@ -97,6 +97,7 @@ document.addEventListener('click', (e) => {
   else if (a === 'resume-upload') resumeUpload(el.dataset.uid)
   else if (a === 'retry-upload') retryUpload(el.dataset.uid)
   else if (a === 'cancel-upload') cancelUpload(el.dataset.uid)
+  else if (a === 'resume-pending-upload') resumePendingUpload(el.dataset.uid)
   else if (a === 'cancel-pending-upload') cancelPendingUpload(el.dataset.uid)
   else if (a === 'open-mkdir') openMkdirModal()
   else if (a === 'do-mkdir') doMkdir()
@@ -1288,6 +1289,11 @@ let upInFlight = 0
 let upSeq = 0               // 队列项唯一 id（data-uid 用，避免按数组下标取项因移除而错位）
 let pendingUploads = []     // 当前令牌名下未完成的分片会话（服务端磁盘为准，刷新后仍可显示）
 let pendingTimer = null     // 输入令牌时防抖刷新未完成列表
+let pendingPollTimer = null // 未完成列表的定时刷新（可见且有断点会话时）
+let pendingSeq = 0          // 未完成列表请求序号，防止旧响应覆盖新状态
+let resumePendingId = ''    // 正在等待用户重新选择文件的断点会话 upload_id
+let resumePendingToken = '' // 点击「继续上传」时的令牌，选文件后若令牌已变则拒绝
+const PENDING_ACTIVE_SECONDS = 15   // 最后分片写入距今 <= 15s 视为「最近有分片写入」
 
 // 浏览器侧断点指纹（localStorage）：bucket|key → { size, lastModified, upload_id, chunk_size }
 const UP_RESUME_STORE = 'artifactdepot.uploadResume.v1'
@@ -1337,6 +1343,15 @@ function upResumeDropByUploadId(uploadId) {
   } catch (e) { /* 忽略 */ }
 }
 
+// 按 upload_id 找回本地断点指纹（bucket|key → size/lastModified/upload_id）。
+// 只有本浏览器留下过记录时才能校验文件是否被修改；没有记录时只能校验文件名/大小。
+function upResumeFindByUploadId(uploadId) {
+  if (!uploadId) return null
+  const m = upResumeMap()
+  const key = Object.keys(m).find(k => m[k] && m[k].upload_id === uploadId)
+  return key ? { key: key, rec: m[key] } : null
+}
+
 function makeUploadItem(file) {
   return {
     uid: ++upSeq,
@@ -1353,6 +1368,8 @@ function makeUploadItem(file) {
     paused: false,         // 该任务是否已暂停（分片边界生效；每个任务独立）
     pauseWaiters: [],      // 该任务暂停期间等待恢复的 worker
     chunked: false,        // 是否走多线程分片上传（小文件单请求直传不支持中途暂停）
+    forcedChunked: false,  // 从「未完成上传」续传时强制走分片（会话本身就是分片会话）
+    pinned: false,         // 续传断点会话：bucket/key 固定用会话里的目标，不随当前浏览目录变化
     canceled: false,       // 用户已放弃：worker 尽快退出，不再发新分片
     bucket: '',            // 发起任务时的 bucket/key（切换目录后清理断点记录仍准确）
     key: '',
@@ -1483,7 +1500,33 @@ function syncUploadGate() {
   }
 }
 
-// ---- 当前令牌的未完成上传（服务端分片会话；刷新页面后仍可显示 / 取消）----
+// ---- 当前令牌的未完成上传（服务端分片会话；刷新后仍可显示 / 取消 / 续传）----
+// 页面刷新或浏览器断开后，浏览器无法恢复 File 与在途 XHR：服务端会话还在，但**本页已经
+// 没有任何分片在传**。这些「断点会话」必须与真正在传的任务区分开：显示最后活动时间与
+// 「已中断（未在传输）」，只提供「继续上传」（重新选择同一文件）与「取消上传」。
+// 暂停按钮只对队列行有意义——pending 行没有可暂停的传输，这也是浏览器恢复后看不到暂停的原因。
+// 「最后活动」文案：服务端 idle_seconds（最后分片写入距今秒数）→ 刚刚 / N 秒前 / N 分钟前…
+function fmtAgo(seconds) {
+  const n = Math.max(0, Math.floor(Number(seconds) || 0))
+  if (n < 10) return '刚刚'
+  if (n < 60) return n + ' 秒前'
+  if (n < 3600) return Math.floor(n / 60) + ' 分钟前'
+  if (n < 86400) return Math.floor(n / 3600) + ' 小时前'
+  return Math.floor(n / 86400) + ' 天前'
+}
+
+// 断点会话是否「最近有分片写入」：服务端 idle_seconds 优先；旧服务端没有该字段时退回
+// 解析 updated_at（UTC）。idle < 0 表示时间未知（既不说在传，也不武断说中断）。
+function pendingActivity(it) {
+  let idle = Number(it && it.idle_seconds)
+  if (!Number.isFinite(idle) || idle < 0) {
+    const ts = Date.parse((it && it.updated_at) || '')
+    idle = Number.isFinite(ts) ? Math.max(0, (Date.now() - ts) / 1000) : -1
+  }
+  if (idle < 0) return { active: false, idle: -1, known: false }
+  return { active: idle <= PENDING_ACTIVE_SECONDS, idle: idle, known: true }
+}
+
 function renderPendingUploads() {
   const wrap = $('upPendingWrap')
   const box = $('upPending')
@@ -1491,7 +1534,12 @@ function renderPendingUploads() {
   // 本页队列里正在处理的任务已经在队列行展示，避免同一个会话重复出现
   const active = new Set(upItems.map(it => it.upload_id).filter(Boolean))
   const items = pendingUploads.filter(it => it && it.upload_id && !active.has(it.upload_id))
-  if (!items.length) { wrap.style.display = 'none'; box.innerHTML = ''; return }
+  if (!items.length) {
+    wrap.style.display = 'none'
+    box.innerHTML = ''
+    stopPendingPoll()
+    return
+  }
   const info = $('upPendingInfo')
   if (info) info.textContent = '（' + items.length + ' 个）'
   wrap.style.display = ''
@@ -1499,21 +1547,58 @@ function renderPendingUploads() {
     const pct = Math.max(0, Math.min(100, Number(it.percent) || 0))
     const label = '已传 ' + fmtSize(it.received_bytes) + ' / ' + fmtSize(it.size) + '（' + pct + '%）'
     const path = (it.bucket || '') + ' / ' + (it.key || '')
-    return '<div class="up-item pending"><span class="nm" title="' + esc(path) + '">' + esc(it.name || it.key) + '</span>' +
+    const act = pendingActivity(it)
+    const stateText = act.known
+      ? (act.active ? '最近有分片写入' : '已中断（未在传输）')
+      : '状态未知'
+    const ago = act.known ? fmtAgo(act.idle) : '未知'
+    return '<div class="up-item pending' + (act.active ? ' live' : ' stalled') + '">' +
+      '<span class="nm" title="' + esc(path) + '">' + esc(it.name || it.key) + '</span>' +
       '<progress value="' + pct + '" max="100"></progress>' +
       '<span class="st">' + esc(label) + '</span>' +
-      '<span class="muted pending-key" title="' + esc(path) + '">' + esc(path) + '</span>' +
-      '<button class="ghost up-act" data-action="cancel-pending-upload" data-uid="' + esc(it.upload_id) + '">取消上传</button></div>'
+      '<span class="pending-state">' + esc(stateText) + '</span>' +
+      '<button class="ghost up-act" data-action="resume-pending-upload" data-uid="' + esc(it.upload_id) + '">继续上传</button>' +
+      '<button class="ghost up-act" data-action="cancel-pending-upload" data-uid="' + esc(it.upload_id) + '">取消上传</button>' +
+      '</div>' +
+      '<div class="pending-sub">' +
+      '<span class="pending-key" title="' + esc(path) + '">保存位置：' + esc(path) + '</span>' +
+      '<span class="pending-ago">最后活动：' + esc(ago) + '</span></div>'
   }).join('')
+  startPendingPoll()
+}
+
+// 未完成列表轮询：其它页面/设备继续上传时，本页的断点行会随进度与 idle_seconds 更新；
+// 本页自己的上传会话会按 upload_id 从列表中排除，不会产生额外请求风暴。
+function startPendingPoll() {
+  if (pendingPollTimer) return
+  if (!uploadTokenValue() || document.visibilityState === 'hidden') return
+  pendingPollTimer = setInterval(() => {
+    if (document.visibilityState === 'hidden') return
+    if (!uploadTokenValue()) { stopPendingPoll(); return }
+    refreshPendingUploads()
+  }, 8000)
+}
+
+function stopPendingPoll() {
+  if (!pendingPollTimer) return
+  clearInterval(pendingPollTimer)
+  pendingPollTimer = null
 }
 
 async function refreshPendingUploads() {
   const token = uploadTokenValue()
-  if (!token) { pendingUploads = []; renderPendingUploads(); return }
+  const seq = ++pendingSeq
+  if (!token) {
+    pendingUploads = []
+    renderPendingUploads()
+    return
+  }
   try {
     const body = await api('/api/objects/uploads', {}, token)
+    if (seq !== pendingSeq || token !== uploadTokenValue()) return   // 过期响应丢弃
     pendingUploads = (body && body.data && body.data.items) || []
   } catch (e) {
+    if (seq !== pendingSeq || token !== uploadTokenValue()) return
     pendingUploads = []   // token 无效/无权限/接口不可用时静默隐藏，不打断当前操作
   }
   renderPendingUploads()
@@ -1522,6 +1607,77 @@ async function refreshPendingUploads() {
 function schedulePendingRefresh() {
   if (pendingTimer) clearTimeout(pendingTimer)
   pendingTimer = setTimeout(() => { pendingTimer = null; refreshPendingUploads() }, 500)
+}
+
+// 「继续上传」：浏览器无法自动恢复 File，必须由用户重新选择同一文件；校验通过后把该 File
+// 绑定到服务端会话（upload_id + 会话里的 bucket/key），只补缺失分片，不重传已传分片。
+async function resumePendingUpload(uploadId) {
+  const it = pendingUploads.find(x => x && x.upload_id === uploadId)
+  if (!it) { toast('该未完成上传已不存在，请刷新后重试', false); refreshPendingUploads(); return }
+  const token = uploadTokenValue()
+  if (!token) { toast('请先填写令牌，再继续上传', false); return }
+  const act = pendingActivity(it)
+  if (act.active) {
+    const ok = await confirmDialog('该断点最近仍有分片写入（可能来自其它页面/设备）。继续上传会从断点补齐缺失分片，确定继续？')
+    if (!ok) return
+  }
+  resumePendingId = uploadId
+  resumePendingToken = token
+  const input = $('upResumeFile')
+  if (!input) { toast('页面缺少续传文件选择框', false); return }
+  input.value = ''   // 允许重复选择同一文件
+  input.click()
+}
+
+// 用户重新选择文件后：校验文件名/大小（有本地指纹时再校验 lastModified），通过则入队续传。
+async function onResumeFilePicked() {
+  const input = $('upResumeFile')
+  const uid = resumePendingId
+  resumePendingId = ''
+  if (!input || !uid) return
+  const file = (input.files && input.files[0]) || null
+  input.value = ''
+  if (!file) return   // 用户取消选择
+  const it = pendingUploads.find(x => x && x.upload_id === uid)
+  if (!it) { toast('该未完成上传已不存在，请刷新后重试', false); refreshPendingUploads(); return }
+  if (!resumePendingToken || resumePendingToken !== uploadTokenValue()) {
+    toast('令牌已变更，请重新点该行「继续上传」', false)
+    return
+  }
+  const expectName = it.name || String(it.key || '').split('/').pop()
+  if (file.size !== Number(it.size)) {
+    toast('文件大小不一致（选择 ' + fmtSize(file.size) + '，断点 ' + fmtSize(it.size) + '），无法续传', false)
+    return
+  }
+  if (expectName && file.name !== expectName) {
+    toast('文件名不一致（应为 ' + expectName + '），无法续传', false)
+    return
+  }
+  const found = upResumeFindByUploadId(uid)
+  if (found && found.rec) {
+    if (Number(found.rec.size) !== Number(file.size) ||
+        Number(found.rec.lastModified) !== Number(file.lastModified)) {
+      toast('文件已修改（大小或修改时间变化），不能把旧分片拼进新文件；请取消该断点后重新上传', false)
+      return
+    }
+  } else {
+    const ok = await confirmDialog('本浏览器没有该文件的断点指纹（可能清理过缓存），只能校验文件名与大小。若文件已被修改，续传结果可能不一致。确定继续？')
+    if (!ok) return
+  }
+  const item = makeUploadItem(file)
+  item.pinned = true            // 目标固定为会话里的 bucket/key，不随当前浏览目录变化
+  item.forcedChunked = true     // 会话是分片会话，即使文件变小也走分片续传
+  item.bucket = it.bucket
+  item.key = it.key
+  item.upload_id = it.upload_id
+  item.chunk_size = Number(it.chunk_size) || 0
+  // 先移除 pending 行，避免与队列行重复；若会话失效，下次刷新会按服务端真实状态恢复
+  pendingUploads = pendingUploads.filter(x => x.upload_id !== uid)
+  upItems.push(item)
+  renderUpQueue()
+  renderPendingUploads()
+  toast('正在从断点继续 ' + file.name + '（已传 ' + fmtSize(it.received_bytes) + ' / ' + fmtSize(it.size) + '）')
+  processQueue()
 }
 
 async function cancelPendingUpload(uploadId) {
@@ -1663,9 +1819,12 @@ async function processQueue() {
     upInFlight++
     item.phase = 'running'
     item.reason = ''
-    item.chunked = item.file.size > uploadCfg.chunk_size
-    item.bucket = state.bucket || ''
-    item.key = uploadTargetKey(item.file)
+    item.chunked = item.forcedChunked || item.file.size > uploadCfg.chunk_size
+    if (!item.pinned) {
+      // 普通上传：目标取当前浏览的 bucket + 位置；断点续传（pinned）沿用会话里的目标
+      item.bucket = state.bucket || ''
+      item.key = uploadTargetKey(item.file)
+    }
     const runner = item.chunked ? uploadOneChunked(item, token) : uploadOne(item, token)
     runner.then((res) => {
       upInFlight--
@@ -1705,10 +1864,11 @@ function uploadOne(item, token) {
   // 小文件单请求直传：无法在中间暂停（该行不显示暂停按钮），失败可重试但无断点；放弃时 abort 本请求
   return new Promise((resolve) => {
     const file = item.file
-    const key = state.prefix ? state.prefix + '/' + file.name : file.name
+    const bucket = item.pinned ? item.bucket : state.bucket
+    const key = item.pinned ? item.key : (state.prefix ? state.prefix + '/' + file.name : file.name)
     const fd = new FormData()
     fd.append('file', file)
-    fd.append('bucket', state.bucket)
+    fd.append('bucket', bucket)
     fd.append('key', key)
     fd.append('source_url', $('upSource').value.trim())
     fd.append('note', $('upNote').value.trim())
@@ -1754,8 +1914,8 @@ async function abortUpload(upload_id, token) {
 // 不传 upload_id 时由服务端按 owner+bucket+key+size 自动找回未完成会话（页面刷新后重新选文件也可续传）。
 async function initiateUpload(item, token) {
   const file = item.file
-  const bucket = state.bucket || ''
-  const key = bucket ? uploadTargetKey(file) : ''
+  const bucket = item.pinned ? item.bucket : (state.bucket || '')
+  const key = item.pinned ? item.key : (bucket ? uploadTargetKey(file) : '')
   const fd = new FormData()
   if (bucket) {
     fd.append('bucket', bucket)
@@ -1788,6 +1948,10 @@ async function initiateUpload(item, token) {
   } catch (e) {
     // 会话失效/参数不一致（HTTP 400，detail 含「分片会话」）→ 按会话丢失处理，新建会话重传
     if (upload_id && e && e.status === 400) {
+      if (item.pinned) {
+        // 从「未完成上传」续传的会话失效时不能悄悄新建会话：那会把 66GB 从头再传一遍
+        throw new Error('断点会话已失效（可能已被取消或过期），请取消该未完成上传后重新上传')
+      }
       upResumeDel(bucket, key)
       item.upload_id = ''
       item.tokenSig = ''
@@ -1823,8 +1987,8 @@ async function initiateUpload(item, token) {
 
 async function uploadOneChunked(item, token) {
   const file = item.file
-  const bucket = state.bucket || ''
-  const key = uploadTargetKey(file)
+  const bucket = item.pinned ? item.bucket : (state.bucket || '')
+  const key = item.pinned ? item.key : uploadTargetKey(file)
   item.bucket = bucket
   item.key = key
   const source_url = $('upSource').value.trim()
@@ -2635,6 +2799,13 @@ if (_upToken) {
   _upToken.addEventListener('input', () => { syncUploadGate(); schedulePendingRefresh() })
   _upToken.addEventListener('change', () => { syncUploadGate(); refreshPendingUploads() })
 }
+// 「继续上传」断点：隐藏 file input 只在用户点该行按钮后打开，选完立即校验并入队
+const _upResumeFile = $('upResumeFile')
+if (_upResumeFile) _upResumeFile.addEventListener('change', onResumeFilePicked)
+// 页面从后台/其它标签页切回来时刷新未完成列表，避免看到过期的「传输中」状态
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && uploadTokenValue()) refreshPendingUploads()
+})
 syncUploadGate()
 refreshPendingUploads()
 loadUploadConfig()    // 拉取 config.upload.*（分片大小/并发/超时），失败则用页面默认值

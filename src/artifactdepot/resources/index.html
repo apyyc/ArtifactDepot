@@ -52,7 +52,8 @@
         <button id="upBtn" data-action="do-upload" disabled title="请先填写令牌">上传</button>
       </div>
       <div class="muted" id="upTokenHint" style="margin-top:2px;">请先填写上方「令牌」，再选择文件或拖拽上传。</div>
-      <div class="muted" style="margin-top:4px;">上传到：<span id="upTarget">（当前 bucket + 位置）</span>。<br />支持多选，或把文件<strong>拖拽到页面任意位置</strong>，松手自动上传（上传前先校验令牌）。大于分片大小（默认 8MB）的文件自动多线程分片上传；失败或暂停不丢已传分片，失败行显示<strong>「失败（可续传）」</strong>，点该行<strong>「继续上传」</strong>只补缺失分片。<br />「暂停上传 / 继续上传」按钮只在对应任务的进度条右侧出现，暂停在当前分片传完后生效。<br />刷新页面后，当前令牌未完成的上传会列在下方，可手动取消；重新选择同一文件即可从断点续传（同一浏览器、同一令牌有效）。<br />下载大文件自动多线程分块：支持「另存为」的浏览器边下边写盘，其它浏览器在内存拼好后保存；进度弹窗可随时取消；下载参数由 config.json 的 download.* 决定。</div>
+      <input type="file" id="upResumeFile" style="display:none" />
+      <div class="muted" style="margin-top:4px;">上传到：<span id="upTarget">（当前 bucket + 位置）</span>。<br />支持多选，或把文件<strong>拖拽到页面任意位置</strong>，松手自动上传（上传前先校验令牌）。大于分片大小（默认 8MB）的文件自动多线程分片上传；失败或暂停不丢已传分片，失败行显示<strong>「失败（可续传）」</strong>，点该行<strong>「继续上传」</strong>只补缺失分片。<br />「暂停上传 / 继续上传」按钮只在对应任务的进度条右侧出现，暂停在当前分片传完后生效。<br />刷新页面或浏览器断开后，当前令牌未完成的上传会列在下方并标注「已中断（未在传输）」；点该行「继续上传」重新选择同一文件即可从断点续传，或「取消上传」清理服务端分片（同一浏览器、同一令牌有效）。<br />下载大文件自动多线程分块：支持「另存为」的浏览器边下边写盘，其它浏览器在内存拼好后保存；进度弹窗可随时取消；下载参数由 config.json 的 download.* 决定。</div>
       <!-- 上传队列行由 app.js 的 renderUpQueue() 渲染（严格 CSP：交互只用 data-action 事件委托）。
            分片任务运行中：<div class="up-item"><span class="nm">文件名</span><progress value="0" max="100"></progress>
              <span class="st">上传中…</span><button class="ghost up-act" data-action="pause-upload" data-uid="1">暂停上传</button>
@@ -61,13 +62,18 @@
            失败行结构示例：<div class="up-item"><span class="nm">文件名</span><progress value="0" max="100"></progress>
              <span class="st bad">失败（可续传）</span><button class="ghost up-act" data-action="retry-upload" data-uid="1">继续上传</button>
              <button class="ghost up-act" data-action="cancel-upload" data-uid="1">放弃</button></div>
-           未完成上传行（当前令牌、页面刷新后仍显示）：<div class="up-item pending"><span class="nm">文件名</span>
-             <progress value="0" max="100"></progress><span class="st">已传 4MB / 8MB（50%）</span>
-             <span class="muted pending-key">bucket / 目录/文件名</span>
-             <button class="ghost up-act" data-action="cancel-pending-upload" data-uid="&lt;upload_id&gt;">取消上传</button></div> -->
+           未完成上传行（当前令牌、页面刷新后仍显示；服务端断点，本页已无传输）：
+             <div class="up-item pending stalled"><span class="nm">文件名</span>
+              <progress value="0" max="100"></progress><span class="st">已传 4MB / 8MB（50%）</span>
+              <span class="pending-state">已中断（未在传输）</span>
+              <button class="ghost up-act" data-action="resume-pending-upload" data-uid="&lt;upload_id&gt;">继续上传</button>
+              <button class="ghost up-act" data-action="cancel-pending-upload" data-uid="&lt;upload_id&gt;">取消上传</button></div>
+             <div class="pending-sub"><span class="pending-key">保存位置：bucket / 目录/文件名</span>
+              <span class="pending-ago">最后活动：3 分钟前</span></div> -->
       <div id="upQueue"></div>
       <div id="upPendingWrap" style="display:none;margin-top:10px;">
         <div class="up-pending-head">未完成的上传（当前令牌）<span id="upPendingInfo" class="muted"></span></div>
+        <div class="muted up-pending-tip">这些是服务端保留的断点会话：页面刷新或浏览器断开后本页不会再传输（因此没有「暂停上传」）。点「继续上传」重新选择同一文件只补缺失分片，或「取消上传」删除服务端分片。列表每 8 秒刷新，其它页面/设备继续传输时会显示「最近有分片写入」。</div>
         <div id="upPending"></div>
       </div>
     </div>

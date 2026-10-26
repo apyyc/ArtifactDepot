@@ -353,7 +353,86 @@ def test_token_inputs_sync_across_tabs():
 
 
 # ===========================================================================
-# 7. 语法兜底（有 node 时校验 app.js）
+# 7. 刷新/断线后的断点会话：明确「已中断」并提供「继续上传」重新选文件续传
+# ===========================================================================
+
+def test_pending_rows_show_interrupted_state_and_last_activity():
+    """pending 行必须区分「最近有分片写入」与「已中断（未在传输）」，并显示最后活动时间。"""
+    html, js = _html(), _js()
+    assert 'id="upResumeFile"' in html
+    assert "up-pending-tip" in html
+    assert "idle_seconds" in js
+    assert "PENDING_ACTIVE_SECONDS" in js
+    assert "function pendingActivity(" in js
+    assert "function fmtAgo(" in js
+    render = _js_function(js, "renderPendingUploads")
+    assert "已中断（未在传输）" in render
+    assert "最近有分片写入" in render
+    assert "最后活动：" in render
+    assert "pending-state" in render
+    assert "pending-sub" in render
+    assert "pending-ago" in render
+    # 进度条仍显示已传字节，但状态文字不再让断点看起来像正在上传
+    assert "已传 " in render
+
+
+def test_pending_resume_reselects_same_file_and_pins_target():
+    """「继续上传」重新选择同一文件：校验名称/大小/指纹，固定会话 bucket/key，只补缺失分片。"""
+    js = _js()
+    assert "function resumePendingUpload(" in js
+    assert "function onResumeFilePicked(" in js
+    assert "addEventListener('change', onResumeFilePicked)" in js
+    pick = _js_function(js, "resumePendingUpload")
+    assert "input.click()" in pick
+    assert "resumePendingId" in pick and "resumePendingToken" in pick
+    # 最近仍有写入时先确认，避免与其它页面/设备重复上传
+    assert "confirmDialog(" in pick
+    picked = _js_function(js, "onResumeFilePicked")
+    for token in ("file.size", "file.name", "upResumeFindByUploadId",
+                  "lastModified", "item.pinned = true", "item.forcedChunked = true",
+                  "item.upload_id = it.upload_id", "item.bucket = it.bucket",
+                  "item.key = it.key", "processQueue()"):
+        assert token in picked, f"onResumeFilePicked 缺少 {token}"
+    # 续传必须把目标固定在会话的 bucket/key（不随当前浏览目录漂移）
+    init = _js_function(js, "initiateUpload")
+    assert "item.pinned ? item.bucket" in init and "item.pinned ? item.key" in init
+    chunked = _js_function(js, "uploadOneChunked")
+    assert "item.pinned ? item.bucket" in chunked and "item.pinned ? item.key" in chunked
+    process = _js_function(js, "processQueue")
+    assert "item.forcedChunked" in process and "if (!item.pinned)" in process
+    # 会话失效时不能悄悄新建会话重传 66GB
+    assert "断点会话已失效" in init
+    assert "item.pinned" in init
+
+
+def test_pending_list_polls_and_refreshes_when_visible_again():
+    """断点列表定时轮询（其它页面/设备继续传输时进度自动更新），页面重新可见时立即刷新。"""
+    js = _js()
+    assert "function startPendingPoll(" in js
+    assert "function stopPendingPoll(" in js
+    assert "setInterval(" in _js_function(js, "startPendingPoll")
+    assert "8000" in _js_function(js, "startPendingPoll")
+    assert "pendingPollTimer" in js
+    # 请求序号避免旧响应覆盖新状态
+    assert "pendingSeq" in js
+    assert "visibilitychange" in js
+    assert "document.visibilityState === 'visible'" in js
+    assert "refreshPendingUploads()" in js
+
+
+def test_pending_css_has_live_stalled_states():
+    """断点行样式：live/stalled 状态徽标、弱化进度条、第二行位置与最后活动。"""
+    css = _css()
+    assert ".up-item.pending.live .pending-state" in css
+    assert ".up-item.pending.stalled .pending-state" in css
+    assert ".up-item.pending.stalled progress" in css
+    assert ".pending-sub .pending-key" in css
+    assert ".pending-sub .pending-ago" in css
+    assert ".up-pending-tip" in css
+
+
+# ===========================================================================
+# 8. 语法兜底（有 node 时校验 app.js）
 # ===========================================================================
 
 def test_app_js_syntax_if_node_available():
