@@ -49,6 +49,12 @@ MANIFEST = ".warehouse.json"
 # 隐藏目录本身已被列表/目录统计/ZIP 跳过；批量删除与 rename 必须显式跳过，避免毁掉活跃上传。
 INTERNAL_UPLOAD_DIR = ".artifactdepot-uploads"
 
+# 目录签名链接打包产物目录名（隐藏）：
+#   <depot>/<bucket>/<目录>/.package/<link_id>/
+# 目录列表/目录大小统计/ZIP 打包均跳过隐藏目录；对象 key 校验禁止隐藏段，
+# 因此外部无法直接访问；下载只能通过目录签名链接解析到成品。
+PACKAGE_DIR = ".package"
+
 # 元数据文本字段上限：清单每次上传都整份重写，长文本会让清单膨胀、拖慢所有上传
 MAX_SOURCE_CHARS = 512   # 来源（source_url，允许非 URL 的自由文本说明）
 MAX_NOTE_CHARS = 200     # 备注（note）
@@ -495,6 +501,16 @@ def delete_object(bucket: str, key: str) -> dict:
         if visible:
             raise HTTPException(400,
                 detail=f"目录非空（含 {len(visible)} 项文件/子目录），不允许删除，请先清空")
+        # 删除目录前先作废该目录下的签名链接并清理 .package 产物（链接失效删包）
+        try:
+            from artifactdepot import packaging
+            packaging.prepare_delete(bucket, k, subtree=False)
+        except Exception:                          # noqa: BLE001 - 清理失败不阻断目录删除
+            logging.getLogger("artifactdepot").warning(
+                "删除目录前清理打包产物失败：%s/%s", bucket, k, exc_info=True)
+        pkg = p / PACKAGE_DIR
+        if pkg.is_dir():
+            shutil.rmtree(pkg, ignore_errors=True)
         # 删除隐藏占位 + 空目录
         for c in p.iterdir():
             try:
@@ -634,6 +650,15 @@ def bulk_delete(bucket: str, prefix: str = "", mode: str = "files",
                 "files": len(files), "dirs": len(dirs),
                 "bytes": sum(size for _, size in files), "errors": errors}
 
+    # 执行前：作废受影响的目录签名链接并清理 .package 产物
+    # （files 模式只动直接文件 → 只影响 prefix 目录本身的链接；all 模式影响整棵子树）
+    try:
+        from artifactdepot import packaging
+        packaging.prepare_delete(bucket, k, subtree=(mode == "all"))
+    except Exception:                              # noqa: BLE001 - 清理失败不阻断删除
+        logging.getLogger("artifactdepot").warning(
+            "批量删除前清理打包产物失败：%s/%s", bucket, k, exc_info=True)
+
     deleted_files = deleted_dirs = deleted_bytes = 0
     deleted_keys: list = []
     for path, size in files:
@@ -689,17 +714,19 @@ def bulk_delete(bucket: str, prefix: str = "", mode: str = "files",
 MAX_BULK_DOWNLOAD_ITEMS = 100000
 
 
-def bulk_download_scan(bucket: str, prefix: str = "") -> dict:
+def bulk_download_scan(bucket: str, prefix: str = "",
+                       max_items: int | None = None) -> dict:
     """只读扫描「一键下载」目标目录：返回可见文件/子目录清单与统计。
 
     供 API 层做「单文件直下 / ZIP」判定与 ZIP 打包，不修改任何数据：
     - 隐藏项（名字以 "." 开头，含 `.keep` / `.warehouse.json`）与符号链接全部跳过；
     - prefix 解析（含符号链接）后必须仍在 bucket 内，否则 400（防跨 bucket 读取）；
     - bucket / prefix 不存在或不是目录 → 404；没有任何可见内容 → 404；
-    - files + dirs 超过 MAX_BULK_DOWNLOAD_ITEMS → 400；
+    - files + dirs 超过 max_items（默认 MAX_BULK_DOWNLOAD_ITEMS）→ 400；
     - 输出顺序稳定：每层先子目录（深度优先）再本层文件；目录名不带结尾 "/"，
       由 zip 生成器统一拼接。entries 项：{"name", "path", "is_dir", "size"}。
     """
+    limit = MAX_BULK_DOWNLOAD_ITEMS if max_items is None else max(1, int(max_items))
     validate_bucket(bucket)
     k = validate_key(prefix)
     bdir = bucket_dir(bucket)
@@ -719,10 +746,10 @@ def bulk_download_scan(bucket: str, prefix: str = "") -> dict:
     counts = {"files": 0, "dirs": 0}
 
     def _check_limit() -> None:
-        if counts["files"] + counts["dirs"] > MAX_BULK_DOWNLOAD_ITEMS:
+        if counts["files"] + counts["dirs"] > limit:
             raise HTTPException(
                 400,
-                detail=f"目录过大（超过 {MAX_BULK_DOWNLOAD_ITEMS} 项），请缩小范围后再下载")
+                detail=f"目录过大（超过 {limit} 项），请缩小范围后再下载")
 
     def _walk(d: Path, rel: str) -> None:
         try:
@@ -831,6 +858,7 @@ def rename_object(bucket: str, key: str, new_key: str, overwrite: bool = False) 
     if not dst.is_relative_to(base):
         raise HTTPException(400, detail="new_key 越界")
 
+    src_is_dir = src.is_dir()
     src_dirs: list[Path] = []
     if src.is_file():
         if dst.exists() and not overwrite:
@@ -846,11 +874,21 @@ def rename_object(bucket: str, key: str, new_key: str, overwrite: bool = False) 
                     409, detail=f"目标已存在：{bucket}/{target.relative_to(base).as_posix()}")
             moves.append((path, target))
 
+    # 目标冲突检查通过后再暂停打包：目录重命名前先打断该前缀下未完成的打包任务并清掉
+    # 半成品；已完成的 .package 会随目录一起搬走，下面再同步链接 key。
+    if src_is_dir:
+        try:
+            from artifactdepot import packaging
+            packaging.prepare_rename(bucket, k)
+        except Exception:                          # noqa: BLE001 - 清理失败不阻断重命名
+            logging.getLogger("artifactdepot").warning(
+                "重命名前暂停目录打包失败：%s/%s", bucket, k, exc_info=True)
+
     try:
         for path, target in moves:
             target.parent.mkdir(parents=True, exist_ok=True)
             path.rename(target)
-        if src.is_dir():
+        if src_is_dir:
             for path in src_dirs:
                 try:
                     path.rmdir()
@@ -870,6 +908,12 @@ def rename_object(bucket: str, key: str, new_key: str, overwrite: bool = False) 
                 except OSError:
                     pass
                 target.rename(path)
+        if src_is_dir:
+            try:
+                from artifactdepot import packaging
+                packaging.resume_links(bucket, k)
+            except Exception:                      # noqa: BLE001
+                pass
         raise
 
     # 清单记录 key 前缀整体替换
@@ -885,6 +929,29 @@ def rename_object(bucket: str, key: str, new_key: str, overwrite: bool = False) 
             else:
                 new_manifest[mk] = mv
         _manifest_save(bucket, new_manifest)
+        # 目录签名链接：链接 key 跟随重命名/移动；成品包随目录一起搬走
+        if src_is_dir:
+            links = load_signed_links()
+            changed = False
+            for link in links:
+                if link.get("bucket") != bucket or link.get("kind") != "dir":
+                    continue
+                lk = (link.get("key") or "").strip("/")
+                if lk == k:
+                    link["key"] = nk
+                    changed = True
+                elif lk.startswith(prefix):
+                    link["key"] = nk + lk[len(k):]
+                    changed = True
+            if changed:
+                save_signed_links(links)
+    if src_is_dir:
+        try:
+            from artifactdepot import packaging
+            packaging.resume_links(bucket, nk)
+        except Exception:                          # noqa: BLE001
+            logging.getLogger("artifactdepot").warning(
+                "重命名后恢复目录打包失败：%s/%s", bucket, nk, exc_info=True)
     return {"bucket": bucket, "from_key": k, "to_key": nk, "moved_objects": len(moves)}
 
 
@@ -1012,6 +1079,8 @@ def load_signed_links() -> list:
     for link in links:
         if isinstance(link, dict):
             link["created_at"] = _ensure_utc_z(link.get("created_at", ""))
+            # 兼容旧数据：早期链接没有 kind 字段，一律按文件链接处理
+            link["kind"] = link.get("kind") or "file"
     return links
 
 
@@ -1021,9 +1090,11 @@ def save_signed_links(links: list) -> None:
 
 
 def create_signed_link(bucket: str, key: str, mode: str = "time",
-                       count: int = 1, expires: int = 3600, created_by: str = "") -> dict:
+                       count: int = 1, expires: int = 3600, created_by: str = "",
+                       kind: str = "file") -> dict:
     """创建签名链接。mode: count(按次数) / time(按时效) / permanent(永久，可作废)
 
+    kind: file=文件链接（默认）/ dir=目录打包链接（打包在后台完成，见 packaging.py）。
     次数与时效的上下限由 config.signed_links 配置（count_min/max、expire_min/max 秒）。"""
     validate_bucket(bucket)
     k = validate_key(key)
@@ -1031,6 +1102,9 @@ def create_signed_link(bucket: str, key: str, mode: str = "time",
         raise HTTPException(400, detail="key 不能为空")
     if mode not in ("count", "time", "permanent"):
         raise HTTPException(400, detail="mode 必须为 count / time / permanent")
+    kind = (kind or "file").strip().lower()
+    if kind not in ("file", "dir"):
+        raise HTTPException(400, detail="kind 必须为 file / dir")
 
     cfg = get_config().get("signed_links", {})
     count_min = int(cfg.get("count_min", 1) or 1)
@@ -1058,6 +1132,7 @@ def create_signed_link(bucket: str, key: str, mode: str = "time",
         "token": secrets.token_urlsafe(16),
         "bucket": bucket,
         "key": k,
+        "kind": kind,
         "mode": mode,
         "max_uses": count,
         "remaining": count,
@@ -1080,27 +1155,53 @@ def get_signed_link(link_id: str):
     return None
 
 
+def _signed_link_error(e: dict, secret: str, bucket: str, key: str, now: float) -> str:
+    """校验链接本体（不含消费），返回错误文本；有效返回 ""。"""
+    if e.get("revoked"):
+        return "链接已作废"
+    if not hmac.compare_digest(str(e.get("token") or ""), str(secret or "")):
+        return "链接无效"
+    if e.get("bucket") != bucket or e.get("key") != key:
+        return "链接与文件不符"
+    if e.get("mode") == "time" and now > (e.get("expires") or 0):
+        return "链接已过期"
+    if e.get("mode") == "count" and (e.get("remaining") or 0) <= 0:
+        return "链接次数已用完"
+    return ""
+
+
+def inspect_signed_link(link_id: str, secret: str, bucket: str, key: str):
+    """只校验不消费：返回 (ok, entry, error)。
+
+    用于目录链接下载前先确认成品是否就绪（避免「打包中」也消耗一次次数）。
+    """
+    now = time.time()
+    with state_lock():
+        for e in load_signed_links():
+            if e.get("id") == link_id:
+                err = _signed_link_error(e, secret, bucket, key, now)
+                return (not err, e if not err else None, err)
+    return False, None, "链接不存在"
+
+
 def consume_signed_link(link_id: str, secret: str, bucket: str, key: str):
     """校验并消费一个链接（count 模式递减剩余次数）。返回 (ok, actor, error)
 
     整段读-改-写在 state_lock 内完成，避免并发下载把按次数链接用超。
+    次数用完后记录 exhausted_at，供目录打包链接的清理逻辑按宽限期删包。
     """
+    now = time.time()
     with state_lock():
         links = load_signed_links()
         for e in links:
             if e.get("id") == link_id:
-                if e.get("revoked"):
-                    return False, "", "链接已作废"
-                if not hmac.compare_digest(str(e.get("token") or ""), str(secret or "")):
-                    return False, "", "链接无效"
-                if e.get("bucket") != bucket or e.get("key") != key:
-                    return False, "", "链接与文件不符"
-                if e.get("mode") == "time" and time.time() > (e.get("expires") or 0):
-                    return False, "", "链接已过期"
+                err = _signed_link_error(e, secret, bucket, key, now)
+                if err:
+                    return False, "", err
                 if e.get("mode") == "count":
-                    if (e.get("remaining") or 0) <= 0:
-                        return False, "", "链接次数已用完"
                     e["remaining"] = e["remaining"] - 1
+                    if e["remaining"] <= 0:
+                        e["exhausted_at"] = now
                     save_signed_links(links)
                 return True, e.get("created_by") or "", ""
         return False, "", "链接不存在"
@@ -1112,6 +1213,9 @@ def revoke_signed_link(link_id: str) -> bool:
         for e in links:
             if e.get("id") == link_id:
                 e["revoked"] = True
+                if not e.get("revoked_at"):
+                    e["revoked_at"] = time.time()
+                    e["revoked_at_iso"] = _utc_now_iso()
                 save_signed_links(links)
                 return True
         return False
