@@ -80,6 +80,35 @@ def test_reload_bad_json_keeps_old(cfg_env):
     assert config.get_config()["access_token"] == "from-env"   # 旧配置保留
 
 
+def test_package_settings_env_and_clamp(cfg_env, monkeypatch):
+    """目录打包配置：.env 点号嵌套 / 真实环境变量 / 整数夹紧 / 压缩方式回退。"""
+    config, _, env_file = cfg_env
+    env_file.write_text(
+        "package.max_items=7\n"
+        "package.zip_compression=deflate\n"
+        "signed_links.allow_directory=false\n", encoding="utf-8")
+    monkeypatch.setenv("ARTIFACT_DEPOT_PACKAGE_MAX_CONCURRENT_JOBS", "99")
+    monkeypatch.delenv("ARTIFACT_DEPOT_PACKAGE_ZIP_COMPRESSION", raising=False)
+    config._CONFIG = None
+    cfg = config.load_config()
+    assert cfg["package"]["max_items"] == 7
+    assert cfg["package"]["zip_compression"] == "deflate"
+    assert cfg["signed_links"]["allow_directory"] is False
+    s = config.get_package_settings()
+    assert s["max_items"] == 7
+    assert s["max_concurrent_jobs"] == 8          # 上限夹紧
+    assert s["zip_compression"] == "deflate"
+    pub = config.public_package_settings()
+    assert pub["allow_directory"] is False and pub["zip_compression"] == "deflate"
+
+    # 非法压缩方式：回退 stored，且配置体检给出提示
+    env_file.write_text("package.zip_compression=zip\n", encoding="utf-8")
+    monkeypatch.delenv("ARTIFACT_DEPOT_PACKAGE_MAX_CONCURRENT_JOBS", raising=False)
+    config._CONFIG = None
+    assert config.get_package_settings()["zip_compression"] == "stored"
+    assert any("package.zip_compression" in w for w in config.config_warnings())
+
+
 def test_config_reload_endpoint_admin_only(tmp_path, monkeypatch):
     import artifactdepot.config as config
     depot = tmp_path / "depot"

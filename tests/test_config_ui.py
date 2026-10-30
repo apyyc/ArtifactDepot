@@ -98,13 +98,16 @@ def test_snapshot_contains_schema_file_values_and_masked_secret(ctx):
     assert d["path"].endswith("cfg.json")
     assert d["exists"] is True
     assert d["groups"] == ["基础", "网络与安全", "界面", "上传",
-                           "下载", "签名链接", "系统/审计", "令牌"]
+                           "下载", "签名链接", "目录打包", "系统/审计", "令牌"]
     keys = {f["key"] for f in d["schema"]}
     assert {"depot_dir", "access_token", "upload.chunk_size_mb",
             "upload.session_cleanup_interval_seconds",
             "ui.file_page_size",
             "ui.audit_page_size", "download.chunk_size_mb",
-            "token.min_length", "token.max_length"} <= keys
+            "token.min_length", "token.max_length",
+            "signed_links.allow_directory",
+            "package.enabled", "package.max_items",
+            "package.zip_compression"} <= keys
     # 文件值 / 生效值都存在，密钥一律脱敏
     assert d["values"]["upload"]["chunk_size_mb"] == 8
     assert d["effective"]["upload"]["chunk_size_mb"] == 8

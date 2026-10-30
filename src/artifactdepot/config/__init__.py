@@ -55,6 +55,18 @@ DEFAULT = {
         "count_max": 10,
         "expire_min_seconds": 60,             # 最短时效（1 分钟）
         "expire_max_seconds": 604800,         # 最长时效（7 天）
+        "allow_directory": True,              # 是否允许为目录生成「打包签名链接」（下载时按需打包）
+    },
+    "package": {                              # 目录签名链接打包（包放在 <bucket>/<目录>/.package/）
+        "enabled": True,                      # 目录打包总开关（关闭后不再创建目录链接/不启动新打包）
+        "max_items": 100000,                  # 单次打包 files+dirs 上限（超限视为打包失败）
+        "max_total_mb": 0,                    # 单次打包源文件总大小上限（MB；0=不限）
+        "max_concurrent_jobs": 1,             # 同时进行的打包任务数（其余排队）
+        "zip_compression": "stored",          # stored=仅存储（快；默认）/ deflate=压缩（CPU 高）
+        "cleanup_interval_seconds": 600,      # 后台清理失效包的间隔（秒）
+        "cleanup_grace_seconds": 60,          # 链接失效后延迟删包的宽限期（秒，避免与在途下载竞争）
+        "delete_on_revoke": True,             # 作废链接时是否立即删包（否则等后台清理）
+        "cleanup_on_startup": True,           # 启动时清理失效/残留包，并恢复未完成的打包任务
     },
     "upload": {                               # 上传分片/并发/超时（改后即时生效，无需重启）
         "chunk_size_mb": 8,                   # 每片大小（1-64MB；服务端返回给前端/CLI）
@@ -233,6 +245,17 @@ _ENV_MAP = {
     # 新建 token 长度约束（支持 .env 点号写法与真实环境变量）
     "ARTIFACT_DEPOT_TOKEN_MIN_LENGTH": "token.min_length",
     "ARTIFACT_DEPOT_TOKEN_MAX_LENGTH": "token.max_length",
+    # 目录签名链接打包（支持 .env 点号写法与真实环境变量）
+    "ARTIFACT_DEPOT_SIGNED_LINKS_ALLOW_DIRECTORY": "signed_links.allow_directory",
+    "ARTIFACT_DEPOT_PACKAGE_ENABLED": "package.enabled",
+    "ARTIFACT_DEPOT_PACKAGE_MAX_ITEMS": "package.max_items",
+    "ARTIFACT_DEPOT_PACKAGE_MAX_TOTAL_MB": "package.max_total_mb",
+    "ARTIFACT_DEPOT_PACKAGE_MAX_CONCURRENT_JOBS": "package.max_concurrent_jobs",
+    "ARTIFACT_DEPOT_PACKAGE_ZIP_COMPRESSION": "package.zip_compression",
+    "ARTIFACT_DEPOT_PACKAGE_CLEANUP_INTERVAL_SECONDS": "package.cleanup_interval_seconds",
+    "ARTIFACT_DEPOT_PACKAGE_CLEANUP_GRACE_SECONDS": "package.cleanup_grace_seconds",
+    "ARTIFACT_DEPOT_PACKAGE_DELETE_ON_REVOKE": "package.delete_on_revoke",
+    "ARTIFACT_DEPOT_PACKAGE_CLEANUP_ON_STARTUP": "package.cleanup_on_startup",
     # 兼容旧前缀
     "WAREHOUSE_DIR": "depot_dir",
     "WAREHOUSE_META_DIR": "meta_dir",
@@ -431,6 +454,77 @@ def public_download_settings() -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# 目录签名链接打包（config.package.*）
+# ---------------------------------------------------------------------------
+
+_PACKAGE_INT_LIMITS = {
+    "max_items": (1, 1000000),
+    "max_total_mb": (0, 1048576),
+    "max_concurrent_jobs": (1, 8),
+    "cleanup_interval_seconds": (60, 86400),
+    "cleanup_grace_seconds": (0, 86400),
+}
+
+_PACKAGE_COMPRESSIONS = ("stored", "deflate")
+
+
+def _package_bool(raw: dict, key: str, default: bool) -> bool:
+    val = raw.get(key, default)
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, str):
+        return val.strip().lower() in ("1", "true", "yes", "on")
+    return bool(val)
+
+
+def get_package_settings() -> dict:
+    """返回归一化后的目录打包配置（config.json 的 package.*）。
+
+    每次调用都读当前配置，因此 `POST /api/config/reload` 后立即生效。
+    - 整数项按 _PACKAGE_INT_LIMITS 夹紧，非法值回退默认；
+    - zip_compression 只接受 stored / deflate，其它值回退 stored；
+    - 布尔项兼容 "true"/"1" 等字符串写法（手改 config.json 时更宽容）。
+    """
+    raw = get_config().get("package")
+    if not isinstance(raw, dict):
+        raw = {}
+    d = DEFAULT["package"]
+    out: dict = {}
+    for key, (lo, hi) in _PACKAGE_INT_LIMITS.items():
+        try:
+            val = int(raw.get(key, d[key]))
+        except (TypeError, ValueError):
+            val = int(d[key])
+        out[key] = max(lo, min(hi, val))
+    comp = str(raw.get("zip_compression", d["zip_compression"]) or "").strip().lower()
+    out["zip_compression"] = comp if comp in _PACKAGE_COMPRESSIONS else d["zip_compression"]
+    for key in ("enabled", "delete_on_revoke", "cleanup_on_startup"):
+        out[key] = _package_bool(raw, key, bool(d[key]))
+    return out
+
+
+def public_package_settings() -> dict:
+    """下发给网页/客户端的目录打包配置（不含任何密钥）。"""
+    s = get_package_settings()
+    signed_links = get_config().get("signed_links")
+    if not isinstance(signed_links, dict):
+        signed_links = {}
+    return {
+        "enabled": s["enabled"],
+        "allow_directory": _package_bool(
+            signed_links, "allow_directory",
+            bool(DEFAULT["signed_links"]["allow_directory"])),
+        "max_items": s["max_items"],
+        "max_total_mb": s["max_total_mb"],
+        "max_concurrent_jobs": s["max_concurrent_jobs"],
+        "zip_compression": s["zip_compression"],
+        "cleanup_interval_seconds": s["cleanup_interval_seconds"],
+        "cleanup_grace_seconds": s["cleanup_grace_seconds"],
+        "delete_on_revoke": s["delete_on_revoke"],
+    }
+
+
 # 网页分页合法区间（越界夹紧；只影响前端查询条数）
 _UI_INT_LIMITS = {
     "file_page_size": (10, 1000),
@@ -554,6 +648,12 @@ def config_warnings(cfg: dict | None = None) -> list:
             out.append("signed_links.expire_min_seconds/expire_max_seconds 配置不合法")
     except (TypeError, ValueError):
         out.append("signed_links 配置项不是整数")
+    # 目录打包配置：压缩方式必须可识别（非法值会回退 stored，但启动时提醒）
+    pkg_cfg = cfg.get("package")
+    if isinstance(pkg_cfg, dict):
+        comp = str(pkg_cfg.get("zip_compression", "stored") or "").strip().lower()
+        if comp not in _PACKAGE_COMPRESSIONS:
+            out.append("package.zip_compression 只能是 stored 或 deflate（当前值已回退 stored）")
     # staging 目录（伴随文件落盘位置）不可写 → 分片会话/框架 spool 都会失败，启动前提示
     try:
         staging = get_staging_dir(cfg)
@@ -579,7 +679,7 @@ def config_warnings(cfg: dict | None = None) -> list:
 # ---------------------------------------------------------------------------
 
 CONFIG_GROUPS = ("基础", "网络与安全", "界面", "上传", "下载", "签名链接",
-                 "系统/审计", "令牌")
+                 "目录打包", "系统/审计", "令牌")
 
 _MASKED_SECRET = "********"
 
@@ -624,6 +724,29 @@ _CONFIG_FIELD_META = {
                                         "type": "int", "min": 1, "max": 31536000},
     "signed_links.expire_max_seconds": {"label": "签名链接最长时效（秒）", "group": "签名链接",
                                         "type": "int", "min": 1, "max": 31536000},
+    "signed_links.allow_directory": {"label": "允许目录打包链接", "group": "签名链接",
+                                     "type": "bool",
+                                     "desc": "开启后可对目录生成签名链接；关闭后目录链接返回 403"},
+    "package.enabled": {"label": "启用目录打包", "group": "目录打包", "type": "bool",
+                        "desc": "总开关；关闭后不再创建目录链接、不启动新的打包任务"},
+    "package.max_items": {"label": "单次打包最大项数", "group": "目录打包", "type": "int",
+                          "desc": "目录内 files + dirs 超过该值视为打包失败（默认 100000）"},
+    "package.max_total_mb": {"label": "单次打包源文件上限（MB）", "group": "目录打包",
+                             "type": "int",
+                             "desc": "0=不限；打包会在源目录内复制一份，建议按磁盘余量设置"},
+    "package.max_concurrent_jobs": {"label": "同时打包任务数", "group": "目录打包",
+                                    "type": "int", "desc": "超出的任务排队等待"},
+    "package.zip_compression": {"label": "ZIP 压缩方式", "group": "目录打包", "type": "string",
+                                "desc": "stored=仅存储（快，默认）/ deflate=压缩（更小但更耗 CPU）"},
+    "package.cleanup_interval_seconds": {"label": "失效包清理间隔（秒）", "group": "目录打包",
+                                         "type": "int"},
+    "package.cleanup_grace_seconds": {"label": "失效后删包宽限期（秒）", "group": "目录打包",
+                                      "type": "int",
+                                      "desc": "链接失效后再等待这么久才删包，避免与在途下载竞争"},
+    "package.delete_on_revoke": {"label": "作废时立即删包", "group": "目录打包", "type": "bool",
+                                 "desc": "关闭则等到后台清理周期再删"},
+    "package.cleanup_on_startup": {"label": "启动时清理/恢复", "group": "目录打包", "type": "bool",
+                                   "desc": "启动时清理失效包与残留半成品，并恢复未完成的打包任务"},
     "upload.chunk_size_mb": {"label": "分片大小（MB）", "group": "上传", "type": "int"},
     "upload.chunk_concurrency": {"label": "每文件分片并发", "group": "上传", "type": "int"},
     "upload.file_concurrency": {"label": "同时上传文件数", "group": "上传", "type": "int"},
@@ -662,6 +785,7 @@ def _field_limits(path: str, meta: dict):
     """返回整数字段的 (min, max)；优先用 upload/download/ui 的夹紧区间。"""
     for prefix, table in (("upload.", _UPLOAD_INT_LIMITS),
                           ("download.", _DOWNLOAD_INT_LIMITS),
+                          ("package.", _PACKAGE_INT_LIMITS),
                           ("ui.", _UI_INT_LIMITS)):
         if path.startswith(prefix):
             key = path[len(prefix):]
@@ -707,6 +831,8 @@ def _group_for_path(path: str) -> str:
         return "下载"
     if path.startswith("signed_links."):
         return "签名链接"
+    if path.startswith("package."):
+        return "目录打包"
     if path.startswith("ui."):
         return "界面"
     return "基础"
@@ -900,6 +1026,11 @@ def _validate_merged_config(cfg: dict) -> None:
             raise ConfigError("签名链接最多次数不能小于最少次数")
         if emax < emin:
             raise ConfigError("签名链接最长时效不能小于最短时效")
+    pkg = cfg.get("package")
+    if isinstance(pkg, dict):
+        comp = str(pkg.get("zip_compression", "stored") or "").strip().lower()
+        if comp not in _PACKAGE_COMPRESSIONS:
+            raise ConfigError("package.zip_compression 只能是 stored 或 deflate")
     up = cfg.get("upload")
     if isinstance(up, dict):
         try:

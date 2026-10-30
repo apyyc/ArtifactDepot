@@ -21,7 +21,19 @@
     "count_min": 1,
     "count_max": 10,
     "expire_min_seconds": 60,
-    "expire_max_seconds": 604800
+    "expire_max_seconds": 604800,
+    "allow_directory": true
+  },
+  "package": {
+    "enabled": true,
+    "max_items": 100000,
+    "max_total_mb": 0,
+    "max_concurrent_jobs": 1,
+    "zip_compression": "stored",
+    "cleanup_interval_seconds": 600,
+    "cleanup_grace_seconds": 60,
+    "delete_on_revoke": true,
+    "cleanup_on_startup": true
   },
   "upload": {
     "chunk_size_mb": 8,
