@@ -1,6 +1,6 @@
 # ArtifactDepot
 
-ArtifactDepot 是一个基于 FastAPI 的对象存储式工件仓库（S3 风格 bucket/key 模型），用于收存处理产物（视频、文件等）。它提供上传（含大文件分片与断点续传）、目录管理、Range 分块下载、一键下载目录、签名链接、审计与可观测能力，并自带网页控制台和桌面客户端。业务 JSON 数据由 DataHub 维护，本服务只负责文件存储，不承担业务逻辑。
+ArtifactDepot 是一个基于 FastAPI 的对象存储式工件仓库（S3 风格 bucket/key 模型），用于收存处理产物（视频、文件等）。它提供上传（含大文件分片与断点续传）、目录管理、Range 分块下载、一键下载目录、签名链接、审计与可观测能力，并自带网页控制台和桌面客户端。本服务只负责文件存储，不承担业务逻辑。
 
 版本号以 [VERSION](VERSION) 为唯一来源（当前 0.10.0）。
 
@@ -31,7 +31,7 @@ ArtifactDepot 是一个基于 FastAPI 的对象存储式工件仓库（S3 风格
   - 处理端（如 carryvideo）处理完成后通过 HTTP 接口推送产物。
   - 协作平台与用户在网页或桌面客户端中浏览、上传、下载产物。
   - 需要临时分享单个文件时，生成按时效、按次数或永久的签名链接。
-- **不负责**：业务 JSON 数据与账号体系。用户 token 由 DataHub 提供权威数据，本服务仅保存同步副本；服务不承担业务逻辑，也不是分布式对象存储。
+- **不负责**：业务 JSON 数据与账号体系。用户 token 由本服务在本地维护注册表；服务不承担业务逻辑，也不是分布式对象存储。
 
 ## 核心功能
 
@@ -44,11 +44,11 @@ ArtifactDepot 是一个基于 FastAPI 的对象存储式工件仓库（S3 风格
 | 目录管理 | 新建目录、重命名与移动、删除（仅允许空目录）、批量删除目录内容（`files` / `all`，执行时需输入目录名确认） |
 | 一键下载目录 | 目录内只有 1 个可见文件且没有可见子目录时直接下载；其余非空情况（多文件或含子目录）流式打包 ZIP，不写临时文件 |
 | 签名链接 | 按时效（秒）、按次数（1 至上限）或永久；可作废；上下限由配置控制 |
-| 身份与权限 | 管理员共享 token 拥有全部权限；用户 token 可从 23 个权限点与 9 种角色预设中组合，并可限定 bucket、路径前缀与过期时间 |
+| 身份与权限 | 管理员共享 token 拥有全部权限；用户 token 可从 22 个权限点与 9 种角色预设中组合，并可限定 bucket、路径前缀与过期时间 |
 | 审计与可观测 | 上传、下载、删除、建目录、改名、签名、Token 变更等操作写入 JSONL 审计（客户端 IP、UTC，配置可信代理时另记解析出的公网 IP）；提供 `/metrics`、`/health/live`、`/health/ready` 与 `X-Request-ID` |
 | 网页控制台 | 浏览、签名链接、Token 管理、审计、配置五个标签页；拖拽上传、上传队列暂停与继续、分块并发下载、批量删除、在线修改配置 |
 | 桌面客户端 | tkinter 桌面客户端（`artifactdepot_gui.py` 与 `artifactdepot_upload.py`），覆盖上传（分片、暂停、续传）与下载（分块并发、暂停、续传）及管理工作流；另提供仅上传的 CLI 模式 |
-| Token 同步 | 从 DataHub `users.json` 拉取用户 token，本地副本只增不删 |
+| Token 管理 | 本地维护 token 注册表，按权限点生成、更新与移除 |
 | 部署 | 单镜像（Podman / Docker）与三卷分离（config、data、state）；构建脚本自动导出 tar，部署脚本配置自启 |
 
 ## 技术栈
@@ -67,7 +67,7 @@ ArtifactDepot 是一个基于 FastAPI 的对象存储式工件仓库（S3 风格
 服务端按职责分为四层：
 
 - **接入层** `src/artifactdepot/api/`：`objects.py` 提供对象与分片上传接口，`system.py` 提供健康检查、bucket、Token、审计与配置接口，`docs.py` 提供文档读取接口；网页路由位于 `web/ui.py`。
-- **存储引擎** `src/artifactdepot/storage.py`：负责 bucket/key 落盘、路径校验、元数据清单、签名链接与 token 注册表、审计、DataHub 同步、分片会话与过期清理；流式 ZIP 由 `zipstream.py` 实现。
+- **存储引擎** `src/artifactdepot/storage.py`：负责 bucket/key 落盘、路径校验、元数据清单、签名链接与 token 注册表、审计、分片会话与过期清理；流式 ZIP 由 `zipstream.py` 实现。
 - **配置与认证**：`config/` 负责多层配置合并、校验与热加载；`auth.py` 负责令牌解析与校验；`permissions.py` 定义权限点与角色预设。
 - **可观测性**：`observability.py` 提供请求 ID、访问日志与指标；健康检查接口位于 `api/system.py`，日志脱敏由 `logging_utils.py` 负责。
 
@@ -76,7 +76,7 @@ ArtifactDepot 是一个基于 FastAPI 的对象存储式工件仓库（S3 风格
 1. 处理端通过 `POST /api/objects` 或分片接口（`initiate`、`chunk`、`complete`）推送产物，请求携带 token。
 2. 文件写入 `<depot_dir>/<bucket>/<key>`，对象元数据写入同 bucket 的 `.warehouse.json`，审计记录追加到 `<meta_dir>/audit.log`。
 3. 浏览器或桌面客户端通过网页与 API 浏览、下载；下载前可用 `HEAD` 探测，随后按 Range 分块并发获取。
-4. 用户 token 由 DataHub 同步到 `<meta_dir>/tokens.json`，用于操作者识别与权限判定。
+4. 用户 token 由本地注册表 `<meta_dir>/tokens.json` 维护，用于操作者识别与权限判定。
 
 存储布局：
 
@@ -91,7 +91,7 @@ ArtifactDepot 是一个基于 FastAPI 的对象存储式工件仓库（S3 风格
                                      # 旧版会话与 multipart spool 临时文件
 
 <meta_dir>/                          # 留空时位于 depot_dir 根下
-├── tokens.json                      # token 与用户名映射（DataHub 同步副本）
+├── tokens.json                      # token 与用户名映射（本地注册表）
 ├── signed_links.json                # 签名链接注册表
 └── audit.log                        # 审计日志（JSONL，自动轮转）
 ```
@@ -136,7 +136,6 @@ ArtifactDepot/
 | Python | 3.10 及以上（代码使用 PEP 604 联合类型注解）；容器镜像固定 `python:3.12-alpine` |
 | 运行依赖 | 见 [requirements.txt](requirements.txt)，与镜像内安装版本一致 |
 | 容器运行时 | Podman 或 Docker（仅构建与容器部署需要） |
-| 外围服务 | DataHub（用户 token 权威源，默认 `http://127.0.0.1:8002/api/data`）；不可达时只影响用户 token 同步，管理员 token 不受影响 |
 | 端口与网络 | 默认监听 `0.0.0.0:8004`；容器部署默认使用 host 网络 |
 | 磁盘 | `depot_dir` 与 `meta_dir` 所在卷需容纳全部产物；分片上传的临时会话与业务文件同卷 |
 
@@ -217,9 +216,9 @@ PYTHONPATH=src .venv/bin/python -m uvicorn artifactdepot.main:app --host 0.0.0.0
 | `<部署根>/state/` | `/data/state` | `tokens.json`、`signed_links.json`、`audit.log` |
 
 - 默认部署根为 `~/SERVER/artifactdepot`；默认目录不可写时，`config`、`data`、`state` 会分别回退到 `${XDG_DATA_HOME:-~/.local/share}/artifactdepot/{config,data,state}`。可用 `--deploy-root` 或环境变量 `DEPLOY_ROOT` 修改；显式指定的目录不可写时脚本直接报错。
-- 默认使用 host 网络，容器内 `127.0.0.1` 即宿主机，便于连接同机 DataHub；`--port-map` 改为端口映射，`--network-host` 显式指定 host 网络。
+- 默认使用 host 网络，容器内 `127.0.0.1` 即宿主机；`--port-map` 改为端口映射，`--network-host` 显式指定 host 网络。
 - 自启方式：Podman 生成 systemd user 服务（`--no-systemd` 跳过），Docker 使用 `--restart=always`。
-- 管理员令牌与 DataHub 地址：编辑 `<部署根>/config/config.json`（首次部署已用生产模板播种）或同目录 `.env` 中的 `access_token`、`datahub_url`，然后重启容器（`podman restart artifactdepot` 或 `docker restart artifactdepot`）。脚本接受的 `--token`、`--datahub-url` 参数当前不会传入容器，见「已知问题」。
+- 管理员令牌：编辑 `<部署根>/config/config.json`（首次部署已用生产模板播种）或同目录 `.env` 中的 `access_token`，然后重启容器（`podman restart artifactdepot` 或 `docker restart artifactdepot`）。脚本接受的 `--token` 参数当前不会传入容器，见「已知问题」。
 - 其他参数：`--data-dir`、`--state-dir`、`--config-dir`、`--config <文件>`、`--meta-dir`、`--no-volume`、`--stop`、`--rm`。
 
 ### 首次使用
@@ -230,7 +229,7 @@ PYTHONPATH=src .venv/bin/python -m uvicorn artifactdepot.main:app --host 0.0.0.0
 4. 管理：新建目录；删除文件或空目录；需要清空目录时使用「清空本目录文件」或「删除本目录全部内容」，先预览再输入目录名确认（bucket 根目录输入 bucket 名）。
 5. 下载：单个文件自动分块并发下载，可取消；「下载本目录」在仅有 1 个可见文件且没有子目录时直接下载，否则打包 ZIP。
 6. 分享：为文件生成按时效、按次数或永久的签名链接。
-7. 管理员：在「Token 管理」中生成、更新、同步 token，在「审计」中查询记录，在「配置」中在线修改配置。
+7. 管理员：在「Token 管理」中生成、更新、移除 token，在「审计」中查询记录，在「配置」中在线修改配置。
 8. 接口调试：`/docs`（Swagger UI）与 `/redoc`（ReDoc），文档原文可从 `/api/docs` 获取。
 9. 桌面客户端：`cd client && ./run.sh`，用法见 [client/README.md](client/README.md)。
 
@@ -262,8 +261,6 @@ PYTHONPATH=src .venv/bin/python -m uvicorn artifactdepot.main:app --host 0.0.0.0
 |---|---|---|
 | `depot_dir` | `./depot` | 对象存储根目录；容器部署使用 `/data/depot` |
 | `meta_dir` | `""` | 状态文件目录；留空表示放在 `depot_dir` 根下，生产建议 `/data/state` |
-| `datahub_url` | `http://127.0.0.1:8002/api/data` | 用户 token 同步地址 |
-| `datahub_sync_interval_seconds` | `60` | 惰性同步的最小间隔，`0` 表示每次都拉取 |
 | `host` / `port` | `0.0.0.0` / `8004` | 监听地址与端口 |
 | `access_token` | `admin` | 管理员共享令牌；生产环境必须替换为至少 16 位随机串 |
 | `max_upload_mb` | `0` | 单文件上传上限（MB），`0` 表示不限 |
@@ -291,7 +288,6 @@ PYTHONPATH=src .venv/bin/python -m uvicorn artifactdepot.main:app --host 0.0.0.0
 |---|---|
 | `ARTIFACT_DEPOT_CONFIG` / `ARTIFACT_DEPOT_ENV` | 配置文件与 `.env` 文件路径 |
 | `ARTIFACT_DEPOT_DIR` / `ARTIFACT_DEPOT_META_DIR` | `depot_dir` / `meta_dir` |
-| `ARTIFACT_DEPOT_DATAHUB_URL` / `ARTIFACT_DEPOT_DATAHUB_SYNC_INTERVAL_SECONDS` | `datahub_url` 与同步间隔 |
 | `ARTIFACT_DEPOT_ACCESS_TOKEN` / `ARTIFACT_DEPOT_PORT` / `ARTIFACT_DEPOT_MAX_UPLOAD_MB` | 共享令牌、端口与上传上限 |
 | `ARTIFACT_DEPOT_UPLOAD_*` | `upload.*` 各项，例如 `ARTIFACT_DEPOT_UPLOAD_CHUNK_SIZE_MB` |
 | `ARTIFACT_DEPOT_DOWNLOAD_*` | `download.*` 各项，例如 `ARTIFACT_DEPOT_DOWNLOAD_CHUNK_CONCURRENCY` |
@@ -314,7 +310,7 @@ PYTHONPATH=src .venv/bin/python -m uvicorn artifactdepot.main:app --host 0.0.0.0
 |---|---|
 | 浏览 | bucket 选择与目录导航、分页加载、拖拽上传、上传队列（暂停、继续、取消、断点续传）、单文件下载（分块并发、进度与速度、取消）、下载目录、新建目录、删除与批量删除、签名链接入口 |
 | 签名链接 | 查看全部链接、复制、作废 |
-| Token 管理 | 查看注册表、按权限点生成 token、更新与移除、从 DataHub 同步、重新加载配置 |
+| Token 管理 | 查看注册表、按权限点生成 token、更新与移除、重新加载配置 |
 | 审计 | 按 bucket、key、操作者、起始时间查询 |
 | 配置 | 展示配置项分组与生效来源，在线修改并热加载 |
 
@@ -347,7 +343,7 @@ cd client
 | 分片上传 | `POST /api/objects/initiate`、`chunk`、`complete`、`abort`（`upload:initiate`、`upload:chunk`、`upload:complete`、`upload:abort`）；`GET /api/objects/uploads` 为网页使用的内部接口，不进入 OpenAPI |
 | 签名链接 | `POST /api/objects/presign`（`link:create`）、`GET /api/objects/signed-links`（`link:list`）、`POST /api/objects/signed-links/{link_id}/revoke`（`link:revoke`）、`GET /api/objects/signed-links/config`（公开） |
 | Bucket | `GET /api/buckets`（公开或 `bucket:list`）、`POST /api/buckets`（`bucket:create`） |
-| Token | `/api/tokens`（`GET` 需 `token:read`，`POST` 与 `PUT /api/tokens/{value}` 需 `token:write`，`DELETE` 需 `token:delete`）、`POST /api/tokens/sync`（`token:sync`） |
+| Token | `/api/tokens`（`GET` 需 `token:read`，`POST` 与 `PUT /api/tokens/{value}` 需 `token:write`，`DELETE` 需 `token:delete`） |
 | 系统与配置 | `/health`、`/health/live`、`/health/ready`、`/metrics`、`GET /api/auth/check`、`GET /api/auth/permissions`、`GET /api/audit`（`audit:read`）、`GET`/`POST /api/config`、`POST /api/config/reload`（`config:write`） |
 | 文档与页面 | `GET /api/docs`、`GET /api/docs/{name}`（`?raw=1` 返回纯文本）；`/`（网页控制台）、`/docs`、`/redoc`、`/openapi.json` |
 
@@ -448,7 +444,7 @@ cd <ArtifactDepot 仓库目录>
 ./deploy_container.sh
 ```
 
-5. 首次部署后编辑 `<部署根>/config/config.json`，设置 `access_token` 与 `datahub_url`，然后重启容器。
+5. 首次部署后编辑 `<部署根>/config/config.json`，设置 `access_token`，然后重启容器。
 
 升级时挂载目录不变，重新导入镜像并再次执行 `deploy_container.sh` 即可原地沿用配置与数据。部署脚本不构建镜像；镜像标签取自 [VERSION](VERSION)，也可用环境变量 `IMAGE_TAG` 覆盖。
 
@@ -461,7 +457,7 @@ cd <ArtifactDepot 仓库目录>
 | 指标 | `GET /metrics`（Prometheus 文本格式，`metrics_enabled=false` 时返回 404） |
 | 审计日志 | `<meta_dir>/audit.log`，JSONL，权限 600，按 `audit_max_mb` 轮转 |
 | 应用日志 | 本地运行写入 `logs/artifactdepot.log`；容器内由 supervisor 写入 `/tmp/artifactdepot.out.log`，可用 `podman exec artifactdepot cat /tmp/artifactdepot.out.log` 查看 |
-| 生产诊断 | `bash check_ad_sync.sh [容器名]`，检查容器状态、挂载、环境变量、配置、DataHub 连通性与 token 同步 |
+| 生产诊断 | `bash check_ad_sync.sh [容器名]`，检查容器状态、挂载、环境变量、配置、健康检查与端口连通性 |
 
 ### 备份与迁移
 
@@ -471,18 +467,17 @@ cd <ArtifactDepot 仓库目录>
 ### 运行约束
 
 - 分片上传的会话注册表保存在进程内，启动时从数据盘扫描重建，因此服务以单进程运行（镜像内 supervisor 启动单个 uvicorn，未启用 `--workers`），也不要让多个实例共用同一 `depot_dir`。
-- DataHub 不可达时用户 token 同步失败，管理员共享 token 仍可正常使用。
 - [sync_artifacts.sh](sync_artifacts.sh) 是通用的 rsync 产物同步脚本，目标地址需在 [sync_artifacts.conf](sync_artifacts.conf) 中按实际环境填写。
 
 ### 已知问题
 
-- [deploy_container.sh](deploy_container.sh) 接受 `--token`、`--datahub-url` 参数以及 `ARTIFACT_DEPOT_ACCESS_TOKEN`、`ARTIFACT_DEPOT_DATAHUB_URL` 环境变量，但当前版本只解析、未注入容器（脚本帮助文本仍描述为经临时 env-file 注入）。请改用 `<部署根>/config/config.json` 或同目录 `.env` 配置后再重启容器。
+- [deploy_container.sh](deploy_container.sh) 接受 `--token` 参数以及 `ARTIFACT_DEPOT_ACCESS_TOKEN` 环境变量，但当前版本只解析、未注入容器（脚本帮助文本仍描述为经临时 env-file 注入）。请改用 `<部署根>/config/config.json` 或同目录 `.env` 配置后再重启容器。
 
 ## 安全说明
 
 - **令牌**：默认共享令牌 `admin` 仅用于内网开箱即用，生产环境必须替换为至少 16 位随机串；弱令牌会在启动时告警，设置 `ARTIFACT_DEPOT_STRICT_CONFIG=1` 时会拒绝启动。
 - **传输**：优先使用 `Authorization: Bearer` 传递令牌，访问日志会将 `token`、`tk`、`sig` 等参数脱敏。服务本身不内置 TLS 终止，跨网或公网访问应置于反向代理或网关之后。
-- **权限**：23 个权限点与 9 种角色预设；写操作需要对应的权限点与资源范围；目录仅允许为空时删除；批量删除必须输入目录名确认；`config:write` 不能轮换 `access_token`。
+- **权限**：22 个权限点与 9 种角色预设；写操作需要对应的权限点与资源范围；目录仅允许为空时删除；批量删除必须输入目录名确认；`config:write` 不能轮换 `access_token`。
 - **读接口**：`/api/buckets` 与 `/api/objects/list` 默认匿名可读，适用于内网部署；需要限制读取时设置 `require_read_token=true`，并通过 token 授予 `bucket:list` 与 `object:list`。`/api/objects/head` 与 `/api/objects/download` 始终需要 token 或签名链接。
 - **审计**：上传、下载、删除、建目录、改名、签名、Token 变更等操作均写入审计，记录操作者、客户端 IP（配置可信代理时另记解析出的公网 IP）、UTC 时间、大小与 SHA-256。
 - **数据保护**：状态文件原子写且权限为 600；路径穿越与隐藏路径有防护；`.artifactdepot-uploads` 不会被列表、打包或批量删除破坏。
@@ -495,9 +490,9 @@ cd <ArtifactDepot 仓库目录>
 
 | 现象 | 原因与解决 |
 |---|---|
-| 上传或下载提示「无效的访问令牌」 | token 未登记、已过期或已禁用；先用 `GET /api/auth/check` 自测，必要时从 DataHub 同步或在「Token 管理」中重建 |
+| 上传或下载提示「无效的访问令牌」 | token 未登记、已过期或已禁用；先用 `GET /api/auth/check` 自测，必要时在「Token 管理」中重建 |
 | 默认 `admin` 令牌能否直接使用 | 仅适用于内网联调；生产环境必须替换为强随机串 |
-| 部署后如何设置管理员令牌与 DataHub 地址 | 编辑 `<部署根>/config/config.json`（或同目录 `.env`）中的 `access_token`、`datahub_url`，再执行 `podman restart artifactdepot` 或 `docker restart artifactdepot` |
+| 部署后如何设置管理员令牌 | 编辑 `<部署根>/config/config.json`（或同目录 `.env`）中的 `access_token`，再执行 `podman restart artifactdepot` 或 `docker restart artifactdepot` |
 | 一次下载出现多条审计 | 分块并发下载对每个 Range 请求各写一条 `download` 审计（`partial=true`，`size` 为区间字节数）；`HEAD` 记为 `head=true` 且 `size=0`；完整 GET 只有一条 |
 | 下载返回 416 | 请求区间越界，或下载期间对象被替换导致大小变化；重新 `HEAD` 探测后再下载 |
 | 网页下载没有分块并发 | 浏览器不支持 File System Access 且文件超过 1 GiB、服务端未返回 `Accept-Ranges` 或忽略 Range 时，会回退为原生单流下载，属于预期行为 |
@@ -511,7 +506,6 @@ cd <ArtifactDepot 仓库目录>
 | 删除或批量删除提示权限不足 | 缺少 `object:delete` 或 `object:delete_bulk` 权限点，且资源范围需覆盖目标 bucket 与前缀；由管理员在「Token 管理」中勾选 |
 | 审计时间为 UTC 或公网 IP 为空 | 审计统一记录 UTC，前端会转换为浏览器本地时间；公网 IP 仅在直连方命中 `trusted_proxies` 时从 `X-Forwarded-For` 解析，未配置或无代理时为空 |
 | 启动报 `No module named uvicorn` | 当前解释器缺少运行依赖；按「安装」创建虚拟环境并安装 `requirements.txt` |
-| 容器访问不到宿主机 8002 端口 | 桥接网络下容器访问宿主机发布端口常不通；默认 host 网络即可解决，`datahub_url` 使用 `http://127.0.0.1:8002/api/data` |
 
 ## 许可证与支持
 

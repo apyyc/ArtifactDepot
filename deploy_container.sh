@@ -20,10 +20,8 @@
 #   - 加 --no-volume 可跳过全部挂载（用镜像内数据，删除容器即丢失，仅调试用）
 #   - meta_dir 默认指向状态卷 /data/state；可用 --meta-dir 显式覆盖
 #
-# 仓库令牌 / DataHub 地址：
+# 仓库令牌：
 #   - token：--token <值> 或环境变量 ARTIFACT_DEPOT_ACCESS_TOKEN
-#   - datahub_url：--datahub-url <地址> 或环境变量 ARTIFACT_DEPOT_DATAHUB_URL；
-#     不传时**不注入环境变量**，以配置文件里的 datahub_url 为准。
 #
 # 用法：
 #   ./deploy_container.sh                            # 默认 host 网络 + 自启
@@ -31,7 +29,7 @@
 #   ./deploy_container.sh --data-dir /data/ad-data           # 单独指定业务数据目录
 #   ./deploy_container.sh --config-dir /etc/artifactdepot    # 单独指定配置目录
 #   ./deploy_container.sh --config ~/ad-config.json          # 只挂单个 config.json
-#   ./deploy_container.sh --token xxx --datahub-url http://ip:8002/api/data
+#   ./deploy_container.sh --token xxx
 #   ./deploy_container.sh --meta-dir /data/state             # 显式覆盖 meta_dir
 #   ./deploy_container.sh --port-map                 # 改用端口映射
 #   ./deploy_container.sh --no-systemd               # 只建容器，不配自启
@@ -113,9 +111,8 @@ META_DIR_CONTAINER=""
 USER_VOLUME_MAPS="${VOLUME_MAPS:-}"
 VOLUME_MAPS=()
 
-# 仓库令牌与 DataHub 地址（可用 --token / --datahub-url 覆盖，也可用环境变量）
+# 仓库令牌（可用 --token 覆盖，也可用环境变量）
 ARTIFACT_DEPOT_TOKEN="${ARTIFACT_DEPOT_ACCESS_TOKEN:-}"
-DATAHUB_URL="${ARTIFACT_DEPOT_DATAHUB_URL:-}"
 
 SERVICE_NAME="container-${CONTAINER_NAME}"
 SYSTEMD_DIR="${HOME}/.config/systemd/user"
@@ -139,7 +136,6 @@ usage() {
   --config <文件>        只挂载单个 config.json（覆盖 --config-dir）
   --meta-dir <容器内路径> 显式覆盖容器内 meta_dir
   --token <值>           注入 ARTIFACT_DEPOT_ACCESS_TOKEN（经临时 env-file，不出现在命令行）
-  --datahub-url <地址>   注入 ARTIFACT_DEPOT_DATAHUB_URL
   --no-volume            不挂载任何卷（数据随容器删除，仅调试用）
   --port-map             使用端口映射（默认 host 网络）
   --network-host         使用 host 网络（默认）
@@ -154,7 +150,6 @@ usage() {
   VOLUME_MAPS                   额外挂载，空格分隔的 host:container 列表
   FORCE=podman|docker           强制指定容器工具
   ARTIFACT_DEPOT_ACCESS_TOKEN   默认 token
-  ARTIFACT_DEPOT_DATAHUB_URL    默认 DataHub 地址
   XDG_DATA_HOME                 默认目录回退根
 USAGE
 }
@@ -196,11 +191,6 @@ while [[ $# -gt 0 ]]; do
       shift
       if [ $# -eq 0 ] || [[ "$1" == -* ]]; then echo "ERROR: --token 需要参数" >&2; exit 1; fi
       ARTIFACT_DEPOT_TOKEN="$1"
-      ;;
-    --datahub-url)
-      shift
-      if [ $# -eq 0 ] || [[ "$1" == -* ]]; then echo "ERROR: --datahub-url 需要参数" >&2; exit 1; fi
-      DATAHUB_URL="$1"
       ;;
     --data-dir)
       shift
@@ -446,7 +436,7 @@ if [ "$VOLUME_ENABLED" = true ]; then
     VOLUME_ARGS+=(-v "${CONFIG_HOST}:${CONTAINER_CONFIG_FILE}")
     echo "   配置卷: ${CONFIG_HOST} -> ${CONTAINER_CONFIG_FILE}"
     ENV_ARGS+=(-e "ARTIFACT_DEPOT_CONFIG=${CONTAINER_CONFIG_FILE}")
-    echo "   注意: 单文件模式不挂载 .env；敏感项请用 --token / --datahub-url 或环境变量注入"
+    echo "   注意: 单文件模式不挂载 .env；敏感项请用 --token 或环境变量注入"
   else
     mkdir -p "$CONFIG_DIR"
     if [ ! -f "${CONFIG_DIR}/config.json" ]; then
@@ -523,7 +513,7 @@ NETWORK_ARGS=()
 PORT_ARGS=()
 if [ "$DO_HOST_NETWORK" = true ]; then
   NETWORK_ARGS+=(--network=host)
-  echo "   网络: host（共享宿主网络，不再映射端口；datahub_url 建议 http://127.0.0.1:8002/api/data）"
+  echo "   网络: host（共享宿主网络，不再映射端口）"
 else
   PORT_ARGS+=(-p "${HOST_PORT}:${CONTAINER_PORT}")
   echo "   网络: 端口映射 ${HOST_PORT}:${CONTAINER_PORT}"

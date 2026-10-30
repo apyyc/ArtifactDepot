@@ -26,7 +26,7 @@ http://<主机IP>:8004
 | 身份 | 来源 | 说明 |
 |---|---|---|
 | 管理员/工具 | 配置 `access_token`（共享令牌，默认 `admin`） | 放行全部权限 |
-| 用户 | `tokens.json` 注册表（可从 DataHub 同步） | 由 `role` + `scopes` 决定权限，可限定 bucket/路径范围与过期时间 |
+| 用户 | `tokens.json` 注册表（本地维护） | 由 `role` + `scopes` 决定权限，可限定 bucket/路径范围与过期时间 |
 | 签名链接 | `link`+`tk` 或 `expires`+`sig` | 仅用于下载，免 token |
 
 token 传递方式：
@@ -35,7 +35,7 @@ token 传递方式：
 2. 查询参数：`?token=<token>`
 3. multipart 接口（上传/分片/合并/取消）额外支持表单字段 `token`；`initiate` 的 token 只认 query 或请求头。
 
-校验规则：管理员 token 用常量时间比较；用户 token 查注册表，未命中时从 DataHub 惰性同步一次。读接口默认公开；带 token 时必须是有效 token，且权限与资源范围必须匹配。
+校验规则：管理员 token 用常量时间比较；用户 token 查注册表。读接口默认公开；带 token 时必须是有效 token，且权限与资源范围必须匹配。
 
 ### 1.2 权限与资源范围
 
@@ -501,7 +501,7 @@ GET /api/auth/check?token=<token>
 
 ## 五、Token 管理
 
-以下接口分别需要 `token:read` / `token:write` / `token:delete` / `token:sync`；管理员共享 token 放行全部。token 通过 query 或 `Authorization` 传递。
+以下接口分别需要 `token:read` / `token:write` / `token:delete`；管理员共享 token 放行全部。token 通过 query 或 `Authorization` 传递。
 
 ### 5.1 查看注册表
 
@@ -563,18 +563,6 @@ DELETE /api/tokens?value=<token>
 **鉴权**：`token:delete`。
 
 响应：`data={"removed":"<token>","user":"..."}`；不存在 `404`；非共享 token 只能删除授权不超出自身的 token。
-
-### 5.4 从 DataHub 同步
-
-```
-POST /api/tokens/sync
-```
-
-**鉴权**：`token:sync`。
-
-响应：`data={mapping,ok,error,datahub_url}`。`ok=false` 表示 DataHub 不可达/解析失败，现有 token 保留。
-
-说明：DataHub 是权威源，同步只更新用户身份，不覆盖已有 role/scopes/范围；外部 token 不受本地 `token.min_length/max_length` 限制。`mapping` 键为明文 token，调用方按敏感数据保护。
 
 ---
 
@@ -659,7 +647,6 @@ GET /api/docs/{name}?raw=1    # text/plain 原文
 | POST | `/api/tokens` | `token:write` |
 | PUT | `/api/tokens/{value}` | `token:write` |
 | DELETE | `/api/tokens` | `token:delete` |
-| POST | `/api/tokens/sync` | `token:sync` |
 | GET | `/api/audit` | `audit:read` |
 
 > `GET /api/config`、`POST /api/config`、`GET /api/objects/uploads`、`HEAD /api/objects/download`、`/docs`、`/redoc`、`/openapi.json` 不进入 OpenAPI，不改变操作数。
@@ -674,8 +661,6 @@ GET /api/docs/{name}?raw=1    # text/plain 原文
 |---|---|---|
 | `depot_dir` | `./depot` | 仓库根目录；相对路径按项目根解析（`ARTIFACT_DEPOT_DIR`） |
 | `meta_dir` | `""` | 状态文件目录；留空=放在 depot 下（`ARTIFACT_DEPOT_META_DIR`） |
-| `datahub_url` | `http://127.0.0.1:8002/api/data` | 用户 token 权威源 |
-| `datahub_sync_interval_seconds` | 60 | 惰性同步最小间隔（0–86400；0=每次拉取） |
 | `host` | `0.0.0.0` | 监听地址 |
 | `port` | 8004 | 服务端口（`ARTIFACT_DEPOT_PORT`） |
 | `access_token` | `admin` | 管理员共享令牌（`ARTIFACT_DEPOT_ACCESS_TOKEN`）；生产必须改为 ≥16 位随机串 |
@@ -711,7 +696,7 @@ GET /api/docs/{name}?raw=1    # text/plain 原文
 | `token.min_length` | 5 | 新建 token 最小长度（1–256） |
 | `token.max_length` | 30 | 新建 token 最大长度（1–256）；自动生成时取该长度 |
 
-常用环境变量：`ARTIFACT_DEPOT_ACCESS_TOKEN`、`ARTIFACT_DEPOT_PORT`、`ARTIFACT_DEPOT_MAX_UPLOAD_MB`、`ARTIFACT_DEPOT_DATAHUB_URL`、`ARTIFACT_DEPOT_TOKEN_MIN_LENGTH`/`MAX_LENGTH`、`ARTIFACT_DEPOT_DOWNLOAD_*`、`ARTIFACT_DEPOT_UPLOAD_*`、`ARTIFACT_DEPOT_UI_FILE_PAGE_SIZE`/`UI_AUDIT_PAGE_SIZE`。
+常用环境变量：`ARTIFACT_DEPOT_ACCESS_TOKEN`、`ARTIFACT_DEPOT_PORT`、`ARTIFACT_DEPOT_MAX_UPLOAD_MB`、`ARTIFACT_DEPOT_TOKEN_MIN_LENGTH`/`MAX_LENGTH`、`ARTIFACT_DEPOT_DOWNLOAD_*`、`ARTIFACT_DEPOT_UPLOAD_*`、`ARTIFACT_DEPOT_UI_FILE_PAGE_SIZE`/`UI_AUDIT_PAGE_SIZE`。
 
 ---
 
@@ -727,7 +712,7 @@ GET /api/auth/permissions
 
 `permissions` 每项为 `{key, group, label, method, path, write}`；`upload`/`download`/`ui`/`token` 下发对应运行参数。
 
-### 10.2 权限点（23 条）
+### 10.2 权限点（22 条）
 
 | 权限点 | 接口 | 说明 |
 |---|---|---|
@@ -751,7 +736,6 @@ GET /api/auth/permissions
 | `token:read` | GET `/api/tokens` | 查看注册表 |
 | `token:write` | POST `/api/tokens`、PUT `/api/tokens/{value}` | 创建/更新 token |
 | `token:delete` | DELETE `/api/tokens` | 移除 token |
-| `token:sync` | POST `/api/tokens/sync` | 从 DataHub 同步 |
 | `audit:read` | GET `/api/audit` | 查询审计 |
 | `config:write` | GET/POST `/api/config`、POST `/api/config/reload` | 修改站点配置（不能轮换 access_token） |
 
@@ -767,7 +751,7 @@ GET /api/auth/permissions
 | `auditor` | bucket:list, object:list, audit:read, token:read |
 | `user` | bucket:list, bucket:create, object:list, object:head, object:download, object:upload, upload:initiate/chunk/complete/abort, object:mkdir, object:rename, link:create, link:list, link:revoke |
 | `custom` | 按勾选，可为空 |
-| `admin` | 全部 23 个权限点 |
+| `admin` | 全部 22 个权限点 |
 
 ### 10.4 生成 Token
 
@@ -797,4 +781,4 @@ curl -X POST "http://<IP>:8004/api/tokens?token=<admin>" \
 3. `config:write` 是高权限（可改站点配置），但不能轮换 `access_token`；仅授予可信管理者。
 4. 删除、批量删除、重命名等写操作需对应 scope 与资源范围；目录仅空可删，批量删除需输入名称确认。
 5. 路径穿越、隐藏路径、跨 bucket 符号链接均有防护；`rename` 非事务，底层 I/O 异常可能留下部分移动。
-6. DataHub 同步的外部 token 不受本地长度限制；注册表默认脱敏，仅管理员可 `reveal=true`。
+6. 注册表默认脱敏，仅管理员可 `reveal=true`。

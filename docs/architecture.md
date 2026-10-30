@@ -8,7 +8,7 @@ ArtifactDepot 是一个**对象存储 / 工件仓库**站点（不是传统意�
 它负责收存处理产物（视频、文件等），按 **S3 模型**提供标准接口：bucket/key 命名、
 上传、列表、下载（`HEAD` 探测 + Range 分块并发）、删除、预签名 URL，并提供网页浏览。
 
-它不承担业务逻辑，也不存协作平台的 JSON 数据（那是 DataHub 的事）。
+它不承担业务逻辑，也不存协作平台的 JSON 数据。
 
 ## 拓扑
 
@@ -27,22 +27,6 @@ ArtifactDepot（独立 FastAPI 服务，端口 8004）
 用户浏览器
 ```
 
-### Token 同步链路（DataHub 为权威源）
-
-```
-DataHub（collab 容器 :8002，users.json）── 0.5.0 起必须绑 0.0.0.0
-    │  GET {datahub_url}/users.json（触发：启动 / 写操作惰性 60s / 手动 /api/tokens/sync）
-    ▼
-ArtifactDepot 合并写回 <meta_dir>/tokens.json（只增不删；DataHub 不可达沿用本地缓存）
-    │  token → 用户名 解析（auth.py）
-    ▼
-审计 actor / 权限判定
-```
-
-> **生产可达性关键**：DW 容器用 **host 网络**（容器内 `127.0.0.1` = 宿主机），
-> `datahub_url` 写 `http://127.0.0.1:8002/api/data` 即可直连同机 collab 的 DataHub。
-> 桥接网络（rootless pasta）下容器连宿主发布端口常不通，是本服务跨机部署失败的主因。
-
 ## 目录结构
 
 ```
@@ -59,10 +43,10 @@ ArtifactDepot/
 └── src/artifactdepot/
     ├── main.py                 # FastAPI 入口 + lifespan（建目录；启动清理旧版 /tmp/dw_chunks 与 legacy 会话、
     │                           #   创建 staging 并把 tempfile.tempdir 指向它（spool 落数据盘，退出还原）、
-    │                           #   扫描 .artifactdepot-uploads 重建 registry、启动同步 token）
+    │                           #   扫描 .artifactdepot-uploads 重建 registry）
     ├── config/                 # 配置包：__init__.py（加载/手动重载）+ config.json + config.production.json + .env(.example)
     ├── storage.py              # 对象存储引擎：路径安全 / put/list/delete/bulk_delete / bulk_download_scan / manifest / 预签名 /
-    │                           #   签名链接注册表 / token 注册表 / 审计 / DataHub 同步 / meta_dir /
+    │                           #   签名链接注册表 / token 注册表 / 审计 / meta_dir /
     │                           #   分片会话（目标目录 .artifactdepot-uploads 与 legacy staging、进程内 registry、续传与 TTL 清理）
     ├── zipstream.py            # 流式 ZIP（后台线程 + 有界队列 + 背压；目录一键下载，不落临时文件）
     ├── auth.py                 # 写操作 token 校验（query / Bearer）
@@ -93,7 +77,7 @@ ArtifactDepot/
 └── …
 
 <meta_dir>/（可选；默认放 depot_dir 根下，0.5.0 起可用 meta_dir 单独放）
-├── tokens.json                   # token→用户名 注册表（DataHub 同步副本）
+├── tokens.json                   # token→用户名 注册表（本地维护）
 ├── signed_links.json             # 签名链接注册表
 └── audit.log                     # 审计日志（JSONL 追加）
 ```
@@ -121,15 +105,13 @@ ArtifactDepot/
 内置默认 < config/config.json（或 ARTIFACT_DEPOT_CONFIG 指定文件）< config/.env < 环境变量
 ```
 
-- 支持环境变量：`ARTIFACT_DEPOT_DIR` / `ARTIFACT_DEPOT_META_DIR` / `ARTIFACT_DEPOT_DATAHUB_URL` /
+- 支持环境变量：`ARTIFACT_DEPOT_DIR` / `ARTIFACT_DEPOT_META_DIR` /
   `ARTIFACT_DEPOT_ACCESS_TOKEN` / `ARTIFACT_DEPOT_PORT` / `ARTIFACT_DEPOT_MAX_UPLOAD_MB`，
   以及 `upload.*`（10 个 `ARTIFACT_DEPOT_UPLOAD_*`，含 `ARTIFACT_DEPOT_UPLOAD_STAGING_DIR`）与
   `download.*`（3 个 `ARTIFACT_DEPOT_DOWNLOAD_*`）；
   `.env` 支持点号写法（`upload.chunk_size_mb=8` / `upload.staging_dir=/data/depot/.staging` / `download.chunk_size_mb=8`）
 - `upload.staging_dir` 只在启动时设置 `tempfile.tempdir`（框架 spool 落点）并创建目录；
   热重载改它会在 `config/reload` 的 `needs_restart` 中提示，需重启才完整生效。
-- **镜像内不得烤死 `ARTIFACT_DEPOT_DATAHUB_URL` 默认值**：环境变量优先级高于配置文件，
-  烤死的 127.0.0.1 会盖掉挂载 config.json 的 `datahub_url`（0.5.0 已从 Dockerfile 移除）。
 
 ## API 契约（S3 对应）
 
@@ -161,7 +143,6 @@ ArtifactDepot/
 | POST | `/api/config/reload` | 手动重载配置（`config:write` 或管理员共享 token） | - |
 | GET | `/api/auth/permissions` | 权限点/接口目录（公开） | - |
 | GET | `/api/auth/check` | 校验 token 身份/状态（公开，返回 valid/expired/enabled） | - |
-| POST | `/api/tokens/sync` | 从 DataHub 拉取并合并用户 token（`token:sync`，返回 ok/error） | - |
 | GET | `/api/buckets` | 列 bucket | ListBuckets |
 | GET | `/api/audit` | 审计查询（`audit:read`） | - |
 | GET | `/health` `/health/live` `/health/ready` | 健康/存活/就绪检查 | - |
@@ -271,7 +252,7 @@ ArtifactDepot/
   `upload_id` 严格字符集校验、会话目录二次确认落在 depot 内；删除/清理不跟随符号链接。
   内部目录 `.artifactdepot-uploads` 被列表 / 目录大小统计 / ZIP 打包跳过，并被 `bulk_delete(mode="all")` 与
   `rename_object` **显式跳过**，防止误删/搬走活跃上传；客户端 key 不允许隐藏路径段，无法直接操作内部目录。
-  **不新增权限点**（0.9.0 权限点为 22 条、现为 23 条；OpenAPI 操作仍 35 条、旧 token 无需变更），`initiate` 响应只回传
+  **不新增权限点**（权限点为 22 条；OpenAPI 操作数不变、旧 token 无需变更），`initiate` 响应只回传
   `uploaded` 等相对信息、**不回显服务端绝对路径**；服务端按**单进程**运行（不要 `--workers`），
   registry 仅作索引、磁盘才是唯一事实源。
 
@@ -280,7 +261,7 @@ ArtifactDepot/
 - **build → save → 拷贝 → load → deploy**：
   - 开发机 `./build_image.sh`（构建 + 自动导出 `artifactdepot-0.9.0.tar`）
   - 拷贝 tar 到生产机 → `podman load -i` → `./deploy_container.sh --token <你的管理员token>`
-- **host 网络默认**：容器共享宿主网络，`datahub_url` 用 `127.0.0.1:8002` 直连同机 DataHub；
+- **host 网络默认**：容器共享宿主网络，容器内 `127.0.0.1` 即宿主机；
   `--port-map` 可改回端口映射（不推荐，rootless 桥接常不通）。
 - **三卷分离挂载**（`deploy_container.sh`，均不随镜像版本变化，升级后原地沿用）：
   - `<部署根>/config/` → `/data/config`：配置目录（`config.json` + `.env`），首次运行用
@@ -294,7 +275,7 @@ ArtifactDepot/
     `ARTIFACT_DEPOT_ENV` 四个环境变量告知应用实际路径
   - 旧布局（`artifactdepot_<版本>/warehouse`，状态文件混在数据目录）会被自动检测并打印迁移命令
 - **自启**：Podman 走 `systemd --user`；Docker 走 `--restart=always`。
-- 排障：`bash check_ad_sync.sh` 逐段定位 token 同步链路。
+- 排障：`bash check_ad_sync.sh` 逐段检查容器、挂载、配置、健康检查与端口连通性。
 - 可选 Nginx `location /depot/` 反代到 8004。
 - carryVideo `server.py` 处理完推送 + ProjectCollab"任务数据"子模块对接，见 README 集成指引。
 

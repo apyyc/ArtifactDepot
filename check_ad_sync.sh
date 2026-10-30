@@ -14,13 +14,10 @@
 # 检查内容：
 #   1. 容器状态
 #   2. /data/depot 挂载与全部 bind mount
-#   3. ARTIFACT_DEPOT_DIR / ARTIFACT_DEPOT_META_DIR / ARTIFACT_DEPOT_DATAHUB_URL 环境变量
-#   4. 容器内 config/config.json 的 depot_dir / meta_dir / datahub_url
-#   5. 容器内访问 DataHub users.json
-#   6. 宿主机访问 DataHub users.json
-#   7. 应用 /health
-#   8. 应用实际 token 同步 /api/tokens/sync
-#   9. 宿主 127.0.0.1:8004 端口连通性
+#   3. ARTIFACT_DEPOT_DIR / ARTIFACT_DEPOT_META_DIR 环境变量
+#   4. 容器内 config/config.json 的 depot_dir / meta_dir
+#   5. 应用 /health
+#   6. 宿主 127.0.0.1:8004 端口连通性
 #
 # 说明：最终结果会逐项 PASS / WARN / FAIL；某项失败不会中断后续检查。
 # ============================================================
@@ -70,8 +67,6 @@ import json
 import socket
 import subprocess
 import sys
-import urllib.error
-import urllib.parse
 import urllib.request
 
 tool, container = sys.argv[1], sys.argv[2]
@@ -153,7 +148,6 @@ for item in env_list:
 
 depot_dir_env = env.get("ARTIFACT_DEPOT_DIR", "")
 meta_dir_env = env.get("ARTIFACT_DEPOT_META_DIR", "")
-datahub_env = env.get("ARTIFACT_DEPOT_DATAHUB_URL", "")
 token_env = env.get("ARTIFACT_DEPOT_ACCESS_TOKEN", "")
 
 if depot_dir_env:
@@ -165,11 +159,6 @@ if meta_dir_env:
     info(f"ARTIFACT_DEPOT_META_DIR={meta_dir_env}（会覆盖 config.json 的 meta_dir）")
 else:
     info("ARTIFACT_DEPOT_META_DIR 未注入（meta_dir 以 config.json 为准）")
-
-if datahub_env:
-    info(f"ARTIFACT_DEPOT_DATAHUB_URL={datahub_env}（会覆盖 config.json 的 datahub_url）")
-else:
-    info("ARTIFACT_DEPOT_DATAHUB_URL 未注入（datahub_url 以 config.json 为准）")
 
 # --- 4. 容器内 config.json -------------------------------------------------
 # 优先用容器内实际生效的 ARTIFACT_DEPOT_CONFIG（部署脚本默认指向 /data/config/config.json），
@@ -198,7 +187,6 @@ def cfg(key, default=""):
 
 depot_dir = depot_dir_env or cfg("depot_dir", "")
 meta_dir = meta_dir_env or cfg("meta_dir", "")
-datahub_url = datahub_env or cfg("datahub_url", "")
 token = token_env or cfg("access_token", "")
 
 if depot_dir:
@@ -207,46 +195,12 @@ if meta_dir:
     info(f"最终 meta_dir: {meta_dir}")
 else:
     info("最终 meta_dir: 空（状态文件放在 depot_dir 根下）")
-if datahub_url:
-    info(f"最终 datahub_url: {datahub_url}")
-else:
-    fail("datahub_url 为空，token 无法同步")
 if token:
     info("access_token/token: 已配置（不打印明文）")
 else:
-    warn("access_token/token 未配置，写入/同步接口可能 401")
+    warn("access_token/token 未配置，写入接口可能 401")
 
-# --- 5. 容器内访问 DataHub -------------------------------------------------
-if datahub_url:
-    users_url = datahub_url.rstrip("/") + "/users.json"
-    code = (
-        "import sys, urllib.request\n"
-        "try:\n"
-        "    with urllib.request.urlopen(sys.argv[1], timeout=5) as r:\n"
-        "        print(r.status)\n"
-        "except Exception as e:\n"
-        "    print('ERROR: ' + repr(e)); sys.exit(1)\n"
-    )
-    p = run([tool, "exec", container, "python3", "-c", code, users_url], timeout=15)
-    if p.returncode == 0 and p.stdout.strip().startswith("2"):
-        ok(f"容器内访问 DataHub 成功: {users_url} -> HTTP {p.stdout.strip()}")
-    else:
-        fail(f"容器内访问 DataHub 失败: {users_url}；{p.stdout.strip()} {p.stderr.strip()}")
-else:
-    fail("跳过容器内 DataHub 检查（datahub_url 为空）")
-
-# --- 6. 宿主机访问 DataHub -------------------------------------------------
-if datahub_url:
-    users_url = datahub_url.rstrip("/") + "/users.json"
-    try:
-        with urllib.request.urlopen(users_url, timeout=5) as resp:
-            ok(f"宿主机访问 DataHub 成功: {users_url} -> HTTP {resp.status}")
-    except Exception as exc:
-        warn(f"宿主机访问 DataHub 失败: {users_url}；{exc!r}（若 DataHub 仅容器内可达可忽略）")
-else:
-    warn("跳过宿主机 DataHub 检查（datahub_url 为空）")
-
-# --- 7. 应用 /health -------------------------------------------------------
+# --- 5. 应用 /health -------------------------------------------------------
 try:
     with urllib.request.urlopen("http://127.0.0.1:8004/health", timeout=5) as resp:
         body = resp.read().decode("utf-8", "replace")
@@ -254,30 +208,7 @@ try:
 except Exception as exc:
     fail(f"/health 不可达: {exc!r}")
 
-# --- 8. 应用实际 token 同步 ------------------------------------------------
-if datahub_url and token:
-    url = "http://127.0.0.1:8004/api/tokens/sync?token=" + urllib.parse.quote(token, safe="")
-    req = urllib.request.Request(url, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            body = resp.read().decode("utf-8", "replace")
-            try:
-                payload = json.loads(body)
-                result = payload.get("data") or {}
-                if result.get("ok"):
-                    ok(f"/api/tokens/sync 成功: {result}")
-                else:
-                    fail(f"/api/tokens/sync 返回 ok=false: {result}")
-            except Exception:
-                warn(f"/api/tokens/sync 返回不可解析: HTTP {resp.status} {body[:200]}")
-    except urllib.error.HTTPError as exc:
-        fail(f"/api/tokens/sync HTTP {exc.code}: {exc.read().decode('utf-8', 'replace')[:200]}")
-    except Exception as exc:
-        fail(f"/api/tokens/sync 请求失败: {exc!r}")
-else:
-    warn("跳过实际同步检查（缺少 datahub_url 或 token）")
-
-# --- 9. 宿主端口连通性 -----------------------------------------------------
+# --- 6. 宿主端口连通性 -----------------------------------------------------
 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 sock.settimeout(3)
 try:
