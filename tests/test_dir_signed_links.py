@@ -324,3 +324,12 @@ def test_config_toggle_blocks_dir_link(ctx):
     cfg.write_text(json.dumps(data), encoding="utf-8")
     ctx["config"]._CONFIG = None
     assert _presign_dir(c, "d").status_code == 403
+
+
+def test_progress_moves_state_to_packaging():
+    """扫描阶段 -> 打包阶段时 task state 同步切换（前端显示「打包中」而不是「扫描中」）。"""
+    from artifactdepot import packaging
+    job = packaging._new_job("lid", {"bucket": "b", "key": "d", "created_by": "u"})
+    job["state"] = "scanning"
+    packaging._progress(job, phase="packaging", files_total=2, bytes_total=10, force=True)
+    assert job["state"] == "packaging" and job["phase"] == "packaging"

@@ -171,6 +171,10 @@ def _progress(job: dict, *, phase: str | None = None, files_done: int | None = N
     with _JOBS_LOCK:
         if phase is not None:
             job["phase"] = phase
+            # 扫描结束后进入实际打包：状态同步从 scanning 切到 packaging，
+            # 前端进度弹窗与链接列表据此显示「打包中」而不是一直「扫描中」。
+            if phase == "packaging" and job.get("state") == "scanning":
+                job["state"] = "packaging"
         if files_total is not None:
             job["files_total"] = files_total
         if bytes_total is not None:

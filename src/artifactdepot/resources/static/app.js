@@ -426,9 +426,10 @@ function pkgStateLabel(st) {
   if (st.state === 'failed') return '打包失败'
   if (st.state === 'cancelled') return '已取消'
   if (st.state === 'invalid') return '链接已失效'
-  if (st.phase === 'scanning' || st.state === 'scanning') return '扫描目录中'
-  if (st.state === 'queued') return '排队中'
-  return '打包中'
+  // 扫描阶段尚未拿到字节数；一旦有进度就按「打包中」显示
+  if ((st.phase === 'scanning' || st.state === 'scanning') &&
+      !st.files_total && !st.bytes_total) return '扫描目录中'
+  return st.state === 'queued' ? '排队中' : '打包中'
 }
 
 function pkgRender(st) {
