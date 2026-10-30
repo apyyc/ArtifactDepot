@@ -61,7 +61,6 @@ def _base_cfg(depot: Path) -> dict:
         "depot_dir": str(depot),
         "meta_dir": "",
         "access_token": ADMIN,
-        "datahub_url": "",
         "ui_enabled": True,
         "metrics_enabled": True,
         "max_upload_mb": 0,
@@ -87,8 +86,8 @@ def ctx(tmp_path, monkeypatch):
     # 真实环境变量优先级最高，会覆盖配置文件；逐个清掉保证用例可重复
     for name in (
         "ARTIFACT_DEPOT_ACCESS_TOKEN", "ARTIFACT_DEPOT_DIR", "ARTIFACT_DEPOT_META_DIR",
-        "ARTIFACT_DEPOT_DATAHUB_URL", "ARTIFACT_DEPOT_MAX_UPLOAD_MB", "ARTIFACT_DEPOT_PORT",
-        "WAREHOUSE_DIR", "WAREHOUSE_META_DIR", "WAREHOUSE_DATAHUB_URL",
+        "ARTIFACT_DEPOT_MAX_UPLOAD_MB", "ARTIFACT_DEPOT_PORT",
+        "WAREHOUSE_DIR", "WAREHOUSE_META_DIR",
         "WAREHOUSE_ACCESS_TOKEN", "WAREHOUSE_PORT", "WAREHOUSE_MAX_UPLOAD_MB",
     ):
         monkeypatch.delenv(name, raising=False)
@@ -896,7 +895,7 @@ def test_public_permissions_catalog(ctx):
     data = body["data"]
     assert {"permissions", "public", "roles", "default_role",
             "require_read_token"} <= set(data)
-    assert len(data["permissions"]) == len(PERMISSION_CATALOG) == 23
+    assert len(data["permissions"]) == len(PERMISSION_CATALOG) == 22
     assert len(data["public"]) == len(PUBLIC_CATALOG) == 6
     assert data["default_role"] == "user"
     assert [r0["key"] for r0 in data["roles"]] == list(ROLE_PRESETS)
@@ -905,7 +904,7 @@ def test_public_permissions_catalog(ctx):
     spec = c.get("/openapi.json").json()
     ops = {(method.upper(), _norm_path(path))
            for path, item in spec["paths"].items() for method in item}
-    assert len(ops) == 35                                   # 35 条 OpenAPI 操作
+    assert len(ops) == 34                                   # 35 条 OpenAPI 操作
     for item in data["permissions"] + data["public"]:
         if item.get("key") == "config:write":
             # 配置接口 include_in_schema=False，仍不出现在 OpenAPI，但确实是受保护权限点

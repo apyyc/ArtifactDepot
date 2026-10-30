@@ -26,7 +26,7 @@ def client(tmp_path, monkeypatch):
     cfg = tmp_path / "cfg.json"
     cfg.write_text(json.dumps({
         "depot_dir": str(depot), "meta_dir": "", "access_token": ADMIN,
-        "datahub_url": "", "ui_enabled": True,
+        "ui_enabled": True,
     }), encoding="utf-8")
     monkeypatch.setenv("ARTIFACT_DEPOT_CONFIG", str(cfg))
     import artifactdepot.config as config
@@ -95,7 +95,7 @@ def test_metrics_can_be_disabled(tmp_path, monkeypatch):
     depot = tmp_path / "depot"; depot.mkdir()
     cfg = tmp_path / "cfg.json"
     cfg.write_text(json.dumps({
-        "depot_dir": str(depot), "access_token": ADMIN, "datahub_url": "",
+        "depot_dir": str(depot), "access_token": ADMIN,
         "metrics_enabled": False,
     }), encoding="utf-8")
     monkeypatch.setenv("ARTIFACT_DEPOT_CONFIG", str(cfg))

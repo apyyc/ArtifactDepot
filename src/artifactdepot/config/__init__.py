@@ -32,8 +32,6 @@ DEFAULT = {
     "depot_dir": "./depot",                    # 对象存储根目录（相对路径按项目根解析；旧键 warehouse_dir 兼容读取）
     "meta_dir": "",                            # 状态文件目录（tokens.json/audit.log/signed_links.json）
                                                # 留空 = 放在 depot_dir 下；设了则单独放该目录（相对按 depot_dir 解析）
-    "datahub_url": "http://127.0.0.1:8002/api/data",  # 从 DataHub users.json 拉取用户 token
-    "datahub_sync_interval_seconds": 60,      # DataHub 惰性同步最小间隔（秒），0=每次都拉取
     "host": "0.0.0.0",                        # 监听地址
     "port": 8004,                             # 服务端口
     "access_token": "admin",                  # 管理员/工具共享令牌；内置默认 admin（开箱即用）
@@ -210,8 +208,6 @@ def _apply_env_field(cfg: dict, key: str, raw, warnings: list, source: str) -> N
 _ENV_MAP = {
     "ARTIFACT_DEPOT_DIR": "depot_dir",
     "ARTIFACT_DEPOT_META_DIR": "meta_dir",
-    "ARTIFACT_DEPOT_DATAHUB_URL": "datahub_url",
-    "ARTIFACT_DEPOT_DATAHUB_SYNC_INTERVAL_SECONDS": "datahub_sync_interval_seconds",
     "ARTIFACT_DEPOT_ACCESS_TOKEN": "access_token",
     "ARTIFACT_DEPOT_PORT": "port",
     "ARTIFACT_DEPOT_MAX_UPLOAD_MB": "max_upload_mb",
@@ -240,7 +236,6 @@ _ENV_MAP = {
     # 兼容旧前缀
     "WAREHOUSE_DIR": "depot_dir",
     "WAREHOUSE_META_DIR": "meta_dir",
-    "WAREHOUSE_DATAHUB_URL": "datahub_url",
     "WAREHOUSE_ACCESS_TOKEN": "access_token",
     "WAREHOUSE_PORT": "port",
     "WAREHOUSE_MAX_UPLOAD_MB": "max_upload_mb",
@@ -583,7 +578,7 @@ def config_warnings(cfg: dict | None = None) -> list:
 # 网页「配置」标签页：配置项元数据 / 快照 / 写回 config.json + 热加载
 # ---------------------------------------------------------------------------
 
-CONFIG_GROUPS = ("基础", "DataHub", "网络与安全", "界面", "上传", "下载", "签名链接",
+CONFIG_GROUPS = ("基础", "网络与安全", "界面", "上传", "下载", "签名链接",
                  "系统/审计", "令牌")
 
 _MASKED_SECRET = "********"
@@ -595,11 +590,6 @@ _CONFIG_FIELD_META = {
                   "desc": "对象存储根目录；相对路径按项目根解析"},
     "meta_dir": {"label": "状态文件目录", "group": "基础", "type": "path", "restart": True,
                  "desc": "tokens.json / audit.log / signed_links.json 目录；留空=放在 depot_dir 下"},
-    "datahub_url": {"label": "DataHub 地址", "group": "DataHub", "type": "string",
-                    "desc": "从 DataHub users.json 拉取用户 token；留空=不同步"},
-    "datahub_sync_interval_seconds": {"label": "DataHub 同步最小间隔（秒）", "group": "DataHub",
-                                      "type": "int", "min": 0, "max": 86400,
-                                      "desc": "惰性同步的最小间隔，0=每次都拉取"},
     "host": {"label": "监听地址", "group": "网络与安全", "type": "string", "restart": True},
     "port": {"label": "监听端口", "group": "网络与安全", "type": "int", "restart": True,
              "min": 1, "max": 65535},

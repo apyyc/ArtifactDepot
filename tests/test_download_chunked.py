@@ -33,7 +33,7 @@ DOWNLOAD = "/api/objects/download"
 def _write_config(path: Path, depot: Path, **extra) -> None:
     cfg = {
         "depot_dir": str(depot), "meta_dir": "", "access_token": ADMIN,
-        "datahub_url": "", "ui_enabled": True, "max_upload_mb": 0,
+        "ui_enabled": True, "max_upload_mb": 0,
     }
     cfg.update(extra)
     path.write_text(json.dumps(cfg), encoding="utf-8")
@@ -103,7 +103,7 @@ def test_default_access_token_is_admin(tmp_path, monkeypatch):
     depot = tmp_path / "depot"
     depot.mkdir()
     cfg = tmp_path / "cfg.json"
-    cfg.write_text(json.dumps({"depot_dir": str(depot), "meta_dir": "", "datahub_url": ""}),
+    cfg.write_text(json.dumps({"depot_dir": str(depot), "meta_dir": ""}),
                    encoding="utf-8")
     monkeypatch.setenv("ARTIFACT_DEPOT_CONFIG", str(cfg))
     monkeypatch.setenv("ARTIFACT_DEPOT_ENV", str(tmp_path / ".env.not-exist"))
@@ -378,7 +378,7 @@ def test_threaded_clients_head_and_range(ctx, files):
 def test_permission_catalog_unchanged(ctx):
     c, _, _, _ = ctx
     d = c.get("/api/auth/permissions").json()["data"]
-    assert len(d["permissions"]) == 23
+    assert len(d["permissions"]) == 22
     keys = {p["key"] for p in d["permissions"]}
     assert "object:download" in keys
     assert not any(k.startswith("download:") for k in keys), "分块下载复用 object:download，不新增权限点"

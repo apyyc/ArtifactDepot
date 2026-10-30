@@ -31,7 +31,7 @@ def ctx(tmp_path, monkeypatch):
     cfg = tmp_path / "cfg.json"
     cfg.write_text(json.dumps({
         "depot_dir": str(depot), "meta_dir": "", "access_token": ADMIN,
-        "datahub_url": "", "ui_enabled": True, "max_upload_mb": 0,
+        "ui_enabled": True, "max_upload_mb": 0,
         "require_read_token": False,
     }), encoding="utf-8")
     monkeypatch.setenv("ARTIFACT_DEPOT_CONFIG", str(cfg))
@@ -50,7 +50,7 @@ ALL_SCOPES = [
     "bucket:list", "bucket:create", "object:list", "object:head", "object:download",
     "object:upload", "upload:initiate", "upload:chunk", "upload:complete", "upload:abort",
     "object:mkdir", "object:rename", "object:delete", "link:create", "link:list",
-    "link:revoke", "token:read", "token:write", "token:delete", "token:sync", "audit:read",
+    "link:revoke", "token:read", "token:write", "token:delete", "audit:read",
 ]
 
 

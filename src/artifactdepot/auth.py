@@ -122,14 +122,8 @@ def _principal_no_sync(token: str):
     return principal_from_record(token, rec)
 
 
-async def resolve_principal(token: str, sync: bool = True):
-    """解析令牌对应的主体；本地未命中时从 DataHub 惰性同步一次再判定"""
-    principal = _principal_no_sync(token)
-    if principal:
-        return principal
-    if not sync:
-        return None
-    await storage.sync_tokens_from_datahub(get_config().get("datahub_url", ""))
+async def resolve_principal(token: str):
+    """解析令牌对应的主体（本地 token 注册表；未登记/禁用/过期返回 None）"""
     return _principal_no_sync(token)
 
 

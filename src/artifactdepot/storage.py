@@ -36,8 +36,6 @@ try:
 except ImportError:  # pragma: no cover - 非 POSIX 平台
     fcntl = None
 
-import httpx
-
 from fastapi import HTTPException
 
 from artifactdepot.config import (get_config, get_staging_dir, get_token_settings,
@@ -1175,7 +1173,10 @@ def _normalize_token_record(value, token: str = "") -> dict:
         scopes = list(preset or [])
     rec["user"] = user
     rec["role"] = role
-    rec["scopes"] = [str(x).strip() for x in scopes if str(x).strip()]
+    # 已下线的权限点（历史 token 里可能残留，如已移除的 token:sync）在读取时过滤，
+    # 避免注册表展示/权限计数继续暴露不存在的权限；原始 tokens.json 由后续写入自然收敛。
+    from artifactdepot.permissions import is_valid_scope
+    rec["scopes"] = [s for s in (str(x).strip() for x in scopes) if s and is_valid_scope(s)]
     if not isinstance(rec.get("allow_buckets"), list):
         rec["allow_buckets"] = []
     if not isinstance(rec.get("allow_prefixes"), dict):
@@ -1419,88 +1420,6 @@ def resolve_user(token: str):
     """按 token 查用户名（未登记/禁用/过期返回 None）"""
     rec = get_token_record(token)
     return rec.get("user") if rec else None
-
-
-# ---------------------------------------------------------------------------
-# 从 DataHub 拉取用户 token（collab 为权威源，本地为缓存副本）
-# ---------------------------------------------------------------------------
-
-_last_sync = 0.0
-SYNC_INTERVAL = 60  # 秒：惰性刷新最小间隔的代码兜底（实际取 config.datahub_sync_interval_seconds）
-
-
-def _sync_interval_seconds() -> int:
-    """DataHub 惰性同步最小间隔（config.datahub_sync_interval_seconds，0=每次都拉）。"""
-    try:
-        return max(0, int(get_config().get("datahub_sync_interval_seconds", SYNC_INTERVAL)))
-    except (TypeError, ValueError):
-        return SYNC_INTERVAL
-
-
-async def _fetch_datahub_users(datahub_url: str):
-    """从 DataHub 拉 users.json。返回 (users列表, error)；失败时 users=None、error 为原因"""
-    if not datahub_url:
-        return None, "未配置 datahub_url"
-    try:
-        async with httpx.AsyncClient(timeout=15, trust_env=False) as client:
-            resp = await client.get(f"{datahub_url.rstrip('/')}/users.json")
-            resp.raise_for_status()
-            data = resp.json()
-        users = data.get("users", []) if isinstance(data, dict) else []
-        return users, None
-    except Exception as e:
-        return None, str(e) or "DataHub 不可达"
-
-
-def _merge_datahub_users(users) -> dict:
-    """把 DataHub 用户合并进本地记录：只补/更新身份，绝不覆盖权限配置。
-
-    - 已存在 token：仅更新 user 名（保留 role/scopes/资源范围/过期）
-    - 新 token：按默认 role=user 建立记录（与旧行为一致）
-    """
-    with state_lock():
-        raw = _read_tokens_raw()
-        for u in users or []:
-            tok = (u.get("api_token") or "").strip()
-            name = (u.get("name") or "").strip()
-            if not tok or not name:
-                continue
-            if tok in raw:
-                rec = _normalize_token_record(raw[tok], tok)
-                rec["user"] = name
-            else:
-                rec = _default_token_record(name, "user")
-            raw[tok] = rec
-        _save_tokens(raw)
-    return load_tokens()
-
-
-async def sync_tokens_from_datahub(datahub_url: str, force: bool = False) -> dict:
-    """从 DataHub users.json 拉取并合并用户 token（只增不删、权限字段保留）"""
-    global _last_sync
-    now = time.time()
-    if not force and now - _last_sync < _sync_interval_seconds():
-        return load_tokens()
-    users, err = await _fetch_datahub_users(datahub_url)
-    if err is not None:
-        return load_tokens()
-    merged = _merge_datahub_users(users)
-    _last_sync = time.time()
-    return merged
-
-
-async def sync_tokens_detailed(datahub_url: str, force: bool = True) -> dict:
-    """手动同步接口用：返回 {mapping, ok, error, datahub_url}"""
-    global _last_sync
-    now = time.time()
-    if not force and now - _last_sync < _sync_interval_seconds():
-        return {"mapping": load_tokens(), "ok": True, "error": "", "datahub_url": datahub_url}
-    users, err = await _fetch_datahub_users(datahub_url)
-    if err is not None:
-        return {"mapping": load_tokens(), "ok": False, "error": err, "datahub_url": datahub_url}
-    merged = _merge_datahub_users(users)
-    _last_sync = time.time()
-    return {"mapping": merged, "ok": True, "error": "", "datahub_url": datahub_url}
 
 
 # ---------------------------------------------------------------------------

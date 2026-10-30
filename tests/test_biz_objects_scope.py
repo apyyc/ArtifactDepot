@@ -84,7 +84,7 @@ PRESIGN_URL_REASON = (
 def _write_config(cfg: Path, depot: Path, extra=None) -> None:
     data = {
         "depot_dir": str(depot), "meta_dir": "", "access_token": ADMIN,
-        "datahub_url": "", "ui_enabled": True, "max_upload_mb": 0,
+        "ui_enabled": True, "max_upload_mb": 0,
         "require_read_token": False,
     }
     data.update(extra or {})

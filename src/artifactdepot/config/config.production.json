@@ -1,8 +1,6 @@
 {
   "depot_dir": "/data/depot",
   "meta_dir": "/data/state",
-  "datahub_url": "http://127.0.0.1:8002/api/data",
-  "datahub_sync_interval_seconds": 60,
   "host": "0.0.0.0",
   "port": 8004,
   "access_token": "admin",

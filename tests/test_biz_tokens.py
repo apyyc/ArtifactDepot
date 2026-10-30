@@ -1,7 +1,7 @@
 # Copyright 2026 apyyc
 # SPDX-License-Identifier: Apache-2.0
 
-"""业务验收：Token 管理 5 接口（#11-#15）+ GET /api/auth/check（#3）
+"""业务验收：Token 管理 4 接口（#11-#14）+ GET /api/auth/check（#3）
 
 基准：reports/api_inventory.md（R4-R9 / R11）与 docs/api_rules.md。
 
@@ -21,11 +21,8 @@ F 数据一致性。每个用例独立（独立临时 depot），不依赖执行
     cd ArtifactDepot/ArtifactDepot
     PYTHONPATH=/home/apyyc/work/ArtifactDepot/.audit-deps/libs:src python3 -m pytest tests/test_biz_tokens.py -q
 """
-import http.server
 import json
 import sys
-import threading
-from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -49,7 +46,7 @@ R7_REASON = (
 def _write_config(cfg: Path, depot: Path, extra=None) -> None:
     data = {
         "depot_dir": str(depot), "meta_dir": "", "access_token": ADMIN,
-        "datahub_url": "", "ui_enabled": True, "max_upload_mb": 0,
+        "ui_enabled": True, "max_upload_mb": 0,
         "require_read_token": False,
     }
     data.update(extra or {})
@@ -71,13 +68,6 @@ def ctx(tmp_path, monkeypatch):
     from starlette.testclient import TestClient
     with TestClient(app) as c:
         yield c, cfg, depot, config
-    config._CONFIG = None
-
-
-def _set_datahub(cfg: Path, config, url: str) -> None:
-    data = json.loads(cfg.read_text(encoding="utf-8"))
-    data["datahub_url"] = url
-    cfg.write_text(json.dumps(data), encoding="utf-8")
     config._CONFIG = None
 
 
@@ -150,41 +140,6 @@ def _upload(c, bucket: str, key: str, data: bytes = b"x"):
     r = c.post("/api/objects", params={"token": ADMIN},
                data={"bucket": bucket, "key": key}, files={"file": (key, data)})
     assert r.status_code == 200, r.text
-
-
-@contextmanager
-def _mock_datahub(users=None, raw_body=None, status=200):
-    """本地假 DataHub：GET /users.json。返回 base_url。"""
-    body = raw_body if raw_body is not None else \
-        json.dumps({"users": users or []}, ensure_ascii=False).encode("utf-8")
-
-    class Handler(http.server.BaseHTTPRequestHandler):
-        def do_GET(self):
-            self.send_response(status)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-        def log_message(self, *args):
-            pass
-
-    srv = http.server.HTTPServer(("127.0.0.1", 0), Handler)
-    th = threading.Thread(target=srv.serve_forever, daemon=True)
-    th.start()
-    try:
-        yield f"http://127.0.0.1:{srv.server_address[1]}"
-    finally:
-        srv.shutdown()
-        srv.server_close()
-        th.join(timeout=2)
-
-
-def _dead_datahub_url() -> str:
-    srv = http.server.HTTPServer(("127.0.0.1", 0), http.server.BaseHTTPRequestHandler)
-    port = srv.server_address[1]
-    srv.server_close()
-    return f"http://127.0.0.1:{port}"
 
 
 # ===========================================================================
@@ -1030,127 +985,6 @@ def test_delete_admin_can_delete_disabled_and_expired_targets(ctx):
     assert disabled not in raw and expired not in raw
 
 
-# ===========================================================================
-# #15 POST /api/tokens/sync
-# ===========================================================================
-
-def test_sync_requires_token_sync_scope(ctx):
-    """C：无 token 401 / 无效 401 / 缺 token:sync 403；文件与审计零变化。"""
-    c, _, depot, _ = ctx
-    _create(c, user="existing", role="viewer")
-    viewer = _create(c, user="viewer", role="viewer")
-    _warm(c, viewer)
-    snap = _strip_last_used(_raw(depot))
-    n_audit = len(_audit_rows(depot))
-
-    assert c.post("/api/tokens/sync").status_code == 401
-    assert c.post("/api/tokens/sync", params={"token": "bad"}).status_code == 401
-    r = c.post("/api/tokens/sync", params={"token": viewer})
-    assert r.status_code == 403 and "token:sync" in _detail(r)
-    assert _strip_last_used(_raw(depot)) == snap
-    assert len(_audit_rows(depot)) == n_audit
-
-
-def test_sync_ok_false_without_datahub_no_side_effects(ctx):
-    """D/F：未配置 datahub_url → ok=false + error，本地注册表原样返回且不被改写。"""
-    c, _, depot, _ = ctx
-    tok = _create(c, user="keep", role="viewer")
-    snap = _strip_last_used(_raw(depot))
-    n_audit = len(_audit_rows(depot))
-
-    r = c.post("/api/tokens/sync", params={"token": ADMIN})
-    assert r.status_code == 200, r.text
-    data = r.json()["data"]
-    assert data["ok"] is False
-    assert "未配置 datahub_url" in data["error"]
-    assert data["datahub_url"] == ""
-    assert set(data["mapping"]) == set(_raw(depot))
-    assert data["mapping"][tok]["user"] == "keep"
-
-    assert _strip_last_used(_raw(depot)) == snap
-    assert len(_audit_rows(depot)) == n_audit
-
-
-def test_sync_ok_false_when_unreachable(ctx):
-    """D：DataHub 不可达 → ok=false + 非空 error，tokens.json 零改动。"""
-    c, cfg, depot, config = ctx
-    _create(c, user="keep", role="viewer")
-    _set_datahub(cfg, config, _dead_datahub_url())
-    snap = _strip_last_used(_raw(depot))
-
-    r = c.post("/api/tokens/sync", params={"token": ADMIN})
-    assert r.status_code == 200, r.text
-    data = r.json()["data"]
-    assert data["ok"] is False
-    assert data["error"]
-    assert _strip_last_used(_raw(depot)) == snap
-
-
-def test_sync_ok_false_on_invalid_json(ctx):
-    """B/D：DataHub 返回非 JSON → ok=false + 非空 error，tokens.json 零改动。"""
-    c, cfg, depot, config = ctx
-    _create(c, user="keep", role="viewer")
-    snap = _strip_last_used(_raw(depot))
-    with _mock_datahub(raw_body=b"<html>not-json</html>") as url:
-        _set_datahub(cfg, config, url)
-        r = c.post("/api/tokens/sync", params={"token": ADMIN})
-        assert r.status_code == 200, r.text
-        data = r.json()["data"]
-        assert data["ok"] is False and data["error"]
-    assert _strip_last_used(_raw(depot)) == snap
-
-
-def test_sync_ok_true_merges_only_add_preserving_permissions(ctx):
-    """A/F：ok=true 时只增不删、保留权限字段，仅更新用户名；禁用状态不被复活。"""
-    c, cfg, depot, config = ctx
-    rich = _create(c, user="rich", role="custom", scopes=["object:list"],
-                   allow_buckets=["demo"], allow_prefixes={"demo": ["a/"]},
-                   expires_at="2099-01-01", description="keep")
-    assert _put(c, rich, enabled=False).status_code == 200
-    local_only = _create(c, user="local-only", role="viewer")
-    before_rich = _strip_last_used(_raw(depot))[rich]
-    before_local = _strip_last_used(_raw(depot))[local_only]
-
-    users = [
-        {"api_token": rich, "name": "renamed-by-datahub"},
-        {"api_token": "dh-new-token-1", "name": "dh-user"},
-    ]
-    with _mock_datahub(users=users) as url:
-        _set_datahub(cfg, config, url)
-        r = c.post("/api/tokens/sync", params={"token": ADMIN})
-        assert r.status_code == 200, r.text
-        data = r.json()["data"]
-        assert data["ok"] is True and data["error"] == ""
-        assert data["datahub_url"] == url
-        raw = _strip_last_used(_raw(depot))
-        # 既有 token：仅 user 变化，权限/范围/过期/描述/禁用状态保留
-        assert raw[rich]["user"] == "renamed-by-datahub"
-        for field in ("role", "scopes", "allow_buckets", "allow_prefixes",
-                      "expires_at", "description", "enabled", "created_at"):
-            assert raw[rich][field] == before_rich[field], field
-        assert raw[rich]["enabled"] is False
-        # 新 token：默认 role=user、无范围限制
-        assert "dh-new-token-1" in raw
-        assert raw["dh-new-token-1"]["role"] == "user"
-        assert raw["dh-new-token-1"]["allow_buckets"] == []
-        # 只增不删：本地独有 token 仍在
-        assert local_only in raw
-        assert raw[local_only] == before_local
-        assert set(data["mapping"]) == set(raw)
-    assert _check(c, rich).json()["data"]["valid"] is False, "sync 不得复活被禁用 token"
-
-
-def test_sync_is_idempotent(ctx):
-    """D/F：重复同步不改变注册表内容（幂等，不重复造 token）。"""
-    c, cfg, depot, config = ctx
-    _create(c, user="keep", role="viewer")
-    users = [{"api_token": "dh-token-x", "name": "dh-x"}]
-    with _mock_datahub(users=users) as url:
-        _set_datahub(cfg, config, url)
-        assert c.post("/api/tokens/sync", params={"token": ADMIN}).status_code == 200
-        snap = _strip_last_used(_raw(depot))
-        assert c.post("/api/tokens/sync", params={"token": ADMIN}).status_code == 200
-        assert _strip_last_used(_raw(depot)) == snap
 
 
 # ===========================================================================

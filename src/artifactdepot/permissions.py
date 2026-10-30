@@ -65,8 +65,6 @@ PERMISSION_CATALOG = [
      "method": "POST", "path": "/api/tokens", "write": True},
     {"key": "token:delete", "group": "Token 管理", "label": "移除 token",
      "method": "DELETE", "path": "/api/tokens", "write": True},
-    {"key": "token:sync", "group": "Token 管理", "label": "从 DataHub 同步 token",
-     "method": "POST", "path": "/api/tokens/sync", "write": True},
 
     # ---- 系统 / 审计 ----
     {"key": "audit:read", "group": "系统 / 审计", "label": "查询审计日志",

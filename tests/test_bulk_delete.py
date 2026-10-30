@@ -44,7 +44,7 @@ _SNAP_EXCLUDE = {"tokens.json", "audit.log", "signed_links.json", ".state.lock"}
 def _write_config(cfg: Path, depot: Path) -> None:
     cfg.write_text(json.dumps({
         "depot_dir": str(depot), "meta_dir": "", "access_token": ADMIN,
-        "datahub_url": "", "ui_enabled": True, "max_upload_mb": 0,
+        "ui_enabled": True, "max_upload_mb": 0,
         "require_read_token": False,
     }), encoding="utf-8")
 

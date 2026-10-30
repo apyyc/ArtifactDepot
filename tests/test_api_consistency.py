@@ -29,7 +29,7 @@ def client(tmp_path, monkeypatch):
     cfg = tmp_path / "cfg.json"
     cfg.write_text(json.dumps({
         "depot_dir": str(depot), "meta_dir": "", "access_token": ADMIN,
-        "datahub_url": "", "ui_enabled": True, "max_upload_mb": 0,
+        "ui_enabled": True, "max_upload_mb": 0,
     }), encoding="utf-8")
     monkeypatch.setenv("ARTIFACT_DEPOT_CONFIG", str(cfg))
     import artifactdepot.config as config
@@ -86,7 +86,7 @@ def test_audit_rotation_and_query(tmp_path, monkeypatch):
     cfg = tmp_path / "cfg.json"
     cfg.write_text(json.dumps({
         "depot_dir": str(depot), "meta_dir": "", "access_token": ADMIN,
-        "datahub_url": "", "audit_max_mb": 1, "audit_backups": 3,
+        "audit_max_mb": 1, "audit_backups": 3,
     }), encoding="utf-8")
     monkeypatch.setenv("ARTIFACT_DEPOT_CONFIG", str(cfg))
     import artifactdepot.config as config

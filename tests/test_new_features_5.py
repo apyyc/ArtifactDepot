@@ -30,7 +30,7 @@ def ctx(tmp_path, monkeypatch):
     depot.mkdir()
     cfg = tmp_path / "cfg.json"
     cfg.write_text(json.dumps({
-        "depot_dir": str(depot), "meta_dir": "", "datahub_url": "",
+        "depot_dir": str(depot), "meta_dir": "",
         "access_token": ADMIN, "ui_enabled": True, "max_upload_mb": 0,
     }), encoding="utf-8")
     monkeypatch.setenv("ARTIFACT_DEPOT_CONFIG", str(cfg))
@@ -200,8 +200,8 @@ def test_config_endpoints_still_hidden_and_openapi_count(ctx):
     spec = c.get("/openapi.json").json()
     assert "/api/config" not in spec["paths"]
     ops = {(m.upper(), p) for p, item in spec["paths"].items() for m in item}
-    assert len(ops) == 35
-    assert len(c.get("/api/auth/permissions").json()["data"]["permissions"]) == 23
+    assert len(ops) == 34
+    assert len(c.get("/api/auth/permissions").json()["data"]["permissions"]) == 22
 
 
 def test_config_write_cannot_rotate_access_token(ctx):
@@ -233,7 +233,7 @@ def test_config_update_is_serialized(tmp_path, monkeypatch):
 
     cfg = tmp_path / "cfg.json"
     cfg.write_text(json.dumps({
-        "depot_dir": str(tmp_path / "depot"), "meta_dir": "", "datahub_url": "",
+        "depot_dir": str(tmp_path / "depot"), "meta_dir": "",
         "access_token": ADMIN, "ui": {"file_page_size": 200, "audit_page_size": 500},
     }), encoding="utf-8")
     monkeypatch.setenv("ARTIFACT_DEPOT_CONFIG", str(cfg))

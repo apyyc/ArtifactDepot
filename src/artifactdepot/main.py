@@ -102,7 +102,7 @@ async def lifespan(app: FastAPI):
         logger.warning("[配置] %s", w)
     if warnings and os.getenv("ARTIFACT_DEPOT_STRICT_CONFIG", "").strip().lower() in ("1", "true", "yes", "on"):
         raise RuntimeError("配置校验未通过：" + "；".join(warnings))
-    # 确保仓库根目录存在，并从 DataHub 拉取用户 token（启动即最新）
+    # 确保仓库根目录存在
     root = storage.get_root()
     root.mkdir(parents=True, exist_ok=True)
     # 0.9.0「伴随文件本地化」：
@@ -138,7 +138,6 @@ async def lifespan(app: FastAPI):
                         scan["registered"], scan["removed"])
     except OSError as e:
         logger.warning("[清理] 启动扫描分片会话失败：%s", e)
-    await storage.sync_tokens_from_datahub(get_config().get("datahub_url", ""), force=True)
     cleanup_task = asyncio.create_task(_chunk_cleanup_loop())
     try:
         yield

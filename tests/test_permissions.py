@@ -28,7 +28,7 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setenv("ARTIFACT_DEPOT_CONFIG", str(tmp_path / "cfg.json"))
     (tmp_path / "cfg.json").write_text(
         '{"depot_dir": "%s", "meta_dir": "", "access_token": "%s", '
-        '"datahub_url": "", "ui_enabled": true, "max_upload_mb": 0}' % (depot, ADMIN),
+        '"ui_enabled": true, "max_upload_mb": 0}' % (depot, ADMIN),
         encoding="utf-8",
     )
     # config 是进程级缓存，测试间必须重置
@@ -50,7 +50,7 @@ def _new_token(c, **body):
 
 def test_permission_catalog_is_public(client):
     d = client.get("/api/auth/permissions").json()["data"]
-    assert len(d["permissions"]) == 23
+    assert len(d["permissions"]) == 22
     assert {p["key"] for p in d["permissions"]} >= {
         "object:upload", "object:download", "object:delete", "link:create",
         "token:write", "config:write"}
@@ -153,17 +153,13 @@ def test_expired_and_disabled_token(client):
     assert client.get("/api/auth/check", params={"token": tok}).json()["data"]["valid"] is False
 
 
-def test_datahub_sync_preserves_permissions(client):
-    """DataHub 同步只更新用户名，不覆盖 role/scopes/资源范围。"""
-    tok = _new_token(client, role="custom", scopes=["object:download"],
-                     allow_buckets=["b1"], description="keep-me")
+def test_removed_scope_filtered_on_read():
+    """已下线的权限点（如 token:sync）在读取归一化时被过滤，不再出现在注册表里。"""
     from artifactdepot import storage
-    storage._merge_datahub_users([{"api_token": tok, "name": "renamed"}])
-    rec = storage.load_tokens()[tok]
-    assert rec["user"] == "renamed"
-    assert rec["scopes"] == ["object:download"]
-    assert rec["allow_buckets"] == ["b1"]
-    assert rec["description"] == "keep-me"
+    rec = storage._normalize_token_record(
+        {"user": "legacy", "role": "custom",
+         "scopes": ["object:list", "token:sync", "no:such:scope"]}, "tok")
+    assert rec["scopes"] == ["object:list"]
 
 
 def test_tokens_list_masked_by_default(client):

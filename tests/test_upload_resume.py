@@ -52,7 +52,7 @@ def env(tmp_path, monkeypatch):
     cfg = tmp_path / "cfg.json"
     cfg.write_text(json.dumps({
         "depot_dir": str(depot), "meta_dir": "", "access_token": ADMIN,
-        "datahub_url": "", "ui_enabled": True, "max_upload_mb": 0,
+        "ui_enabled": True, "max_upload_mb": 0,
         # 分片 1MB：用很小的数据就能构造多分片会话（避免测试写大文件）
         "upload": {"chunk_size_mb": 1, "max_chunk_mb": 1},
     }), encoding="utf-8")

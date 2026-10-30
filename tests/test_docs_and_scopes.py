@@ -28,7 +28,7 @@ def ctx(tmp_path, monkeypatch):
     cfg = tmp_path / "cfg.json"
     cfg.write_text(
         '{"depot_dir": "%s", "meta_dir": "", "access_token": "%s", '
-        '"datahub_url": "", "ui_enabled": true, "max_upload_mb": 0}' % (depot, ADMIN),
+        '"ui_enabled": true, "max_upload_mb": 0}' % (depot, ADMIN),
         encoding="utf-8",
     )
     monkeypatch.setenv("ARTIFACT_DEPOT_CONFIG", str(cfg))

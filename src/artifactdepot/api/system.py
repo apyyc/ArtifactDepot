@@ -474,15 +474,6 @@ async def del_token(value: str, request: Request,
     return {"code": 0, "message": "success", "data": result}
 
 
-@router.post("/api/tokens/sync")
-async def sync_tokens(request: Request,
-                      actor: Principal = Depends(require_scope("token:sync"))):
-    """从 DataHub users.json 拉取并合并用户 token（权限配置保留）"""
-    result = await storage.sync_tokens_detailed(
-        get_config().get("datahub_url", ""), force=True)
-    return {"code": 0, "message": "success", "data": result}
-
-
 # ---------------------------------------------------------------------------
 # 审计查询
 # ---------------------------------------------------------------------------

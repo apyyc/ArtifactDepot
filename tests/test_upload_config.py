@@ -30,7 +30,7 @@ COMPLETE = "/api/objects/complete"
 def _write_config(path: Path, depot: Path, upload=None) -> None:
     cfg = {
         "depot_dir": str(depot), "meta_dir": "", "access_token": ADMIN,
-        "datahub_url": "", "ui_enabled": True, "max_upload_mb": 0,
+        "ui_enabled": True, "max_upload_mb": 0,
     }
     if upload is not None:
         cfg["upload"] = upload

@@ -13,7 +13,7 @@
   uploaded_chunks / idle_seconds；不泄露服务端绝对路径
 - idle_seconds 反映最后分片写入距今秒数（页面据此显示「已中断（未在传输）」/最后活动时间）
 - 取消（POST /api/objects/abort）后列表立即消失
-- 权限目录仍 23 条、OpenAPI 操作仍 35 条（该接口 include_in_schema=False）
+- 权限目录仍 22 条、OpenAPI 操作仍 34 条（该接口 include_in_schema=False）
 """
 import json
 import sys
@@ -37,7 +37,7 @@ def ctx(tmp_path, monkeypatch):
     cfg = tmp_path / "cfg.json"
     cfg.write_text(json.dumps({
         "depot_dir": str(depot), "meta_dir": "", "access_token": ADMIN,
-        "datahub_url": "", "ui_enabled": True, "max_upload_mb": 0,
+        "ui_enabled": True, "max_upload_mb": 0,
         "upload": {"chunk_size_mb": 1, "max_chunk_mb": 1},
     }), encoding="utf-8")
     monkeypatch.setenv("ARTIFACT_DEPOT_CONFIG", str(cfg))
@@ -172,11 +172,11 @@ def test_empty_list_and_completed_sessions_not_listed(ctx):
 
 
 def test_public_contract_counts_unchanged(ctx):
-    """内部接口不进 OpenAPI、不新增权限点：权限目录 23 条、OpenAPI 操作 35 条。"""
+    """内部接口不进 OpenAPI、不新增权限点：权限目录 22 条、OpenAPI 操作 34 条。"""
     c = ctx
     d = c.get("/api/auth/permissions").json()["data"]
-    assert len(d["permissions"]) == 23
+    assert len(d["permissions"]) == 22
     spec = c.get("/openapi.json").json()
     ops = {(m.upper(), p) for p, item in spec["paths"].items() for m in item}
-    assert len(ops) == 35
+    assert len(ops) == 34
     assert "/api/objects/uploads" not in spec["paths"]

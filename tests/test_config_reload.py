@@ -86,7 +86,7 @@ def test_config_reload_endpoint_admin_only(tmp_path, monkeypatch):
     depot.mkdir()
     cfg = tmp_path / "config.json"
     cfg.write_text(json.dumps({"depot_dir": str(depot), "meta_dir": "", "access_token": ADMIN,
-                               "datahub_url": "", "ui_enabled": True}), encoding="utf-8")
+                               "ui_enabled": True}), encoding="utf-8")
     monkeypatch.setenv("ARTIFACT_DEPOT_CONFIG", str(cfg))
     monkeypatch.setenv("ARTIFACT_DEPOT_ENV", str(tmp_path / ".env.not-exist"))
     monkeypatch.delenv("ARTIFACT_DEPOT_ACCESS_TOKEN", raising=False)
