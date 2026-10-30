@@ -9,6 +9,38 @@ ArtifactDepot v0.10.0 — 所有对本项目的重要更改都将记录在此文
 
 ## [未发布]
 
+### 新增：目录签名链接（后台打包）与目录行下载（2026-10-31）
+
+#### Added
+
+- **目录行「下载」**：目录操作列新增下载入口，与顶部「下载本目录」一致（唯一可见文件直下 / 其他流式 ZIP）。
+- **目录签名链接**：目录行新增「签名链接」，支持按时效/按次数/永久三种模式；链接立即返回，后台打包到
+  `<bucket>/<目录>/.package/<link_id>/`（唯一文件复制 / 其他 ZIP，先临时文件再原子落盘 + `.ready.json`）。
+  网页复用下载进度弹窗显示扫描/打包进度，支持取消（链接作废）与「后台进行」；链接列表显示目录 ZIP 与打包状态。
+- **成品下载**：打包完成后通过签名链接返回真实文件（支持 HEAD/Range/ETag），语义与「下载本目录」一致；
+  未就绪返回 `409` 且不消耗次数，`HEAD` 不消耗次数。
+- **生命周期**：链接过期/次数用完/作废后按配置后台删包，作废可立即删包；启动时清理失效/残留包并恢复未完成打包；
+  目录重命名时链接 key 跟随（旧分享 URL 仍有效），删除/清空目录时相关链接作废并删包。
+- **配置**：新增 `signed_links.allow_directory` 与 `package.*`（enabled/max_items/max_total_mb/
+  max_concurrent_jobs/zip_compression/cleanup_interval_seconds/cleanup_grace_seconds/delete_on_revoke/
+  cleanup_on_startup）；配置页新增「目录打包」分组，支持 `.env` 点号与 `ARTIFACT_DEPOT_PACKAGE_*` 环境变量。
+- **接口**：`POST /api/objects/presign` 增加 `kind=file|dir`；新增网页内部接口
+  `GET /api/objects/signed-links/{id}/package`、`POST .../package/cancel`（`include_in_schema=false`，不增加
+  OpenAPI 操作数与权限点）；列表返回 `kind/package_state`；`signed-links/config` 与 `/api/auth/permissions`
+  下发打包配置。
+- **审计**：新增 `package` 动作（start/done/fail/cancel/cleanup，含 link_id/文件数/字节数/耗时）；
+  目录链接下载写 `download` / `download_bulk`，带 `signed=true`、`package=true`。
+- **测试**：新增 `tests/test_dir_signed_links.py`（打包/下载/清理/权限/改名/删除）与
+  `tests/test_dir_signed_links_ui.py`（网页入口/进度弹窗标记）。
+
+#### Changed
+
+- 目录行操作列由「删除」扩展为「下载 / 签名链接 / 删除」；文件行不变。
+- `config_schema` 新增「目录打包」分组与 10 项配置；`config.json` / `config.production.json` 同步模板。
+- 文档：README、`docs/api_rules.md`、`docs/architecture.md` 补充目录签名链接契约、`.package` 布局与配置。
+
+---
+
 ### 修复：浏览器断开/刷新后的未完成上传被误显示为仍在传输（2026-10-26）
 
 #### Fixed

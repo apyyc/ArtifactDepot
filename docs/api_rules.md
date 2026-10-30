@@ -67,7 +67,7 @@ token 传递方式：
 | `401` | 缺少/无效/过期/禁用令牌；签名无效或过期 |
 | `403` | 权限不足；资源范围越界；越权修改 token；非创建者作废链接；非管理员修改 `access_token` |
 | `404` | 对象/目录/token/链接/文档不存在；一键下载空目录 |
-| `409` | 目标已存在且 `overwrite=false`；上传/分片目标类型冲突 |
+| `409` | 目标已存在且 `overwrite=false`；上传/分片目标类型冲突；目录签名链接的成品尚未打包完成 |
 | `413` | 超过单文件上传上限或单分片上限 |
 | `416` | Range 不可满足 |
 | `422` | 请求参数校验失败（字段缺失/类型错误），`detail` 为数组 |
@@ -236,7 +236,8 @@ POST /api/objects/presign
 | 字段 | 必填 | 说明 |
 |---|---|---|
 | `bucket` | 是 | bucket |
-| `key` | 是 | 对象 key |
+| `key` | 是 | 对象 key；`kind=dir` 时为目标目录 |
+| `kind` | 否 | `file`（默认）/ `dir`（目录打包链接，见 §2.8.1） |
 | `mode` | 否 | `count` / `time`（默认）/ `permanent` |
 | `count` | 否 | `mode=count` 的次数，受 `config.signed_links.count_min/max`（默认 1–10）限制 |
 | `expires` | 否 | `mode=time` 的秒数，默认 3600，受 `config.signed_links.expire_min/max`（默认 60–604800）限制 |
@@ -245,10 +246,35 @@ POST /api/objects/presign
 
 ```json
 { "url": "/api/objects/download?bucket=..&key=..&link=<id>&tk=<token>", "id": "<id>",
-  "mode": "time", "max_uses": null, "remaining": null, "expires": 1730000000 }
+  "kind": "file", "mode": "time", "max_uses": null, "remaining": null, "expires": 1730000000 }
 ```
 
-`max_uses`/`remaining` 仅 `count` 模式有值；`expires` 仅 `time` 模式为时间戳。生成时校验参数，不强制对象已存在。key 含 `&`、`#`、`+` 时返回的 `url` 未编码，建议自行编码或使用显式参数。
+`max_uses`/`remaining` 仅 `count` 模式有值；`expires` 仅 `time` 模式为时间戳。生成时校验参数，不强制对象已存在。key 含 `&`、`#`、`+` 时返回的 `url` 未编码，建议自行编码或使用显式参数。`kind=dir` 时响应额外带 `package` 进度快照，链接会立即返回，打包在后台继续。
+
+### 2.8.1 目录签名链接（kind=dir）
+
+```
+POST /api/objects/presign    {"bucket":"b","key":"dir","kind":"dir","mode":"time","expires":3600}
+GET  /api/objects/signed-links/{link_id}/package          # 打包状态/进度（网页内部）
+POST /api/objects/signed-links/{link_id}/package/cancel   # 取消打包并作废链接（网页内部）
+```
+
+**鉴权**：创建仍用 `link:create` + 资源范围；状态/取消接口同样要求 `link:create`，且仅管理员或链接创建者可操作（`include_in_schema=false`，不增加 OpenAPI 操作数）。
+
+**规则**：
+
+- 仅当 `signed_links.allow_directory=true` 且 `package.enabled=true` 时允许；否则 `403`。
+- 链接立即创建（三种模式与文件链接一致），同时启动后台打包：
+  - 目录只有 1 个可见文件且无可见子目录 → 复制该文件为成品（下载时直下，与 §2.11 一致）；
+  - 其他非空目录 → 打包 `<目录名>.zip`（`package.zip_compression`：`stored` 默认 / `deflate`）。
+- 成品位于 `<bucket>/<目录>/.package/<link_id>/`，完成标记 `.ready.json`；该隐藏目录不参与列表、ZIP、目录大小统计，对象 key 也不能直接访问。
+- 打包中打开链接 → `409`（带 `Retry-After`），**不消耗次数**；`HEAD` 只探测不消耗次数；`GET` 成功才消费次数。
+- 成品是真实文件，下载走 `FileResponse`，支持 `HEAD/Range/ETag`；ZIP 顶层文件夹名为目录最后一段。
+- 打包失败或被取消 → 删除半成品并**自动作废链接**（管理端重新生成）；空目录、超过 `package.max_items`、超过 `package.max_total_mb` 均视为失败。
+- 链接失效（过期 / 次数用完 / 作废）后，后台按 `package.cleanup_interval_seconds` 扫描，并延迟 `package.cleanup_grace_seconds` 删除 `.package`；`package.delete_on_revoke=true` 时作废立即删包。
+- `package.cleanup_on_startup=true` 时启动会清理失效/残留包，并恢复上次进程未完成的打包任务。
+- 目录重命名/移动时链接 `key` 跟随更新，旧分享 URL 仍有效（下载以注册表 key 为准）；删除目录或批量清空时相关链接作废并删包。
+- 审计：`package` 动作记录 `phase=start/done/fail/cancel/cleanup`、`link_id`、文件数/目录数/字节数/耗时；成品下载写 `download`（单文件）或 `download_bulk`（ZIP），带 `signed=true`、`package=true`。
 
 ### 2.9 签名链接配置、列表与作废
 
@@ -258,9 +284,9 @@ GET  /api/objects/signed-links                   # link:list
 POST /api/objects/signed-links/{link_id}/revoke  # link:revoke
 ```
 
-- 配置：返回 `count_min/count_max/expire_min_seconds/expire_max_seconds`。
-- 列表：带范围 token 只返回范围内链接；完整 URL 仅管理员/创建者可见；`token` 字段不返回。
-- 作废：管理员可作废任意，用户只能作废自己创建的；`link_id` 不存在 → `404`。
+- 配置：返回 `count_min/count_max/expire_min_seconds/expire_max_seconds`，以及 `package`（`allow_directory/enabled/max_items/max_total_mb/max_concurrent_jobs/zip_compression/cleanup_*` 等公开上限）。
+- 列表：带范围 token 只返回范围内链接；完整 URL 仅管理员/创建者可见；`token` 字段不返回。每条带 `kind`（`file`/`dir`）与 `package_state`（目录链接：`ready/queued/scanning/packaging/failed/cancelled/missing/invalid`）。
+- 作废：管理员可作废任意，用户只能作废自己创建的；`link_id` 不存在 → `404`；目录链接作废时按配置立即删包。
 
 ### 2.10 批量删除目录内容
 
@@ -307,6 +333,7 @@ GET /api/objects/download-bulk?bucket=<bucket>&prefix=<prefix>
 - 空目录、不存在或不是目录 → `404`；`prefix` 解析后越出 bucket → `400`。
 - 单次 `files+dirs` 上限 100000，超出 `400`。
 - 失败请求不写审计、不计下载指标；ZIP 不支持 Range。
+- 目录签名链接（§2.8.1）的成品下载保持同一语义：唯一可见文件直下 / 其他 ZIP；但成品是后台预打包的真实文件，支持 `HEAD/Range/ETag`。
 
 ### 2.12 分块并发下载
 
@@ -586,6 +613,8 @@ GET /api/audit
 
 响应为审计记录数组，每条含 `time`、`action`、`bucket`、`key`、`actor`、`ip`、`public_ip`、`size`、`sha256` 及动作附加字段。
 
+常见动作：`upload`、`download`、`download_bulk`、`delete`、`delete_bulk`、`presign`、`revoke`、`package`。目录打包的 `package` 记录带 `phase`（`start/done/fail/cancel/cleanup`）、`link_id`、`files`、`dirs`、`elapsed_ms` 等字段；目录签名链接下载额外带 `signed=true`、`package=true`。
+
 带资源范围的用户 token 只返回范围内、且归属于具体 bucket 的记录；`bucket=""` 的全局事件（token/config 变更等）不返回。管理员与未受限 token 可看全量。
 
 ---
@@ -638,6 +667,8 @@ GET /api/docs/{name}?raw=1    # text/plain 原文
 | POST | `/api/objects/bulk-delete` | `object:delete_bulk` |
 | GET | `/api/objects/signed-links` | `link:list` |
 | POST | `/api/objects/signed-links/{link_id}/revoke` | `link:revoke` |
+| GET | `/api/objects/signed-links/{link_id}/package` | `link:create`（内部接口） |
+| POST | `/api/objects/signed-links/{link_id}/package/cancel` | `link:create`（内部接口） |
 | POST | `/api/objects/initiate` | `upload:initiate` |
 | POST | `/api/objects/chunk` | `upload:chunk` |
 | POST | `/api/objects/complete` | `upload:complete` |
@@ -679,6 +710,16 @@ GET /api/docs/{name}?raw=1    # text/plain 原文
 | `signed_links.count_max` | 10 | 签名链接次数上限（1–100000） |
 | `signed_links.expire_min_seconds` | 60 | 签名链接时效下限（1–31536000 秒） |
 | `signed_links.expire_max_seconds` | 604800 | 签名链接时效上限（1–31536000 秒） |
+| `signed_links.allow_directory` | true | 是否允许生成目录打包签名链接 |
+| `package.enabled` | true | 目录打包总开关 |
+| `package.max_items` | 100000 | 单次打包 files+dirs 上限（1–1000000） |
+| `package.max_total_mb` | 0 | 单次打包源文件总大小上限（0=不限，0–1048576MB） |
+| `package.max_concurrent_jobs` | 1 | 同时打包任务数（1–8） |
+| `package.zip_compression` | `stored` | `stored` / `deflate` |
+| `package.cleanup_interval_seconds` | 60 | 失效包后台清理间隔（60–86400 秒） |
+| `package.cleanup_grace_seconds` | 60 | 链接失效后延迟删包宽限期（0–86400 秒） |
+| `package.delete_on_revoke` | true | 作废链接时立即删包 |
+| `package.cleanup_on_startup` | true | 启动时清理失效/残留包并恢复未完成打包 |
 | `upload.chunk_size_mb` | 8 | 分片大小（1–64MB） |
 | `upload.chunk_concurrency` | 4 | 每文件分片并发（1–16） |
 | `upload.file_concurrency` | 3 | 同时上传文件数（1–10） |
@@ -696,7 +737,7 @@ GET /api/docs/{name}?raw=1    # text/plain 原文
 | `token.min_length` | 5 | 新建 token 最小长度（1–256） |
 | `token.max_length` | 30 | 新建 token 最大长度（1–256）；自动生成时取该长度 |
 
-常用环境变量：`ARTIFACT_DEPOT_ACCESS_TOKEN`、`ARTIFACT_DEPOT_PORT`、`ARTIFACT_DEPOT_MAX_UPLOAD_MB`、`ARTIFACT_DEPOT_TOKEN_MIN_LENGTH`/`MAX_LENGTH`、`ARTIFACT_DEPOT_DOWNLOAD_*`、`ARTIFACT_DEPOT_UPLOAD_*`、`ARTIFACT_DEPOT_UI_FILE_PAGE_SIZE`/`UI_AUDIT_PAGE_SIZE`。
+常用环境变量：`ARTIFACT_DEPOT_ACCESS_TOKEN`、`ARTIFACT_DEPOT_PORT`、`ARTIFACT_DEPOT_MAX_UPLOAD_MB`、`ARTIFACT_DEPOT_TOKEN_MIN_LENGTH`/`MAX_LENGTH`、`ARTIFACT_DEPOT_DOWNLOAD_*`、`ARTIFACT_DEPOT_UPLOAD_*`、`ARTIFACT_DEPOT_UI_FILE_PAGE_SIZE`/`UI_AUDIT_PAGE_SIZE`、`ARTIFACT_DEPOT_SIGNED_LINKS_ALLOW_DIRECTORY`、`ARTIFACT_DEPOT_PACKAGE_*`。
 
 ---
 
@@ -708,9 +749,9 @@ GET /api/docs/{name}?raw=1    # text/plain 原文
 GET /api/auth/permissions
 ```
 
-公开，返回：`{permissions, public, roles, default_role, require_read_token, upload, download, ui, token}`。
+公开，返回：`{permissions, public, roles, default_role, require_read_token, upload, download, ui, token, package}`。
 
-`permissions` 每项为 `{key, group, label, method, path, write}`；`upload`/`download`/`ui`/`token` 下发对应运行参数。
+`permissions` 每项为 `{key, group, label, method, path, write}`；`upload`/`download`/`ui`/`token`/`package` 下发对应运行参数。
 
 ### 10.2 权限点（22 条）
 

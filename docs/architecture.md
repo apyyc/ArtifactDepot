@@ -48,6 +48,7 @@ ArtifactDepot/
     ├── storage.py              # 对象存储引擎：路径安全 / put/list/delete/bulk_delete / bulk_download_scan / manifest / 预签名 /
     │                           #   签名链接注册表 / token 注册表 / 审计 / meta_dir /
     │                           #   分片会话（目标目录 .artifactdepot-uploads 与 legacy staging、进程内 registry、续传与 TTL 清理）
+    ├── packaging.py            # 目录签名链接后台打包（扫描→复制/ZIP、进度、.package 就绪标记、失效清理、改名/删除钩子）
     ├── zipstream.py            # 流式 ZIP（后台线程 + 有界队列 + 背压；目录一键下载，不落临时文件）
     ├── auth.py                 # 写操作 token 校验（query / Bearer）
     ├── api/
@@ -68,9 +69,11 @@ ArtifactDepot/
 ├── <bucket>/                     # bucket = 项目（如 project_1）
 │   ├── task_5/                   # key 的父目录（可多级）
 │   │   ├── xxx.mp4               # key = 任务/文件名（扁平路径式命名）
-│   │   └── .artifactdepot-uploads/<upload_id>/
-│   │                             # 活跃分片上传会话（伴随文件本地化；完成/超时自动清理）
-│   │                             #   .session.json / chunk_<i>.part / .incoming/ / .merged
+│   │   ├── .artifactdepot-uploads/<upload_id>/
+│   │   │                         # 活跃分片上传会话（伴随文件本地化；完成/超时自动清理）
+│   │   │                         #   .session.json / chunk_<i>.part / .incoming/ / .merged
+│   │   └── .package/<link_id>/   # 目录签名链接成品（后台打包；链接失效后清理）
+│   │                             #   <目录名>.zip 或唯一文件名 + .ready.json
 │   └── .warehouse.json           # 每 bucket 元数据清单（隐藏，列表跳过）
 ├── .staging/                     # 默认 staging（upload.staging_dir 留空时）：
 │                                 #   legacy 会话 <upload_id>/ + Starlette multipart spool
@@ -91,8 +94,10 @@ ArtifactDepot/
   - 客户端（桌面）：上传断点 `.<源文件名>.artifactdepot-upload.json`、下载 `.part` 与
     `.<目标名>.artifactdepot-download.json`（0600）；源目录不可写时上传断点回退
     `~/.artifactdepot/upload-state/<sha1(server|bucket|key)>.json`。
-- `.artifactdepot-uploads` / `.staging` 均为隐藏目录：列表、目录递归大小、ZIP 打包均跳过；
+- `.artifactdepot-uploads` / `.staging` / `.package` 均为隐藏目录：列表、目录递归大小、ZIP 打包均跳过；
   **批量删除 `mode="all"` 与 `rename_object` 显式跳过 `.artifactdepot-uploads`**（内部目录保护）。
+  `.package` 由目录签名链接专用：对象 key 校验禁止隐藏路径段，外部无法直接访问；删除/清空目录前会
+  先作废相关链接并删包，重命名时随目录一起移动并同步链接 key。
 - **文件系统是唯一事实源**：列表以目录扫描为准，手工放入的文件也能列出；
   `.warehouse.json` 清单只做元数据补充（size/sha256/mtime/source_url）。
 - 隐藏点文件（`.` 开头）不在列表展示、不可作为上传 key，防止覆盖清单。
@@ -107,9 +112,12 @@ ArtifactDepot/
 
 - 支持环境变量：`ARTIFACT_DEPOT_DIR` / `ARTIFACT_DEPOT_META_DIR` /
   `ARTIFACT_DEPOT_ACCESS_TOKEN` / `ARTIFACT_DEPOT_PORT` / `ARTIFACT_DEPOT_MAX_UPLOAD_MB`，
-  以及 `upload.*`（10 个 `ARTIFACT_DEPOT_UPLOAD_*`，含 `ARTIFACT_DEPOT_UPLOAD_STAGING_DIR`）与
-  `download.*`（3 个 `ARTIFACT_DEPOT_DOWNLOAD_*`）；
-  `.env` 支持点号写法（`upload.chunk_size_mb=8` / `upload.staging_dir=/data/depot/.staging` / `download.chunk_size_mb=8`）
+  以及 `upload.*`（10 个 `ARTIFACT_DEPOT_UPLOAD_*`，含 `ARTIFACT_DEPOT_UPLOAD_STAGING_DIR`）、
+  `download.*`（3 个 `ARTIFACT_DEPOT_DOWNLOAD_*`）、`signed_links.allow_directory`
+  （`ARTIFACT_DEPOT_SIGNED_LINKS_ALLOW_DIRECTORY`）与 `package.*`
+  （`ARTIFACT_DEPOT_PACKAGE_*`）；
+  `.env` 支持点号写法（`upload.chunk_size_mb=8` / `upload.staging_dir=/data/depot/.staging` /
+  `download.chunk_size_mb=8` / `package.max_items=100000`）
 - `upload.staging_dir` 只在启动时设置 `tempfile.tempdir`（框架 spool 落点）并创建目录；
   热重载改它会在 `config/reload` 的 `needs_restart` 中提示，需重启才完整生效。
 
@@ -133,10 +141,12 @@ ArtifactDepot/
 | GET | `/api/objects/download-bulk` | 一键下载目录：单文件直下 / 多文件或含子目录流式 ZIP（复用 `object:download`；见下「可靠性要点」） | - |
 | DELETE | `/api/objects` | 删除对象/空目录（权限点 `object:delete`） | DeleteObject |
 | POST | `/api/objects/bulk-delete` | 批量删除目录内容（`object:delete_bulk`；保留目录本身、需输入名称确认；见下「可靠性要点」） | - |
-| POST | `/api/objects/presign` | 生成签名链接（count/time/permanent） | Presigned URL |
-| GET | `/api/objects/signed-links` | 列签名链接（`link:list`；完整 URL 仅管理员/创建者） | - |
-| GET | `/api/objects/signed-links/config` | 签名链接次数/时效上下限（公开） | - |
-| POST | `/api/objects/signed-links/{link_id}/revoke` | 作废签名链接（`link:revoke`；本人或管理员） | - |
+| POST | `/api/objects/presign` | 生成签名链接（`kind=file` 文件 / `kind=dir` 目录打包；count/time/permanent） | Presigned URL |
+| GET | `/api/objects/signed-links` | 列签名链接（`link:list`；完整 URL 仅管理员/创建者；目录链接带 `package_state`） | - |
+| GET | `/api/objects/signed-links/config` | 签名链接次数/时效上下限 + 目录打包能力（公开） | - |
+| POST | `/api/objects/signed-links/{link_id}/revoke` | 作废签名链接（`link:revoke`；本人或管理员；目录链接按配置删包） | - |
+| GET | `/api/objects/signed-links/{link_id}/package` | 目录打包状态/进度（`link:create`；内部接口，`include_in_schema=false`） | - |
+| POST | `/api/objects/signed-links/{link_id}/package/cancel` | 取消目录打包并作废链接（`link:create`；内部接口） | - |
 | GET/POST/DELETE | `/api/tokens` | Token 注册表管理（`token:read/write/delete`；默认脱敏前 2 + 后 4） | - |
 | PUT | `/api/tokens/{value}` | 更新 token 权限/范围/过期/启用状态（`token:write`） | - |
 | GET/POST | `/api/config` | 运行时配置快照 / 在线写回 config.json 并热加载（`config:write`；`include_in_schema=false`） | - |
@@ -217,6 +227,16 @@ ArtifactDepot/
   客户端中断置位 `threading.Event`，生产线程退出并由 `finish_once()` 兜底写一条 `aborted=true` 审计。
   预检只读扫描（`bulk_download_scan`）决定「单文件直下 / ZIP」，隐藏项与符号链接跳过、不跟随；
   `prefix` 解析（含符号链接）后必须仍在本 bucket 内，单次 `files + dirs` 上限 `MAX_BULK_DOWNLOAD_ITEMS = 100000`。
+- **目录签名链接后台打包**（`packaging.py` + `.package`）：
+  `presign(kind=dir)` 立即创建链接并返回，随后在后台 daemon 线程按 `package.max_concurrent_jobs` 限流打包；
+  成品先写临时文件，`os.replace` 原子落盘为 `.package/<link_id>/<目录名>.zip`（或唯一文件），再写 `.ready.json`。
+  下载接口先 `inspect_signed_link`（只校验不消费）再检查就绪，未就绪返回 `409` 且不扣次数；成品是真实文件，
+  通过 `FileResponse` 支持 `HEAD/Range/ETag`。失败/取消自动作废链接并删包；链接失效后按
+  `package.cleanup_interval_seconds` + `package.cleanup_grace_seconds` 后台删包；启动时按
+  `package.cleanup_on_startup` 清理残留并恢复未完成任务。`.package` 是隐藏内部目录（列表/ZIP/目录统计跳过，
+  对象 key 不能直接访问）；目录改名时链接 key 跟随、旧 URL 仍可用（下载以注册表 key 为准），
+  删除/批量清空目录时相关链接作废并删包。进度保存在进程内 registry（单进程假设）；`.ready.json`
+  是持久完成标记，重启后已完成包仍可下载。
 - 容器以非 root 用户 `artifactdepot(10001)` 运行；绑定宿主机目录时由 `deploy_container.sh` 以宿主 UID/GID + `--userns=keep-id` 运行，保证卷可写。
 
 ## 可观测性
@@ -238,6 +258,10 @@ ArtifactDepot/
 - 一键下载：复用 `object:download` + bucket/前缀范围；只打包可见项（隐藏文件/目录、`.keep`、`.warehouse.json`、
   符号链接一律跳过且不跟随），`prefix` 解析后不得越出 bucket；ZIP 条目名来自真实相对路径，中文名用 RFC 5987
   `filename*`；流式生成、单次上限 100000 项。
+- 目录签名链接：创建复用 `link:create` + 资源范围（与文件链接一致，不新增权限点）；打包内容同样是**只打包可见项**，
+  `package.max_items` / `package.max_total_mb` 限制资源消耗；`.package` 隐藏且对象 key 校验禁止隐藏段，
+  外部无法直接访问，下载只能通过链接；状态/取消接口要求 `link:create` 且仅创建者/管理员；失败/取消自动作废链接，
+  过期/次数用完/作废后清理包。注意：链接是能力凭证，持有者可在有效期内下载整目录快照（与文件链接一致）。
 - 共享令牌：`access_token` 默认 `admin`（内置 / `config.json` / `.env`），仅用于内网开箱即用/联调；
   `admin` 属弱口令会触发启动告警，`ARTIFACT_DEPOT_STRICT_CONFIG=1` 时拒绝启动；生产必须改为 ≥16 位随机串。
 - 分块下载：复用 `object:download`，`HEAD` 探测不新增权限点；每个 Range 独立鉴权、独立写审计；

@@ -44,6 +44,7 @@ ArtifactDepot 是一个基于 FastAPI 的对象存储式工件仓库（S3 风格
 | 目录管理 | 新建目录、重命名与移动、删除（仅允许空目录）、批量删除目录内容（`files` / `all`，执行时需输入目录名确认） |
 | 一键下载目录 | 目录内只有 1 个可见文件且没有可见子目录时直接下载；其余非空情况（多文件或含子目录）流式打包 ZIP，不写临时文件 |
 | 签名链接 | 按时效（秒）、按次数（1 至上限）或永久；可作废；上下限由配置控制 |
+| 目录签名链接 | 目录行生成分享链接；后台打包到 `<目录>/.package/<link_id>/`（唯一文件直下 / 其他 ZIP），生成后立即返回链接并显示进度；链接失效自动删包，目录改名链接跟随、删除/清空目录自动作废 |
 | 身份与权限 | 管理员共享 token 拥有全部权限；用户 token 可从 22 个权限点与 9 种角色预设中组合，并可限定 bucket、路径前缀与过期时间 |
 | 审计与可观测 | 上传、下载、删除、建目录、改名、签名、Token 变更等操作写入 JSONL 审计（客户端 IP、UTC，配置可信代理时另记解析出的公网 IP）；提供 `/metrics`、`/health/live`、`/health/ready` 与 `X-Request-ID` |
 | 网页控制台 | 浏览、签名链接、Token 管理、审计、配置五个标签页；拖拽上传、上传队列暂停与继续、分块并发下载、批量删除、在线修改配置 |
@@ -86,6 +87,8 @@ ArtifactDepot 是一个基于 FastAPI 的对象存储式工件仓库（S3 风格
 │   ├── <key 路径>/<文件>            # key 含 / 即多级目录
 │   ├── <key 路径>/.artifactdepot-uploads/<upload_id>/
 │   │                                # 分片上传会话（完成或过期后自动清理）
+│   ├── <key 路径>/.package/<link_id>/
+│   │                                # 目录签名链接成品（<目录名>.zip 或唯一文件 + .ready.json）
 │   └── .warehouse.json              # 该 bucket 的对象元数据清单（隐藏）
 └── .staging/                        # 默认 staging（upload.staging_dir 留空时）
                                      # 旧版会话与 multipart spool 临时文件
@@ -228,7 +231,7 @@ PYTHONPATH=src .venv/bin/python -m uvicorn artifactdepot.main:app --host 0.0.0.0
 3. 上传：选择文件或把文件拖拽到页面任意位置；大文件自动分片，可暂停、继续或在失败后续传。
 4. 管理：新建目录；删除文件或空目录；需要清空目录时使用「清空本目录文件」或「删除本目录全部内容」，先预览再输入目录名确认（bucket 根目录输入 bucket 名）。
 5. 下载：单个文件自动分块并发下载，可取消；「下载本目录」在仅有 1 个可见文件且没有子目录时直接下载，否则打包 ZIP。
-6. 分享：为文件生成按时效、按次数或永久的签名链接。
+6. 分享：为文件生成按时效、按次数或永久的签名链接；目录行也可生成目录打包链接（链接立即生成，后台打包完成后可下载，唯一文件直下 / 其他 ZIP）。
 7. 管理员：在「Token 管理」中生成、更新、移除 token，在「审计」中查询记录，在「配置」中在线修改配置。
 8. 接口调试：`/docs`（Swagger UI）与 `/redoc`（ReDoc），文档原文可从 `/api/docs` 获取。
 9. 桌面客户端：`cd client && ./run.sh`，用法见 [client/README.md](client/README.md)。
@@ -272,6 +275,12 @@ PYTHONPATH=src .venv/bin/python -m uvicorn artifactdepot.main:app --host 0.0.0.0
 | `ui.file_page_size` / `ui.audit_page_size` | `200` / `500` | 网页文件列表分页条数与审计查询条数 |
 | `signed_links.count_min` / `count_max` | `1` / `10` | 签名链接次数范围 |
 | `signed_links.expire_min_seconds` / `expire_max_seconds` | `60` / `604800` | 签名链接时效范围（秒） |
+| `signed_links.allow_directory` | `true` | 是否允许生成目录打包签名链接 |
+| `package.enabled` | `true` | 目录打包总开关 |
+| `package.max_items` / `max_total_mb` | `100000` / `0` | 单次打包项数上限与源文件总大小上限（MB，`0` 不限） |
+| `package.max_concurrent_jobs` / `zip_compression` | `1` / `stored` | 同时打包任务数与 ZIP 方式（`stored` / `deflate`） |
+| `package.cleanup_interval_seconds` / `cleanup_grace_seconds` | `60` / `60` | 失效包清理间隔与失效后删包宽限期（秒） |
+| `package.delete_on_revoke` / `cleanup_on_startup` | `true` / `true` | 作废时立即删包 / 启动时清理并恢复未完成打包 |
 | `upload.chunk_size_mb` / `chunk_concurrency` | `8` / `4` | 分片大小（MB）与单文件分片并发数 |
 | `upload.file_concurrency` | `3` | 网页端同时上传的文件数 |
 | `upload.request_timeout_seconds` | `86400` | 分片与合并请求超时（秒） |
@@ -289,6 +298,8 @@ PYTHONPATH=src .venv/bin/python -m uvicorn artifactdepot.main:app --host 0.0.0.0
 | `ARTIFACT_DEPOT_CONFIG` / `ARTIFACT_DEPOT_ENV` | 配置文件与 `.env` 文件路径 |
 | `ARTIFACT_DEPOT_DIR` / `ARTIFACT_DEPOT_META_DIR` | `depot_dir` / `meta_dir` |
 | `ARTIFACT_DEPOT_ACCESS_TOKEN` / `ARTIFACT_DEPOT_PORT` / `ARTIFACT_DEPOT_MAX_UPLOAD_MB` | 共享令牌、端口与上传上限 |
+| `ARTIFACT_DEPOT_SIGNED_LINKS_ALLOW_DIRECTORY` | `signed_links.allow_directory` |
+| `ARTIFACT_DEPOT_PACKAGE_*` | `package.enabled/max_items/max_total_mb/max_concurrent_jobs/zip_compression/cleanup_*` 等同名配置 |
 | `ARTIFACT_DEPOT_UPLOAD_*` | `upload.*` 各项，例如 `ARTIFACT_DEPOT_UPLOAD_CHUNK_SIZE_MB` |
 | `ARTIFACT_DEPOT_DOWNLOAD_*` | `download.*` 各项，例如 `ARTIFACT_DEPOT_DOWNLOAD_CHUNK_CONCURRENCY` |
 | `ARTIFACT_DEPOT_UI_FILE_PAGE_SIZE` / `ARTIFACT_DEPOT_UI_AUDIT_PAGE_SIZE` | 网页分页条数 |
@@ -308,8 +319,8 @@ PYTHONPATH=src .venv/bin/python -m uvicorn artifactdepot.main:app --host 0.0.0.0
 
 | 标签页 | 功能 |
 |---|---|
-| 浏览 | bucket 选择与目录导航、分页加载、拖拽上传、上传队列（暂停、继续、取消、断点续传）、单文件下载（分块并发、进度与速度、取消）、下载目录、新建目录、删除与批量删除、签名链接入口 |
-| 签名链接 | 查看全部链接、复制、作废 |
+| 浏览 | bucket 选择与目录导航、分页加载、拖拽上传、上传队列（暂停、继续、取消、断点续传）、单文件下载（分块并发、进度与速度、取消）、目录行下载、新建目录、删除与批量删除、文件/目录签名链接入口（目录打包显示进度） |
+| 签名链接 | 查看全部链接、复制、作废；目录链接显示「目录 ZIP」与打包状态（就绪/打包中/失败/失效） |
 | Token 管理 | 查看注册表、按权限点生成 token、更新与移除、重新加载配置 |
 | 审计 | 按 bucket、key、操作者、起始时间查询 |
 | 配置 | 展示配置项分组与生效来源，在线修改并热加载 |
@@ -341,7 +352,7 @@ cd client
 |---|---|
 | 对象 | `POST /api/objects`（`object:upload`）、`GET /api/objects/list`（`object:list`）、`GET /api/objects/download`、`HEAD /api/objects/download`（`object:download` 或签名链接）、`GET /api/objects/head`（`object:head`）、`GET /api/objects/download-bulk`（`object:download`）、`DELETE /api/objects`（`object:delete`）、`POST /api/objects/mkdir`（`object:mkdir`）、`POST /api/objects/rename`（`object:rename`）、`POST /api/objects/bulk-delete`（`object:delete_bulk`） |
 | 分片上传 | `POST /api/objects/initiate`、`chunk`、`complete`、`abort`（`upload:initiate`、`upload:chunk`、`upload:complete`、`upload:abort`）；`GET /api/objects/uploads` 为网页使用的内部接口，不进入 OpenAPI |
-| 签名链接 | `POST /api/objects/presign`（`link:create`）、`GET /api/objects/signed-links`（`link:list`）、`POST /api/objects/signed-links/{link_id}/revoke`（`link:revoke`）、`GET /api/objects/signed-links/config`（公开） |
+| 签名链接 | `POST /api/objects/presign`（`link:create`；`kind=file/dir`）、`GET /api/objects/signed-links`（`link:list`）、`POST /api/objects/signed-links/{link_id}/revoke`（`link:revoke`）、`GET /api/objects/signed-links/config`（公开）；目录打包进度/取消为网页内部接口（`GET /api/objects/signed-links/{link_id}/package`、`POST .../package/cancel`，`include_in_schema=false`） |
 | Bucket | `GET /api/buckets`（公开或 `bucket:list`）、`POST /api/buckets`（`bucket:create`） |
 | Token | `/api/tokens`（`GET` 需 `token:read`，`POST` 与 `PUT /api/tokens/{value}` 需 `token:write`，`DELETE` 需 `token:delete`） |
 | 系统与配置 | `/health`、`/health/live`、`/health/ready`、`/metrics`、`GET /api/auth/check`、`GET /api/auth/permissions`、`GET /api/audit`（`audit:read`）、`GET`/`POST /api/config`、`POST /api/config/reload`（`config:write`） |
@@ -482,7 +493,7 @@ cd <ArtifactDepot 仓库目录>
 - **审计**：上传、下载、删除、建目录、改名、签名、Token 变更等操作均写入审计，记录操作者、客户端 IP（配置可信代理时另记解析出的公网 IP）、UTC 时间、大小与 SHA-256。
 - **数据保护**：状态文件原子写且权限为 600；路径穿越与隐藏路径有防护；`.artifactdepot-uploads` 不会被列表、打包或批量删除破坏。
 - **密钥管理**：敏感项放在 `.env`（不进 git 与镜像），生产配置由部署根下的配置文件经宿主机卷管理；不要把真实令牌写入文档、示例或提交记录。
-- **已知限制**：服务按单实例设计；签名链接按次数计数时，分块并发下载会为每个 Range 请求消耗一次次数，大文件下载建议使用 token；重命名操作非事务，底层 I/O 异常可能留下部分移动。
+- **已知限制**：服务按单实例设计；签名链接按次数计数时，分块并发下载会为每个 Range 请求消耗一次次数，大文件下载建议使用 token；重命名操作非事务，底层 I/O 异常可能留下部分移动。目录打包会在源目录 `.package` 内额外占用一份成品空间（唯一文件复制、其他 ZIP），大目录请用 `package.max_total_mb` / `max_items` 限制；打包任务在后台线程执行，进程重启后未完成的打包会由启动清理重新排队（已在 `.ready.json` 标记的成品不受影响）；永久目录链接的包会一直保留到作废或源目录删除。
 
 安全摘要与逐项说明见 [docs/api_rules.md](docs/api_rules.md)。
 
@@ -495,6 +506,8 @@ cd <ArtifactDepot 仓库目录>
 | 部署后如何设置管理员令牌 | 编辑 `<部署根>/config/config.json`（或同目录 `.env`）中的 `access_token`，再执行 `podman restart artifactdepot` 或 `docker restart artifactdepot` |
 | 一次下载出现多条审计 | 分块并发下载对每个 Range 请求各写一条 `download` 审计（`partial=true`，`size` 为区间字节数）；`HEAD` 记为 `head=true` 且 `size=0`；完整 GET 只有一条 |
 | 下载返回 416 | 请求区间越界，或下载期间对象被替换导致大小变化；重新 `HEAD` 探测后再下载 |
+| 打开目录签名链接返回 409「目录打包中」 | 后台还在扫描/打包；等进度完成后再打开。若打包失败，链接会自动作废，需重新生成（可在「签名链接」页查看状态） |
+| `.package` 是什么、能否删除 | 目录签名链接的成品目录（隐藏），由服务端管理；链接失效后自动清理，不要手工修改或依赖其内容 |
 | 网页下载没有分块并发 | 浏览器不支持 File System Access 且文件超过 1 GiB、服务端未返回 `Accept-Ranges` 或忽略 Range 时，会回退为原生单流下载，属于预期行为 |
 | 上传失败或断网后是否需要重传整个文件 | 不需要。分片会话与已上传分片保留在服务端，再次上传同一文件时只补缺失分片；超过 `upload.session_ttl_seconds` 后会话被清理 |
 | 网页刷新后如何续传 | 浏览器无法恢复文件对象；重新选择同一文件，或在「未完成的上传」中点击「继续上传」，按 `bucket/key/size` 找回会话 |
