@@ -89,3 +89,18 @@
   .dl-bar { height: 14px; background: #eef2f7; border: 1px solid #dcdfe6; border-radius: 7px; overflow: hidden; }
   .dl-bar > span { display: block; width: 0; height: 100%; background: linear-gradient(90deg, #409eff, #67c23a); transition: width .2s ease; }
   .dl-stat { margin-top: 8px; font-size: 12px; color: #909399; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+  /* Token 注册表：权限点数可折叠为格式化详情（默认折叠，点开显示分组中文名 / 说明 / 生效范围） */
+  .tk-scope-toggle { padding: 0; border: none; background: none; color: #409eff; font-size: 13px; cursor: pointer; white-space: nowrap; }
+  .tk-scope-toggle:hover { text-decoration: underline; }
+  .tk-detail-row[hidden] { display: none; }
+  .tk-detail-cell { background: #fafbfc; }
+  .tk-detail { font-size: 12px; line-height: 1.6; color: #606266; }
+  .tk-detail-title { font-weight: bold; color: #303133; }
+  .tk-detail-empty { color: #909399; }
+  .tk-scope-group { display: flex; align-items: flex-start; gap: 8px; margin-top: 4px; }
+  .tk-scope-group-name { flex: 0 0 72px; color: #909399; }
+  .tk-scope-chips { display: flex; flex-wrap: wrap; gap: 4px; }
+  .tk-scope-chip { display: inline-block; padding: 0 7px; border: 1px solid #b3d8ff; border-radius: 10px; background: #ecf5ff; color: #409eff; font-size: 12px; line-height: 18px; }
+  .tk-detail-line { margin-top: 4px; }
+  .tk-detail-label { color: #909399; }
+  .tk-detail-text { word-break: break-word; }

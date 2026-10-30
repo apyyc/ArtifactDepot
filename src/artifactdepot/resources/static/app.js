@@ -87,6 +87,7 @@ document.addEventListener('click', (e) => {
   else if (a === 'del-file') delFile(el.dataset.key)
   else if (a === 'revoke-link') revokeLink(el.dataset.id)
   else if (a === 'remove-token') removeToken(el.dataset.token)
+  else if (a === 'toggle-token-scopes') toggleTokenScopes(el)
   else if (a === 'go-up') goUp()
   else if (a === 'load-more') loadMore()
   else if (a === 'switch-tab') switchTab(el.dataset.tab)
@@ -2654,6 +2655,52 @@ function fmtScopeRange(rec) {
   return parts.length ? parts.join('；') : '未限制（全部 bucket）'
 }
 
+// Token 权限明细：按权限目录的 group 分组；已知权限点按目录顺序输出，未知 key 归到「其他」
+function tokenScopeGroups(scopes) {
+  const perms = TKCATALOG.permissions || []
+  const seen = new Set()
+  ;(scopes || []).forEach(key => { if (key) seen.add(key) })
+  const groups = []
+  perms.forEach(p => {
+    if (!seen.has(p.key)) return
+    seen.delete(p.key)
+    let g = groups.find(x => x.name === p.group)
+    if (!g) { g = { name: p.group, keys: [] }; groups.push(g) }
+    g.keys.push(p.key)
+  })
+  if (seen.size) groups.push({ name: '其他', keys: Array.from(seen) })
+  return groups
+}
+
+// 详情行内容：分组 chips（中文 label，原始 key 仅放 title）+ 说明（非空时）+ 生效范围
+function tokenScopeDetailHtml(rec) {
+  const scopes = rec.scopes || []
+  const groups = tokenScopeGroups(scopes)
+  let html = '<div class="tk-detail">' +
+    '<div class="tk-detail-title">权限点（' + esc(scopes.length) + '）</div>'
+  if (!groups.length) {
+    html += '<div class="tk-detail-empty">（无权限点）</div>'
+  } else {
+    groups.forEach(g => {
+      html += '<div class="tk-scope-group">' +
+        '<span class="tk-scope-group-name">' + esc(g.name) + '</span>' +
+        '<span class="tk-scope-chips">' +
+        g.keys.map(key => '<span class="tk-scope-chip" title="' + esc(key) + '">' +
+          esc(scopeLabel(key)) + '</span>').join('') +
+        '</span></div>'
+    })
+  }
+  const desc = String(rec.description || '').trim()
+  if (desc) {
+    html += '<div class="tk-detail-line"><span class="tk-detail-label">说明：</span>' +
+      '<span class="tk-detail-text">' + esc(desc) + '</span></div>'
+  }
+  html += '<div class="tk-detail-line"><span class="tk-detail-label">生效范围：</span>' +
+    '<span class="tk-detail-text">' + esc(fmtScopeRange(rec)) + '</span></div>'
+  html += '</div>'
+  return html
+}
+
 async function loadTokens() {
   const t = $('admToken').value.trim()
   if (!t) { toast('请输入管理员令牌', false); return }
@@ -2670,22 +2717,36 @@ async function loadTokens() {
       const state = rec.expired ? '<span style="color:#f56c6c;">已过期</span>'
         : (rec.enabled === false ? '<span style="color:#f56c6c;">已禁用</span>'
           : '<span style="color:#67c23a;">有效</span>')
+      const count = (rec.scopes || []).length
       tr.innerHTML = '<td>' + esc(rec.user) + '</td>' +
         '<td class="mono">' + esc(rec.token) + '</td>' +
         '<td>' + esc(rec.role || '') + '</td>' +
-        '<td>' + (rec.scopes || []).length + '</td>' +
+        '<td><button class="tk-scope-toggle" data-action="toggle-token-scopes" data-count="' + esc(count) +
+          '" aria-expanded="false">' + esc(count + ' 项 ▾') + '</button></td>' +
         '<td class="muted">' + esc(fmtScopeRange(rec)) + '</td>' +
         '<td>' + esc(rec.expires_at || '永久') + '</td>' +
         '<td>' + state + '</td>' +
         '<td><button class="danger" data-action="remove-token" data-token="' + esc(rec.token) + '">移除</button></td>'
       tb.appendChild(tr)
+      // 明细行：默认折叠，点击「N 项」展开（重新查询后全部回到折叠）
       const detail = document.createElement('tr')
-      detail.innerHTML = '<td colspan="8" class="muted mono" style="font-size:12px;">' +
-        esc((rec.scopes || []).join('  ')) + (rec.description ? '　|　' + esc(rec.description) : '') +
-        '　|　生效范围：' + esc(fmtScopeRange(rec)) + '</td>'
+      detail.className = 'tk-detail-row'
+      detail.hidden = true
+      detail.innerHTML = '<td colspan="8" class="tk-detail-cell">' + tokenScopeDetailHtml(rec) + '</td>'
       tb.appendChild(detail)
     }
   } catch (e) { toast(e.message, false) }
+}
+
+// 展开/收起某 token 的权限明细行；aria-expanded 与箭头同步
+function toggleTokenScopes(el) {
+  const tr = el.closest('tr')
+  const detail = tr && tr.nextElementSibling
+  if (!detail || !detail.classList.contains('tk-detail-row')) return
+  const expand = detail.hidden
+  detail.hidden = !expand
+  el.setAttribute('aria-expanded', expand ? 'true' : 'false')
+  el.textContent = (el.dataset.count || '0') + ' 项 ' + (expand ? '▴' : '▾')
 }
 
 async function removeToken(masked) {
