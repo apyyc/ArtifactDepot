@@ -103,7 +103,7 @@ document.addEventListener('click', (e) => {
   else if (a === 'open-mkdir') openMkdirModal()
   else if (a === 'do-mkdir') doMkdir()
   else if (a === 'close-mkdir') closeMkdirModal()
-  else if (a === 'download-dir') downloadDir()
+  else if (a === 'download-dir') downloadDir(el.dataset.key)
   else if (a === 'download-file') downloadFile(el.dataset.key)
   else if (a === 'cancel-download') cancelDownload()
   else if (a === 'bulk-delete') openBulkDeleteModal(el.dataset.mode)
@@ -275,7 +275,9 @@ function renderRows() {
         '<td class="muted">' + esc(fmtTime(it.mtime)) + '</td>' +
         '<td>-</td>' +
         '<td>-</td>' +
-        '<td><a href="#" data-action="del-dir" data-key="' + esc(it.key) + '" style="color:#f56c6c;">删除</a></td>'
+        // 目录行「下载」与顶部「下载本目录」同一端点：单文件直下 / 其他流式 ZIP
+        '<td><a href="#" data-action="download-dir" data-key="' + esc(it.key) + '">下载</a> ' +
+        '<a href="#" data-action="del-dir" data-key="' + esc(it.key) + '" style="color:#f56c6c;">删除</a></td>'
     } else {
       // 下载按钮只带 data-key，token 由 downloadFile() 走 Authorization 头（不再拼进 href）
       tr.innerHTML =
@@ -708,13 +710,18 @@ async function delDir(key) {
 }
 
 // ---- 目录一键下载（单文件直下 / 多文件或含子目录自动打包 ZIP）----
-// 入口按钮：data-action="download-dir"；只读操作，无确认弹窗。
-function downloadDir() {
+// 入口：顶部「下载本目录」（不带 data-key，下载当前 prefix）+ 目录行「下载」。
+// 目录行传该行 key（可能带结尾 /），其余行为与顶部按钮完全一致；只读操作，无确认弹窗。
+function downloadDir(prefix) {
   if (!state.bucket) { toast('请先选择 bucket', false); return }
   const t = $('upToken').value.trim()
   if (!t) { toast('请先填写令牌（下载需要 object:download 权限）', false); return }
+  // undefined/null = 当前目录；目录行 = 该行 key（去掉结尾 /，与 state.prefix 保持一致）
+  const target = (prefix === undefined || prefix === null)
+    ? (state.prefix || '')
+    : String(prefix).replace(/\/+$/, '')
   const url = '/api/objects/download-bulk?bucket=' + encodeURIComponent(state.bucket) +
-    '&prefix=' + encodeURIComponent(state.prefix || '') +
+    '&prefix=' + encodeURIComponent(target) +
     '&token=' + encodeURIComponent(t)
   // 交给浏览器原生下载（不 fetch 成 blob，避免大 ZIP 常驻内存；文件名由服务端 Content-Disposition 决定）
   const a = document.createElement('a')
@@ -724,7 +731,7 @@ function downloadDir() {
   a.style.display = 'none'
   document.body.appendChild(a)
   try { a.click() } finally { document.body.removeChild(a) }
-  toast('开始下载；多文件或含子目录时自动打包 ZIP')
+  toast('开始下载' + (target ? '：' + target : '') + '；多文件或含子目录时自动打包 ZIP')
 }
 
 // ---- 单文件下载：大文件并行 Range 分块 + 进度/取消 + 完整性校验 ----

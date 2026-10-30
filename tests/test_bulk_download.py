@@ -490,12 +490,16 @@ def test_audit_metrics_and_failures_not_counted(ctx):
 # ===========================================================================
 
 def test_ui_markers():
-    """前端已加入「下载本目录」按钮并调用 download-bulk 端点。"""
+    """前端已加入「下载本目录」按钮 + 目录行「下载」，并调用 download-bulk 端点。"""
     base = ROOT / "src" / "artifactdepot" / "resources"
     html = (base / "index.html").read_text(encoding="utf-8")
     js = (base / "static" / "app.js").read_text(encoding="utf-8")
     assert 'data-action="download-dir"' in html
     assert "/api/objects/download-bulk" in js
+    # 目录行也渲染「下载」入口（带 data-key，下载该行目录而不是当前 prefix）
+    assert 'data-action="download-dir" data-key="' in js
+    assert 'function downloadDir(prefix)' in js
+    assert 'downloadDir(el.dataset.key)' in js
 
 
 # ===========================================================================
