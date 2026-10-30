@@ -474,7 +474,7 @@ def _run_job(job: dict) -> None:
             _copy_with_progress(job, single["path"], tmp, total_bytes)
             os.replace(tmp, dest / artifact)
             kind = "file"
-            out_size = total_bytes
+            out_size = (dest / artifact).stat().st_size
             files = 1
             dirs = 0
             media = _media_type(artifact)
@@ -538,14 +538,18 @@ def _run_job(job: dict) -> None:
     except BaseException as exc:                  # noqa: BLE001 - 后台线程必须兜底
         detail = getattr(exc, "detail", None) or str(exc) or exc.__class__.__name__
         logger.warning("[打包] 目录打包失败 %s/%s：%s", bucket, key, detail)
+        keep = bool(job.get("keep_link"))
         _rm_package(bucket, key, link_id)
-        storage.revoke_signed_link(link_id)
+        if not keep:
+            storage.revoke_signed_link(link_id)
         with _JOBS_LOCK:
             job["state"] = "failed"
             job["phase"] = "failed"
             job["ready_at"] = time.time()
-            job["error"] = str(detail)[:500]
-        _audit(job, "fail", extra={"error": str(detail)[:500]})
+            job["error"] = ("打包任务因目录变更中断，链接保留" if keep
+                            else str(detail)[:500])
+        _audit(job, "fail", extra={"error": str(detail)[:500],
+                                   "keep_link": keep})
 
 
 def _job_thread(job: dict) -> None:
