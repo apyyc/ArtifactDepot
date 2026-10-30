@@ -19,11 +19,12 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from artifactdepot import storage
+from artifactdepot import packaging, storage
 from artifactdepot.api.docs import router as docs_router
 from artifactdepot.api.objects import router as objects_router
 from artifactdepot.api.system import router as system_router
-from artifactdepot.config import config_warnings, get_config, get_upload_settings
+from artifactdepot.config import (config_warnings, get_config, get_package_settings,
+                                  get_upload_settings)
 from artifactdepot.logging_utils import install_access_log_redaction
 from artifactdepot.observability import ObservabilityMiddleware, install_observability
 from artifactdepot.web.ui import router as web_router
@@ -91,6 +92,26 @@ async def _chunk_cleanup_loop() -> None:
             logger.warning("[清理] 后台清理分片会话失败", exc_info=True)
 
 
+async def _package_cleanup_loop() -> None:
+    """定期清理失效的目录签名链接打包产物（过期/次数用完/作废）。
+
+    间隔读 config.package.cleanup_interval_seconds（热加载后下一轮生效）；
+    清理只遍历 signed_links 注册表，成本与仓库大小无关。
+    """
+    while True:
+        try:
+            interval = int(get_package_settings().get("cleanup_interval_seconds", 600))
+        except Exception:
+            interval = 600
+        await asyncio.sleep(max(60, interval))
+        try:
+            removed = await asyncio.to_thread(packaging.cleanup_invalid_packages)
+            if removed:
+                logger.info("[清理] 后台清理失效目录包：%s 个", removed)
+        except Exception:
+            logger.warning("[清理] 后台清理目录包失败", exc_info=True)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # 访问日志脱敏（token 等 query 参数不入日志）+ 结构化日志/指标
@@ -138,13 +159,25 @@ async def lifespan(app: FastAPI):
                         scan["registered"], scan["removed"])
     except OSError as e:
         logger.warning("[清理] 启动扫描分片会话失败：%s", e)
+    # 目录签名链接打包：清理失效/残留包，并恢复上次进程未完成的打包任务
+    try:
+        pkg_scan = await asyncio.to_thread(packaging.cleanup_on_startup)
+        if pkg_scan.get("removed") or pkg_scan.get("resumed"):
+            logger.info("[清理] 目录包启动清理：删除 %s 个、恢复打包 %s 个",
+                        pkg_scan.get("removed", 0), pkg_scan.get("resumed", 0))
+    except Exception:
+        logger.warning("[清理] 目录包启动清理失败", exc_info=True)
     cleanup_task = asyncio.create_task(_chunk_cleanup_loop())
+    package_cleanup_task = asyncio.create_task(_package_cleanup_loop())
     try:
         yield
     finally:
         cleanup_task.cancel()
+        package_cleanup_task.cancel()
         with suppress(asyncio.CancelledError):
             await cleanup_task
+        with suppress(asyncio.CancelledError):
+            await package_cleanup_task
         tempfile.tempdir = original_tempdir
 
 

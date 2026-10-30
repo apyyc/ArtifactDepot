@@ -984,7 +984,12 @@ def test_public_signed_links_config(ctx):
     data = r.json()["data"]
     assert (data["count_min"], data["count_max"]) == (1, 10)
     assert (data["expire_min_seconds"], data["expire_max_seconds"]) == (60, 604800)
-    assert all(isinstance(v, int) for v in data.values())
+    # 目录打包能力随配置下发（嵌套对象；其余四个历史字段仍是整数）
+    for key in ("count_min", "count_max", "expire_min_seconds", "expire_max_seconds"):
+        assert isinstance(data[key], int)
+    assert isinstance(data["package"], dict)
+    assert data["package"]["allow_directory"] is True
+    assert data["package"]["enabled"] is True
 
     _apply_cfg(ctx, signed_links={"count_min": 2, "count_max": 4,
                                   "expire_min_seconds": 120,

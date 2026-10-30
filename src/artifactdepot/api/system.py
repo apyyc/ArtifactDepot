@@ -18,9 +18,10 @@ from artifactdepot.auth import (
     resource_allowed,
 )
 from artifactdepot.config import (ConfigError, config_snapshot, get_config,
-                                  public_download_settings, public_token_settings,
-                                  public_ui_settings, public_upload_settings,
-                                  reload_config, update_config_file)
+                                  public_download_settings, public_package_settings,
+                                  public_token_settings, public_ui_settings,
+                                  public_upload_settings, reload_config,
+                                  update_config_file)
 from artifactdepot.observability import render_metrics
 from artifactdepot.permissions import (
     DEFAULT_ROLE, PERMISSION_CATALOG, PUBLIC_CATALOG, ROLE_PRESETS,
@@ -71,6 +72,8 @@ async def permissions_catalog():
         "ui": public_ui_settings(),
         # 新建 token 的长度上下限（服务端自动生成与显式创建都受此约束）
         "token": public_token_settings(),
+        # 目录签名链接打包能力（开关/上限/压缩方式），供网页动态提示
+        "package": public_package_settings(),
     }}
 
 

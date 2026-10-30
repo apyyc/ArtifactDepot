@@ -18,14 +18,13 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Reques
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
-from artifactdepot import storage, zipstream
+from artifactdepot import netutil, packaging, storage, zipstream
 from artifactdepot.auth import (
     Principal, ensure_scope, extract_form_token, extract_token, optional_read_principal,
     require_scope, resolve_principal, resource_allowed,
 )
-from artifactdepot import netutil
 from artifactdepot.observability import DELETES, DOWNLOADS, UPLOADS
-from artifactdepot.config import get_config, public_upload_settings
+from artifactdepot.config import get_config, public_package_settings, public_upload_settings
 
 router = APIRouter(prefix="/api/objects", tags=["Objects"])
 
@@ -210,6 +209,68 @@ async def head(request: Request, response: Response, bucket: str, key: str,
     return {"code": 0, "message": "success", "data": data}
 
 
+async def _download_dir_link(request: Request, bucket: str, key: str,
+                             link_id: str, tk: str):
+    """目录签名链接下载：成品是 .package 里的真实文件（复制文件 / ZIP）。
+
+    - 先用 inspect（不消费次数）校验链接，再检查成品是否就绪，避免「打包中」也扣次数；
+    - 打包未完成 → 409 + Retry-After（并尝试补一次后台打包）；
+    - HEAD 只探测不消耗次数；GET 成功才消费次数并写下载审计。
+    """
+    entry = storage.get_signed_link(link_id)
+    if not entry or entry.get("kind") != "dir":
+        raise HTTPException(401, detail="链接不存在")
+    # 目录重命名后注册表 key 已更新；以链接注册表为准，旧分享 URL 里的 key 不再生效，
+    # 这样目录改名不会让已经发出去的链接失效（链接本身是能力凭证）。
+    bucket = str(entry.get("bucket") or bucket)
+    key = str(entry.get("key") or key)
+    ok, entry, err = storage.inspect_signed_link(link_id, tk, bucket, key)
+    if not ok:
+        raise HTTPException(401, detail=err)
+    ready = packaging.read_ready(bucket, key, link_id)
+    if ready is None:
+        packaging.ensure_job(link_id, actor=entry.get("created_by") or "",
+                             ip=_client_ip(request))
+        raise HTTPException(409, detail="目录打包中，请稍后再试",
+                            headers={"Retry-After": "2"})
+    art = packaging.artifact_path(bucket, key, link_id)
+    if art is None:
+        raise HTTPException(409, detail="目录打包成品缺失，请重新生成链接",
+                            headers={"Retry-After": "2"})
+    actor = entry.get("created_by") or ""
+    ip = _client_ip(request)
+    public_ip = _public_ip(request)
+    kind = str(ready.get("kind") or "zip")
+    filename = str(ready.get("artifact") or art.name)
+    media = (ready.get("media_type")
+             or ("application/zip" if kind == "zip" else "application/octet-stream"))
+    if request.method.upper() == "HEAD":
+        storage.audit("download", bucket, key, actor=actor, ip=ip, size=0,
+                      public_ip=public_ip,
+                      extra={"head": True, "signed": True, "package": True,
+                             "link_id": link_id})
+        return FileResponse(art, media_type=media,
+                            filename=_safe_header_filename(filename))
+    ok, actor, err = storage.consume_signed_link(link_id, tk, bucket, key)
+    if not ok:
+        raise HTTPException(401, detail=err)
+    size = int(ready.get("size") or 0)
+    if kind == "zip":
+        storage.audit("download_bulk", bucket, key, actor=actor, ip=ip, size=size,
+                      public_ip=public_ip,
+                      extra={"mode": "zip",
+                             "files": int(ready.get("files") or 0),
+                             "dirs": int(ready.get("dirs") or 0),
+                             "signed": True, "package": True, "link_id": link_id})
+    else:
+        storage.audit("download", bucket, key, actor=actor, ip=ip, size=size,
+                      public_ip=public_ip,
+                      extra={"bulk": True, "mode": "file", "signed": True,
+                             "package": True, "link_id": link_id})
+    DOWNLOADS.inc()
+    return FileResponse(art, media_type=media, filename=_safe_header_filename(filename))
+
+
 @router.head("/download", include_in_schema=False)
 @router.get("/download")
 async def download(
@@ -225,13 +286,18 @@ async def download(
     """下载对象（GetObject）。签名链接（link+tk / expires+sig）免 token；否则需 object:download。
 
     鉴权优先级：
-    1. link+tk（注册表签名链接）→ 校验次数/过期/作废，免 token
-    2. expires+sig（旧式 HMAC）→ 校验签名，免 token
+    1. link+tk（注册表签名链接）→ 校验次数/过期/作废，免 token；
+       - kind=dir：返回后台打包好的成品（唯一文件直下 / ZIP，支持 HEAD/Range）；
+         打包未完成时 409，不消耗次数；
+    2. expires+sig（旧式 HMAC）→ 校验签名，免 token（仅文件）；
     3. 否则 → token 必须含 object:download 且资源范围允许
     """
     p = storage.object_path(bucket, key)
 
     if link is not None or tk is not None:
+        entry = storage.get_signed_link(link or "")
+        if entry and entry.get("kind") == "dir":
+            return await _download_dir_link(request, bucket, key, link or "", tk or "")
         if not p.is_file():
             raise HTTPException(404, detail=f"对象不存在：{bucket}/{key}")
         ok, actor, err = storage.consume_signed_link(link or "", tk or "", bucket, key)
@@ -428,8 +494,10 @@ async def rename(body: RenameRequest, request: Request,
 
 
 class PresignRequest(BaseModel):
+    """生成签名链接请求（文件链接 / 目录打包链接）。"""
     bucket: str
     key: str
+    kind: str = "file"      # file=普通文件链接；dir=目录打包链接（后台打包，见 packaging.py）
     mode: str = "time"      # count(1-10次) / time(默认1小时) / permanent(永久)
     count: int = 1          # mode=count 时次数（1-10）
     expires: int = 3600     # mode=time 时秒数（默认 1 小时）
@@ -438,29 +506,91 @@ class PresignRequest(BaseModel):
 @router.post("/presign")
 async def presign(body: PresignRequest,
                   request: Request, actor: Principal = Depends(require_scope("link:create"))):
-    """生成签名下载链接。需要 link:create；资源范围允许的 bucket/key 才能签"""
+    """生成签名下载链接。需要 link:create；资源范围允许的 bucket/key 才能签。
+
+    - kind=file（默认）：返回文件下载链接（行为与历史一致）；
+    - kind=dir：先校验目录存在，立即创建链接并启动后台打包；响应带 package 进度快照，
+      可通过 GET /api/objects/signed-links/{id}/package 轮询状态。
+    """
     ensure_scope(actor, "link:create", bucket=body.bucket, key=body.key)
+    kind = (body.kind or "file").strip().lower()
+    if kind not in ("file", "dir"):
+        raise HTTPException(400, detail="kind 必须为 file / dir")
+    if kind == "dir":
+        pub = public_package_settings()
+        if not pub["allow_directory"]:
+            raise HTTPException(403, detail="目录签名链接已关闭（signed_links.allow_directory=false）")
+        if not pub["enabled"]:
+            raise HTTPException(403, detail="目录打包已关闭（package.enabled=false）")
+        dir_key = storage.validate_key(body.key)
+        if not dir_key or not storage.object_path(body.bucket, dir_key).is_dir():
+            raise HTTPException(404, detail=f"目录不存在：{body.bucket}/{body.key}")
     entry = storage.create_signed_link(body.bucket, body.key, body.mode,
                                        count=body.count, expires=body.expires,
-                                       created_by=actor.actor)
+                                       created_by=actor.actor, kind=kind)
     url = (f"/api/objects/download?bucket={entry['bucket']}&key={entry['key']}"
            f"&link={entry['id']}&tk={entry['token']}")
     storage.audit("presign", entry["bucket"], entry["key"], actor.actor, _client_ip(request), public_ip=_public_ip(request))
-    return {"code": 0, "message": "success",
-            "data": {"url": url, "id": entry["id"], "mode": entry["mode"],
-                     "max_uses": entry["max_uses"], "remaining": entry["remaining"],
-                     "expires": entry["expires"]}}
+    data = {"url": url, "id": entry["id"], "mode": entry["mode"],
+            "kind": kind,
+            "max_uses": entry["max_uses"], "remaining": entry["remaining"],
+            "expires": entry["expires"]}
+    if kind == "dir":
+        # 链接已创建并返回；打包在后台继续，前端轮询 package 状态显示进度
+        data["package"] = packaging.start_job(entry["id"], actor=actor.actor,
+                                              ip=_client_ip(request))
+    return {"code": 0, "message": "success", "data": data}
+
+
+def _dir_link_for_actor(link_id: str, actor: Principal) -> dict:
+    """加载目录链接并做「存在 / 类型 / 权限 / 创建者」校验（状态与取消接口共用）。"""
+    entry = storage.get_signed_link(link_id)
+    if not entry:
+        raise HTTPException(404, detail="链接不存在")
+    ensure_scope(actor, "link:create", bucket=entry.get("bucket", ""),
+                 key=entry.get("key", ""))
+    if entry.get("kind") != "dir":
+        raise HTTPException(400, detail="该链接不是目录打包链接")
+    if not actor.is_admin and entry.get("created_by") != actor.actor:
+        raise HTTPException(403, detail="只能查看/操作自己创建的链接")
+    return entry
+
+
+@router.get("/signed-links/{link_id}/package", include_in_schema=False)
+async def package_status(link_id: str, request: Request,
+                         actor: Principal = Depends(require_scope("link:create"))):
+    """目录打包进度（网页内部轮询；与 link:create 同权限，创建者/管理员可见）。"""
+    entry = _dir_link_for_actor(link_id, actor)
+    if packaging.link_valid(entry) and packaging.read_ready(
+            entry.get("bucket", ""), entry.get("key", ""), link_id) is None:
+        # 服务重启/任务丢失后自动补一次打包
+        packaging.ensure_job(link_id, actor=actor.actor, ip=_client_ip(request))
+    return {"code": 0, "message": "success", "data": packaging.job_status(link_id)}
+
+
+@router.post("/signed-links/{link_id}/package/cancel", include_in_schema=False)
+async def package_cancel(link_id: str, request: Request,
+                         actor: Principal = Depends(require_scope("link:create"))):
+    """取消目录打包：链接自动作废、半成品删除（网页内部接口）。"""
+    entry = _dir_link_for_actor(link_id, actor)
+    data = packaging.cancel_job(link_id, actor=actor.actor, ip=_client_ip(request))
+    storage.audit("package", entry.get("bucket", ""), entry.get("key", ""),
+                  actor.actor, _client_ip(request),
+                  public_ip=_public_ip(request),
+                  extra={"phase": "cancel_request", "link_id": link_id})
+    return {"code": 0, "message": "success", "data": data}
 
 
 @router.get("/signed-links/config")
 async def signed_links_config():
-    """返回签名链接次数/时效的上下限（config.signed_links），供前端渲染校验"""
+    """返回签名链接次数/时效上下限 + 目录打包能力，供前端渲染校验与提示。"""
     cfg = get_config().get("signed_links", {})
     return {"code": 0, "message": "success", "data": {
         "count_min": int(cfg.get("count_min", 1) or 1),
         "count_max": int(cfg.get("count_max", 10) or 10),
         "expire_min_seconds": int(cfg.get("expire_min_seconds", 60) or 60),
         "expire_max_seconds": int(cfg.get("expire_max_seconds", 604800) or 604800),
+        "package": public_package_settings(),
     }}
 
 
@@ -481,6 +611,8 @@ async def list_signed_links(request: Request,
         else:
             l["url"] = ""
         l.pop("token", None)
+        l["kind"] = l.get("kind") or "file"
+        l["package_state"] = packaging.link_package_state(l)
         out.append(l)
     return {"code": 0, "message": "success", "data": out}
 
@@ -501,6 +633,11 @@ async def revoke_link(link_id: str, request: Request,
     if not actor.is_admin and entry.get("created_by") != actor.actor:
         raise HTTPException(403, detail="只能作废自己创建的链接")
     storage.revoke_signed_link(link_id)
+    # 目录链接：作废后按配置立即删包/打断后台打包（失败不影响作废本身）
+    try:
+        packaging.on_revoke(link_id)
+    except Exception:                              # noqa: BLE001 - 清理失败不影响作废
+        pass
     storage.audit("revoke", entry.get("bucket", ""), entry.get("key", ""), actor.actor,
                   _client_ip(request), public_ip=_public_ip(request))
     return {"code": 0, "message": "success"}
