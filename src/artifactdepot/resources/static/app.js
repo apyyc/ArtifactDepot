@@ -304,7 +304,7 @@ function renderRows() {
 let psKey = ''
 let psKind = 'file'
 let psCfg = { count_min: 1, count_max: 10, expire_min_seconds: 60, expire_max_seconds: 604800 }
-let psPkgCfg = { allow_directory: true, enabled: true }
+let psPkgCfg = { allow_directory: false, enabled: false, supported: false }
 
 function psTypeChange() {
   const t = document.querySelector('input[name="psType"]:checked').value
@@ -326,14 +326,24 @@ async function presign(key, kind) {
   $('psPackageNote').style.display = 'none'
   $('psPackageNote').textContent = ''
   // 拉取次数/时效上下限（config.signed_links）与目录打包能力（config.package）
+  // 旧版服务端没有 package 字段：明确提示先重启/升级，避免创建出无效链接后再轮询 404。
+  psPkgCfg = { allow_directory: false, enabled: false, supported: false }
   try {
     const b = await api('/api/objects/signed-links/config')
     psCfg = b.data || psCfg
-    psPkgCfg = (b.data && b.data.package) || psPkgCfg
-  } catch (e) { /* 用默认值 */ }
-  if (psKind === 'dir' && (!psPkgCfg.allow_directory || !psPkgCfg.enabled)) {
-    toast('目录签名链接未启用（signed_links.allow_directory / package.enabled）', false)
-    return
+    if (b.data && b.data.package) {
+      psPkgCfg = Object.assign({ supported: true }, b.data.package)
+    }
+  } catch (e) { /* 用默认值（目录打包视为不支持） */ }
+  if (psKind === 'dir') {
+    if (!psPkgCfg.supported) {
+      toast('当前服务端版本不支持目录打包链接：请重启/升级 ArtifactDepot 后重试', false)
+      return
+    }
+    if (!psPkgCfg.allow_directory || !psPkgCfg.enabled) {
+      toast('目录签名链接未启用（signed_links.allow_directory / package.enabled）', false)
+      return
+    }
   }
   $('psCountHint').textContent = '（' + psCfg.count_min + '-' + psCfg.count_max + ' 次）'
   $('psCount').value = psCfg.count_min
@@ -375,6 +385,19 @@ async function doPresign() {
     $('psResultRow').style.display = 'flex'
     $('psResult').focus(); $('psResult').select()
     if (psKind === 'dir') {
+      // 防御旧进程：它不认识 kind=dir，会创建一条指向目录的普通文件链接
+      if (r.data.kind !== 'dir' || !r.data.package) {
+        try {
+          await api('/api/objects/signed-links/' + encodeURIComponent(r.data.id) + '/revoke',
+            { method: 'POST' }, token)
+        } catch (e2) { /* 撤销失败也继续提示 */ }
+        $('psResultRow').style.display = 'none'
+        $('psResult').value = ''
+        $('psPackageNote').textContent = '当前服务端尚未支持目录打包（可能是旧进程）；请重启/升级 ArtifactDepot 后重试。本次创建的无效链接已尝试撤销。'
+        $('psPackageNote').style.display = 'block'
+        toast('服务端未更新，请重启 ArtifactDepot 后重试', false)
+        return
+      }
       $('psPackageNote').textContent = '目录正在后台打包：完成后链接才能下载；进度见进度条。'
       $('psPackageNote').style.display = 'block'
       toast('链接已生成，正在后台打包')

@@ -27,3 +27,6 @@ def test_dir_link_ui_markers():
     # 签名链接弹窗的目录提示 / 打包状态提示
     assert 'id="psKindHint"' in html and 'id="psPackageNote"' in html
     assert "package_state" in js and "目录 ZIP" in js
+    # 旧版服务端（没有 package 配置/不认识 kind=dir）给出明确重启提示并撤销无效链接
+    assert "当前服务端版本不支持目录打包链接" in js
+    assert "r.data.kind !== 'dir'" in js
