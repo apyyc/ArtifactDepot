@@ -298,6 +298,8 @@
         <input id="psResult" readonly class="select-on-focus" style="flex:1; font-size:12px;" />
         <button class="ghost" data-action="copy-presign">复制</button>
       </div>
+      <div class="muted" id="psKindHint" style="display:none; margin-top:8px;">目录链接：后台打包完成后，打开链接按「下载本目录」规则返回成品（唯一文件直下 / 其他 ZIP）。</div>
+      <div class="muted" id="psPackageNote" style="display:none; margin-top:4px;"></div>
       <div class="row" style="margin-top:12px;">
         <button id="psGenBtn" data-action="do-presign">生成</button>
         <button class="ghost" data-action="close-presign">关闭</button>
@@ -310,13 +312,15 @@
        token 不再拼进 href / DOM，改由 fetch 的 Authorization 头发送，避免出现在访问日志与页面源码里。 -->
   <div id="dlModal" class="modal-mask" style="display:none;">
     <div class="modal modal-wide">
-      <h3 style="margin:0 0 8px;font-size:15px;">正在下载</h3>
+      <h3 id="dlTitle" style="margin:0 0 8px;font-size:15px;">正在下载</h3>
       <div class="dl-name" id="dlName"></div>
       <div class="dl-bar" id="dlBar"><span id="dlBarFill"></span></div>
       <div class="dl-stat" id="dlStat">准备中…</div>
-      <div class="muted" style="margin-top:8px;">文件大于分片大小时自动多线程分块下载；取消会立即中止所有在途请求并丢弃未完成的部分。</div>
+      <div class="muted" id="dlHint" style="margin-top:8px;">文件大于分片大小时自动多线程分块下载；取消会立即中止所有在途请求并丢弃未完成的部分。</div>
       <div class="row" style="margin-top:12px;">
-        <button class="ghost" data-action="cancel-download">取消下载</button>
+        <button class="ghost" id="dlCancelBtn" data-action="cancel-download">取消下载</button>
+        <button class="ghost" id="pkgCancelBtn" style="display:none;" data-action="cancel-package">取消打包（链接作废）</button>
+        <button class="ghost" id="pkgBgBtn" style="display:none;" data-action="hide-package-progress">后台进行</button>
       </div>
     </div>
   </div>

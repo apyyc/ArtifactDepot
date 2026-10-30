@@ -83,7 +83,7 @@ document.addEventListener('click', (e) => {
   const a = el.dataset.action
   if (a === 'enter-dir') enterDir(el.dataset.key)
   else if (a === 'del-dir') delDir(el.dataset.key)
-  else if (a === 'presign') presign(el.dataset.key)
+  else if (a === 'presign') presign(el.dataset.key, el.dataset.kind)
   else if (a === 'del-file') delFile(el.dataset.key)
   else if (a === 'revoke-link') revokeLink(el.dataset.id)
   else if (a === 'remove-token') removeToken(el.dataset.token)
@@ -112,6 +112,8 @@ document.addEventListener('click', (e) => {
   else if (a === 'do-presign') doPresign()
   else if (a === 'close-presign') closePsModal()
   else if (a === 'copy-presign') copyPsResult()
+  else if (a === 'cancel-package') cancelPackage()
+  else if (a === 'hide-package-progress') hidePackageProgress()
   else if (a === 'copy-link') copyLink(el)
   else if (a === 'load-links') loadLinks()
   else if (a === 'load-tokens') loadTokens()
@@ -275,8 +277,9 @@ function renderRows() {
         '<td class="muted">' + esc(fmtTime(it.mtime)) + '</td>' +
         '<td>-</td>' +
         '<td>-</td>' +
-        // 目录行「下载」与顶部「下载本目录」同一端点：单文件直下 / 其他流式 ZIP
+        // 目录行操作：下载（同顶部「下载本目录」）/ 签名链接（后台打包）/ 删除
         '<td><a href="#" data-action="download-dir" data-key="' + esc(it.key) + '">下载</a> ' +
+        '<a href="#" data-action="presign" data-key="' + esc(it.key) + '" data-kind="dir">签名链接</a> ' +
         '<a href="#" data-action="del-dir" data-key="' + esc(it.key) + '" style="color:#f56c6c;">删除</a></td>'
     } else {
       // 下载按钮只带 data-key，token 由 downloadFile() 走 Authorization 头（不再拼进 href）
@@ -299,7 +302,9 @@ function renderRows() {
 }
 
 let psKey = ''
+let psKind = 'file'
 let psCfg = { count_min: 1, count_max: 10, expire_min_seconds: 60, expire_max_seconds: 604800 }
+let psPkgCfg = { allow_directory: true, enabled: true }
 
 function psTypeChange() {
   const t = document.querySelector('input[name="psType"]:checked').value
@@ -308,18 +313,28 @@ function psTypeChange() {
   $('psPermanentHint').style.display = t === 'permanent' ? 'block' : 'none'
 }
 
-async function presign(key) {
+// 入口：文件行只传 key（kind=file）；目录行 data-kind="dir"（后台打包链接）
+async function presign(key, kind) {
   const token = $('upToken').value.trim()
   if (!token) { toast('请先填写令牌', false); return }
   psKey = key
-  $('psTarget').textContent = '文件：' + state.bucket + ' / ' + key
+  psKind = kind === 'dir' ? 'dir' : 'file'
+  $('psTarget').textContent = (psKind === 'dir' ? '目录：' : '文件：') + state.bucket + ' / ' + key
   $('psResult').value = ''
   $('psResultRow').style.display = 'none'
-  // 拉取次数/时效上下限（config.signed_links）
+  $('psKindHint').style.display = psKind === 'dir' ? 'block' : 'none'
+  $('psPackageNote').style.display = 'none'
+  $('psPackageNote').textContent = ''
+  // 拉取次数/时效上下限（config.signed_links）与目录打包能力（config.package）
   try {
     const b = await api('/api/objects/signed-links/config')
     psCfg = b.data || psCfg
+    psPkgCfg = (b.data && b.data.package) || psPkgCfg
   } catch (e) { /* 用默认值 */ }
+  if (psKind === 'dir' && (!psPkgCfg.allow_directory || !psPkgCfg.enabled)) {
+    toast('目录签名链接未启用（signed_links.allow_directory / package.enabled）', false)
+    return
+  }
   $('psCountHint').textContent = '（' + psCfg.count_min + '-' + psCfg.count_max + ' 次）'
   $('psCount').value = psCfg.count_min
   $('psCount').min = psCfg.count_min; $('psCount').max = psCfg.count_max
@@ -337,7 +352,7 @@ function closePsModal() { $('presignModal').style.display = 'none' }
 async function doPresign() {
   const token = $('upToken').value.trim()
   const type = document.querySelector('input[name="psType"]:checked').value
-  const body = { bucket: state.bucket, key: psKey, mode: type }
+  const body = { bucket: state.bucket, key: psKey, mode: type, kind: psKind }
   if (type === 'count') {
     const c = parseInt($('psCount').value)
     if (isNaN(c) || c < psCfg.count_min || c > psCfg.count_max) {
@@ -358,14 +373,157 @@ async function doPresign() {
     const u = window.location.origin + (r.data.url || '')
     $('psResult').value = u
     $('psResultRow').style.display = 'flex'
-    toast('链接已生成')
     $('psResult').focus(); $('psResult').select()
+    if (psKind === 'dir') {
+      $('psPackageNote').textContent = '目录正在后台打包：完成后链接才能下载；进度见进度条。'
+      $('psPackageNote').style.display = 'block'
+      toast('链接已生成，正在后台打包')
+      pkgTrack(r.data.id, state.bucket + ' / ' + psKey + '/')
+    } else {
+      toast('链接已生成')
+    }
   } catch (e) { toast(e.message, false) }
 }
 async function copyPsResult() {
   const v = $('psResult').value
   if (!v) return
   copyText(v, '链接已复制')
+}
+
+// ---- 目录打包进度：复用「上传/下载进度条」弹窗（#dlModal）----
+// 打包在服务端后台线程继续：此处只轮询状态；「后台进行」只隐藏弹窗，不取消任务。
+let pkgTask = null
+
+function dlModalReset() {
+  if ($('dlTitle')) $('dlTitle').textContent = '正在下载'
+  if ($('dlHint')) $('dlHint').textContent = '文件大于分片大小时自动多线程分块下载；取消会立即中止所有在途请求并丢弃未完成的部分。'
+  if ($('dlCancelBtn')) $('dlCancelBtn').style.display = ''
+  if ($('pkgCancelBtn')) $('pkgCancelBtn').style.display = 'none'
+  if ($('pkgBgBtn')) $('pkgBgBtn').style.display = 'none'
+}
+
+function pkgShowModal(name) {
+  $('dlTitle').textContent = '正在打包目录'
+  $('dlName').textContent = name || ''
+  $('dlBarFill').style.width = '0%'
+  $('dlStat').textContent = '准备打包…'
+  $('dlHint').textContent = '打包在服务端后台进行；完成后链接即可下载。取消打包会作废该链接并删除包。'
+  $('dlCancelBtn').style.display = 'none'
+  $('pkgCancelBtn').style.display = ''
+  $('pkgBgBtn').style.display = ''
+  $('dlModal').style.display = 'flex'
+}
+
+function pkgHideModal(reset) {
+  if (!pkgTask || !pkgTask.modalVisible) return
+  $('dlModal').style.display = 'none'
+  pkgTask.modalVisible = false
+  if (reset !== false) dlModalReset()
+}
+
+function pkgStateLabel(st) {
+  if (st.state === 'ready') return '已完成'
+  if (st.state === 'failed') return '打包失败'
+  if (st.state === 'cancelled') return '已取消'
+  if (st.state === 'invalid') return '链接已失效'
+  if (st.phase === 'scanning' || st.state === 'scanning') return '扫描目录中'
+  if (st.state === 'queued') return '排队中'
+  return '打包中'
+}
+
+function pkgRender(st) {
+  const pct = Math.max(0, Math.min(100, Number(st.percent) || 0))
+  $('dlBarFill').style.width = pct.toFixed(1) + '%'
+  const parts = [pkgStateLabel(st)]
+  if (st.files_total) parts.push('文件 ' + (st.files_done || 0) + '/' + st.files_total)
+  if (st.bytes_total) parts.push(fmtSize(st.bytes_done || 0) + ' / ' + fmtSize(st.bytes_total))
+  parts.push(pct.toFixed(1) + '%')
+  $('dlStat').textContent = parts.join(' · ')
+}
+
+function pkgStopTimer(t) {
+  if (t && t.timer) { clearTimeout(t.timer); t.timer = null }
+}
+
+function pkgTrack(linkId, name) {
+  if (pkgTask) pkgStopTimer(pkgTask)
+  pkgTask = { linkId: linkId, timer: null, modalVisible: false }
+  // 若当下有单文件下载正在使用进度弹窗，则不抢占弹窗，只轮询状态
+  if (!dlActive()) {
+    pkgShowModal(name)
+    pkgTask.modalVisible = true
+  }
+  pkgPoll()
+}
+
+async function pkgPoll() {
+  const t = pkgTask
+  if (!t) return
+  const token = $('upToken').value.trim()
+  let st = null
+  try {
+    const body = await api('/api/objects/signed-links/' + encodeURIComponent(t.linkId) + '/package', {}, token)
+    st = body.data || {}
+  } catch (e) {
+    if (pkgTask !== t) return
+    // 令牌/链接受限或不存在：立即停止轮询并提示；网络抖动则稍后重试
+    if (e && (e.status === 401 || e.status === 403 || e.status === 404)) {
+      pkgFail(t, e.message || '无法查询打包状态')
+      return
+    }
+    t.timer = setTimeout(pkgPoll, 1000)
+    return
+  }
+  if (pkgTask !== t) return
+  pkgRender(st)
+  if (st.state === 'ready') { pkgDone(t); return }
+  if (st.state === 'failed' || st.state === 'cancelled' || st.state === 'invalid') {
+    pkgFail(t, st.error || '目录打包失败')
+    return
+  }
+  t.timer = setTimeout(pkgPoll, 700)
+}
+
+function pkgDone(t) {
+  if (pkgTask !== t) return
+  pkgStopTimer(t)
+  if (t.modalVisible) pkgHideModal(true)
+  pkgTask = null
+  $('psPackageNote').textContent = '目录打包完成，链接现在可以下载了。'
+  $('psPackageNote').style.display = 'block'
+  toast('目录打包完成')
+}
+
+function pkgFail(t, msg) {
+  if (pkgTask !== t) return
+  pkgStopTimer(t)
+  if (t.modalVisible) pkgHideModal(true)
+  pkgTask = null
+  $('psPackageNote').textContent = (msg || '目录打包失败') + '（链接已作废，可重新生成）'
+  $('psPackageNote').style.display = 'block'
+  closePsModal()
+  toast(msg || '目录打包失败，链接已作废', false)
+}
+
+function hidePackageProgress() {
+  if (!pkgTask) return
+  pkgHideModal(true)
+  toast('打包在后台继续，完成后会提示')
+}
+
+async function cancelPackage() {
+  const t = pkgTask
+  if (!t) return
+  const token = $('upToken').value.trim()
+  try {
+    await api('/api/objects/signed-links/' + encodeURIComponent(t.linkId) + '/package/cancel',
+      { method: 'POST' }, token)
+  } catch (e) { /* 链接可能已失效：仍然清理本地状态 */ }
+  pkgStopTimer(t)
+  pkgHideModal(true)
+  pkgTask = null
+  closePsModal()
+  toast('已取消打包，链接已作废')
 }
 
 // ---- 新建目录 ----
@@ -634,13 +792,25 @@ async function loadLinks() {
       if (l.revoked) statusHtml = '<span style="color:#f56c6c;">已作废</span>'
       else if (l.mode === 'count' && (l.remaining || 0) <= 0) statusHtml = '<span style="color:#909399;">已用完</span>'
       else statusHtml = '<span style="color:#67c23a;">有效</span>'
+      // 目录链接：显示后台打包状态（ready/queued/scanning/packaging/failed/cancelled/missing/invalid）
+      let keyTxt = l.bucket + '/' + l.key
+      if (l.kind === 'dir') {
+        keyTxt += '/'
+        const stateMap = {
+          ready: '包就绪', queued: '打包排队', scanning: '扫描中', packaging: '打包中',
+          running: '打包中', failed: '打包失败', cancelled: '打包已取消',
+          missing: '未打包', invalid: '已失效',
+        }
+        const label = stateMap[l.package_state] || l.package_state || ''
+        if (label) statusHtml += ' <span class="muted">· 目录包：' + esc(label) + '</span>'
+      }
       const canRevoke = !l.revoked && !(l.mode === 'count' && (l.remaining || 0) <= 0)
       const linkCell = l.url
         ? '<a href="#" data-action="copy-link" data-url="' + esc(l.url) + '">复制链接</a>'
         : '-'
       tr.innerHTML =
         '<td>' + esc(l.created_by) + '</td>' +
-        '<td class="mono">' + esc(l.bucket + '/' + l.key) + '</td>' +
+        '<td class="mono">' + esc(keyTxt) + (l.kind === 'dir' ? ' <span class="muted">目录 ZIP</span>' : '') + '</td>' +
         '<td>' + esc(modeTxt) + '</td>' +
         '<td>' + esc(remaining) + '</td>' +
         '<td class="muted">' + esc(fmtTime(l.created_at)) + '</td>' +
