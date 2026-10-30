@@ -569,8 +569,16 @@ def start_job(link_id: str, actor: str = "", ip: str = "") -> dict:
         return job_status(link_id)
     with _JOBS_LOCK:
         job = _JOBS.get(link_id)
-        if job is not None and job.get("state") in ("queued", "scanning", "packaging"):
+        if job is not None:
+            # 已有任务（含 failed/cancelled/ready）：直接返回原状态，绝不因状态查询
+            # 的并发而给已失败/已取消的链接重新起一个任务（会把 failed 覆盖成 cancelled）。
+            if job.get("state") in ("ready", "failed", "cancelled", "missing"):
+                return job_status(link_id)
             return _snapshot(job)
+        # 拿到锁后再确认一次链接仍有效：预检查与建任务之间可能已被失败/作废流程撤销
+        entry = storage.get_signed_link(link_id)
+        if (not entry or entry.get("kind") != "dir" or not link_valid(entry)):
+            return job_status(link_id)
         job = _new_job(link_id, entry, actor=actor, ip=ip)
         _JOBS[link_id] = job
         thread = threading.Thread(target=_job_thread, args=(job,),

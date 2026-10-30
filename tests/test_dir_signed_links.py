@@ -308,6 +308,7 @@ def test_dir_link_permissions_and_scope(ctx):
     r = c.get(f"/api/objects/signed-links/{d['id']}/package", params={"token": other})
     assert r.status_code == 403                  # 非创建者不能看别人链接的进度
     assert _status(c, d["id"])["link_id"] == d["id"]
+    _wait_state(c, d["id"])                      # 收尾：避免打包线程跨测试继续跑
 
 
 def test_config_toggle_blocks_dir_link(ctx):
@@ -333,3 +334,55 @@ def test_progress_moves_state_to_packaging():
     job["state"] = "scanning"
     packaging._progress(job, phase="packaging", files_total=2, bytes_total=10, force=True)
     assert job["state"] == "packaging" and job["phase"] == "packaging"
+
+
+def test_time_expiry_cleanup(ctx):
+    c, depot = ctx["client"], ctx["depot"]
+    from artifactdepot import packaging
+    _mkdir(c, key="d")
+    _upload(c, key="d/a.txt")
+    d = _presign_dir(c, "d", mode="time", expires=60).json()["data"]
+    _wait_state(c, d["id"])
+    # 模拟已到期（直接改注册表，避免等待 60 秒）
+    p = depot / "signed_links.json"
+    links = json.loads(p.read_text(encoding="utf-8"))
+    for x in links:
+        if x["id"] == d["id"]:
+            x["expires"] = 1
+    p.write_text(json.dumps(links), encoding="utf-8")
+    assert packaging.cleanup_invalid_packages() >= 1
+    assert not (depot / "b" / "d" / PKG / d["id"]).exists()
+    assert c.get(_link_url(c, d)).status_code == 401
+
+
+def test_max_items_failure_revokes_link(ctx):
+    c, cfg = ctx["client"], ctx["cfg"]
+    data = json.loads(cfg.read_text(encoding="utf-8"))
+    data["package"]["max_items"] = 2
+    cfg.write_text(json.dumps(data), encoding="utf-8")
+    ctx["config"]._CONFIG = None
+    _mkdir(c, key="many")
+    for i in range(3):
+        _upload(c, key=f"many/{i}.txt", data=b"x")
+    d = _presign_dir(c, "many").json()["data"]
+    st = _wait_state(c, d["id"], states=("failed", "cancelled"))
+    assert st["state"] == "failed" and "过大" in st["error"]
+    assert [x for x in _links(c) if x["id"] == d["id"]][0]["revoked"] is True
+
+
+def test_zip_compression_deflate(ctx):
+    c, cfg, depot = ctx["client"], ctx["cfg"], ctx["depot"]
+    data = json.loads(cfg.read_text(encoding="utf-8"))
+    data["package"]["zip_compression"] = "deflate"
+    cfg.write_text(json.dumps(data), encoding="utf-8")
+    ctx["config"]._CONFIG = None
+    _mkdir(c, key="zipd")
+    _upload(c, key="zipd/a.txt", data=b"a" * 2000)
+    _upload(c, key="zipd/b.txt", data=b"b" * 2000)
+    d = _presign_dir(c, "zipd").json()["data"]
+    _wait_state(c, d["id"])
+    rr = c.get(_link_url(c, d))
+    assert rr.status_code == 200
+    z = zipfile.ZipFile(__import__("io").BytesIO(rr.content))
+    assert all(i.compress_type == zipfile.ZIP_DEFLATED for i in z.infolist() if not i.is_dir())
+    assert len(rr.content) < 4000
