@@ -422,7 +422,7 @@ async def update_token_entry(value: str, body: TokenUpdate, request: Request,
                 clean_prefixes[b] = storage.normalize_prefixes(prefixes)
             rec["allow_prefixes"] = clean_prefixes
         if body.expires_at is not None:
-            rec["expires_at"] = body.expires_at.strip()
+            rec["expires_at"] = storage.validate_expires_at(body.expires_at)
         if body.description is not None:
             rec["description"] = body.description.strip()
         if body.enabled is not None:

@@ -1246,6 +1246,16 @@ def _parse_ts(ts: str):
             return None
 
 
+def validate_expires_at(expires_at: str) -> str:
+    """校验并规范化 expires_at：空=永久；非空必须是 YYYY-MM-DD 或 ISO 8601。"""
+    text = (expires_at or "").strip()
+    if text and _parse_ts(text) is None:
+        raise HTTPException(
+            400, detail=f"expires_at 格式非法：{expires_at!r}"
+                        "（支持 YYYY-MM-DD 或 ISO 8601；空表示永久）")
+    return text
+
+
 def token_record_expired(rec: dict) -> bool:
     exp = _parse_ts((rec or {}).get("expires_at", ""))
     if exp is None:
@@ -1385,6 +1395,7 @@ def add_token(token: str, user: str, role: str = "", scopes=None,
         clean_prefixes[b] = normalize_prefixes(prefixes)
 
     validate_scope_range(allow_buckets, clean_prefixes)
+    expires_at = validate_expires_at(expires_at)
     with state_lock():
         raw = _read_tokens_raw()
         existing = _normalize_token_record(raw.get(token, {}), token) if token in raw else None

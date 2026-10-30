@@ -1117,3 +1117,31 @@ def test_registry_consistency_across_all_interfaces(ctx):
     assert c.get("/api/auth/check", params={"token": a}).json()["data"]["valid"] is False
     assert c.get("/api/objects/list",
                  params={"bucket": "demo", "token": b}).status_code == 200
+
+
+def test_post_and_put_reject_invalid_expires_at(ctx):
+    """B/契约：expires_at 必须是 YYYY-MM-DD 或 ISO 8601；空表示永久；非法格式 400 且零写入。"""
+    c, cfg, depot, config = ctx
+    invalid = ["not-a-date", "2026-13-01", "2026-02-30", "2026/01/01", "12345678"]
+    before = _raw(depot)
+    for bad in invalid:
+        r = _post_token(c, user="bad-exp", role="viewer", expires_at=bad)
+        assert r.status_code == 400, (bad, r.status_code, r.text)
+        assert "expires_at" in _detail(r)
+        assert _raw(depot) == before, f"非法 expires_at 不得产生记录：{bad}"
+
+    # PUT 同样校验，失败不改动既有记录
+    tok = _create(c, user="keep-exp", role="viewer", expires_at="2099-01-01")
+    raw_before = _raw(depot)
+    for bad in invalid:
+        r = _put(c, tok, expires_at=bad)
+        assert r.status_code == 400, (bad, r.status_code, r.text)
+        assert _raw(depot) == raw_before, f"PUT 非法 expires_at 不得改动记录：{bad}"
+
+    # 合法格式仍可用（日期 / ISO / 带 Z）；空保持永久
+    for good in ("2099-12-31", "2099-12-31T23:59:59", "2099-12-31T23:59:59Z"):
+        assert _post_token(c, user="good-exp", role="viewer",
+                           expires_at=good).status_code == 200, good
+        assert _put(c, tok, expires_at=good).status_code == 200, good
+    assert _put(c, tok, expires_at="").status_code == 200
+    assert _raw(depot)[tok]["expires_at"] == ""
