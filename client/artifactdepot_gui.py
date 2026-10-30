@@ -12,7 +12,7 @@
     （上传状态在源文件目录 `.<文件名>.artifactdepot-upload.json`，
     下载状态与 `.part` 在目标文件目录，均 0600 原子写）；
   - 签名链接：查看、复制、作废；
-  - Token 管理：注册表、显示明文、移除、DataHub 同步、配置重载、按权限点生成 Token、
+  - Token 管理：注册表、显示明文、移除、配置重载、按权限点生成 Token、
     bucket/前缀资源范围、角色预设；
   - 审计：按 bucket/key/actor/since 查询。
 
@@ -1524,8 +1524,6 @@ class TokensTab(ttk.Frame):
         ttk.Entry(bar, textvariable=self.admin_var, width=24, show="*").pack(side="left")
         ttk.Button(bar, text="查询注册表", style="Accent.TButton",
                    command=self.load_tokens).pack(side="left", padx=6)
-        ttk.Button(bar, text="从 DataHub 同步", style="Ghost.TButton",
-                   command=self.sync_tokens).pack(side="left")
         ttk.Button(bar, text="重新加载配置", style="Ghost.TButton",
                    command=self.reload_config).pack(side="left", padx=6)
         ttk.Checkbutton(bar, text="显示明文", variable=self.reveal_var,
@@ -1840,28 +1838,6 @@ class TokensTab(ttk.Frame):
             self.load_tokens()
         except Exception as e:
             self.app.show_error(e)
-
-    def sync_tokens(self):
-        try:
-            client = self._admin_client()
-        except Exception as e:
-            self.app.show_error(e)
-            return
-        def work():
-            try:
-                data = client.sync_tokens()
-            except Exception as e:
-                self.app.root.after(0, self.app.show_error, e)
-                return
-            def apply():
-                n = len(data.get("mapping") or {})
-                if data.get("ok"):
-                    self.info_var.set(f"已从 {data.get('datahub_url') or '?'} 同步 {n} 个 token")
-                else:
-                    self.info_var.set(f"同步失败：{data.get('error') or 'DataHub 不可达'}")
-                self.load_tokens()
-            self.app.root.after(0, apply)
-        threading.Thread(target=work, daemon=True).start()
 
     def reload_config(self):
         try:

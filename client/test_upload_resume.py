@@ -266,7 +266,6 @@ def server(tmp_path_factory):
         "access_token": TOKEN,
         "host": "127.0.0.1",
         "port": port,
-        "datahub_url": "",
         "require_read_token": False,
         "upload": {"chunk_size_mb": 1},
         "download": {"chunk_size_mb": 1, "chunk_concurrency": 2},

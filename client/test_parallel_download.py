@@ -222,7 +222,6 @@ def server(tmp_path_factory):
         "access_token": TOKEN,
         "host": "127.0.0.1",
         "port": port,
-        "datahub_url": "",                 # 不联网拉 token
         "require_read_token": False,
     }
     config_path = work / "config.json"

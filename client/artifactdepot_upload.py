@@ -702,9 +702,6 @@ class ArtifactDepotClient:
     def delete_token(self, value: str) -> dict:
         return self.delete_json("/api/tokens", {"value": value}).get("data") or {}
 
-    def sync_tokens(self) -> dict:
-        return self._json("POST", "/api/tokens/sync").get("data") or {}
-
     def reload_config(self) -> dict:
         return self._json("POST", "/api/config/reload").get("data") or {}
 
