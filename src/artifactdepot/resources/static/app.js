@@ -117,7 +117,6 @@ document.addEventListener('click', (e) => {
   else if (a === 'load-tk-buckets') loadTokenBuckets(true)
   else if (a === 'generate-token') generateToken()
   else if (a === 'copy-token') copyTkResult()
-  else if (a === 'sync-tokens') syncTokens()
   else if (a === 'reload-config') reloadConfig()
   else if (a === 'load-config') loadConfigPanel(true)
   else if (a === 'save-config') saveConfigPanel()
@@ -2644,23 +2643,6 @@ async function reloadConfigFile() {
     $('cfgInfo').textContent = '重载失败：' + ((e && e.message) || e)
     toast('重载失败：' + ((e && e.message) || e), false)
   }
-}
-
-async function syncTokens() {
-  const t = $('admToken').value.trim()
-  if (!t) { toast('请输入管理员令牌', false); return }
-  try {
-    const body = await api('/api/tokens/sync', { method: 'POST' }, t)
-    const d = body.data || {}
-    const n = Object.keys(d.mapping || {}).length
-    if (d.ok) {
-      $('syncInfo').textContent = '已从 ' + (d.datahub_url || '?') + ' 同步 ' + n + ' 个 token'
-    } else {
-      $('syncInfo').textContent = '同步失败：' + (d.error || 'DataHub 不可达') + '（现有 ' + n + ' 个 token 保留）'
-      toast('同步失败：' + (d.error || 'DataHub 不可达'), false)
-    }
-    await loadTokens()
-  } catch (e) { toast(e.message, false) }
 }
 
 function fmtScopeRange(rec) {
