@@ -63,7 +63,7 @@ DEFAULT = {
         "max_total_mb": 0,                    # 单次打包源文件总大小上限（MB；0=不限）
         "max_concurrent_jobs": 1,             # 同时进行的打包任务数（其余排队）
         "zip_compression": "stored",          # stored=仅存储（快；默认）/ deflate=压缩（CPU 高）
-        "cleanup_interval_seconds": 600,      # 后台清理失效包的间隔（秒）
+        "cleanup_interval_seconds": 60,       # 后台清理失效包的间隔（秒）
         "cleanup_grace_seconds": 60,          # 链接失效后延迟删包的宽限期（秒，避免与在途下载竞争）
         "delete_on_revoke": True,             # 作废链接时是否立即删包（否则等后台清理）
         "cleanup_on_startup": True,           # 启动时清理失效/残留包，并恢复未完成的打包任务
