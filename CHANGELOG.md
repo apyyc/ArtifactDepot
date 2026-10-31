@@ -1,13 +1,13 @@
 # Changelog
 
-ArtifactDepot v0.10.0 — 所有对本项目的重要更改都将记录在此文件中。
+ArtifactDepot v0.11.0 — 所有对本项目的重要更改都将记录在此文件中。
 
 本日志格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本号遵循 [语义化版本规范](https://semver.org/lang/zh-CN/)。
 
 ---
 
-## [未发布]
+## [0.11.0] - 2026-10-31
 
 ### 新增：目录签名链接（后台打包）与目录行下载（2026-10-31）
 

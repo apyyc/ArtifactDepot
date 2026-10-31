@@ -49,7 +49,7 @@ def _app_version() -> str:
                     return v
     except OSError:
         pass
-    return "0.10.0"
+    return "0.11.0"
 
 
 APP_VERSION = _app_version()

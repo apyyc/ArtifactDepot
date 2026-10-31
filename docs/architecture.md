@@ -1,6 +1,6 @@
 # ArtifactDepot 架构说明
 
-> 版本 **0.9.0**
+> 版本 **0.11.0**
 
 ## 定位
 
@@ -283,7 +283,7 @@ ArtifactDepot/
 ## 部署
 
 - **build → save → 拷贝 → load → deploy**：
-  - 开发机 `./build_image.sh`（构建 + 自动导出 `artifactdepot-0.9.0.tar`）
+  - 开发机 `./build_image.sh`（构建 + 自动导出 `artifactdepot-0.11.0.tar`）
   - 拷贝 tar 到生产机 → `podman load -i` → `./deploy_container.sh --token <你的管理员token>`
 - **host 网络默认**：容器共享宿主网络，容器内 `127.0.0.1` 即宿主机；
   `--port-map` 可改回端口映射（不推荐，rootless 桥接常不通）。
